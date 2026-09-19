@@ -1,2 +1,1 @@
-def hello() -> str:
-    return "Hello from gfetch!"
+"""gfetch: download analysis-ready Earth observation datasets from STAC as Zarr cubes."""

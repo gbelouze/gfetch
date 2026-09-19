@@ -16,17 +16,22 @@ for the full architecture writeup.
 
 ## Features
 
-- [ ] Search: STAC search against Planetary Computer and Element84 Earth Search
-- [ ] Download: resumable, atomic (temp-write + rename), sentinel-file completion markers
-- [ ] Mosaic: `odc-stac`-backed load/reproject onto a common AOI grid, satellite-profile defaults
-- [ ] Write: plain Zarr output with pre-planned per-worker chunk regions
-- [ ] Stage separation: `search`/`download`/`load`/`write` independently callable, for SLURM job splitting
-- [ ] Satellite profiles: `Sentinel2`, `Landsat` with sensible per-collection defaults
-- [ ] Config-driven: `omegaconf` YAML config + CLI `init` scaffolding
-- [ ] CLI: `cyclopts`-based, one subcommand per stage
-- [ ] Pleasant UX: `rich` logging and progress bars
-- [ ] Fully typed: complete type annotations, checked with `pyrefly`
-- [ ] Testing: comprehensive test coverage
+- [x] Search: STAC search against Element84 Earth Search (tested) and Planetary Computer
+      (source/collection mapping registered, not yet exercised end-to-end)
+- [x] Download: resumable, atomic (temp-write + rename), sentinel-file completion markers
+- [x] Mosaic: `odc-stac`-backed load/reproject onto a common AOI grid, cloud masking + composite
+- [x] Write: plain Zarr output, incl. pre-planned per-worker disjoint-region writes
+- [x] Stage separation: `search`/`download`/`mosaic` independently callable CLI subcommands
+      (mosaic build + write share one subcommand — no benefit to splitting across SLURM jobs
+      when both run compute-only, back to back, in the same process)
+- [ ] Satellite profiles: `sentinel-2` implemented; `landsat` deferred (collection ids
+      unverified per `claude/tech-stack.md`)
+- [x] Config-driven: `omegaconf` YAML config + CLI `init` scaffolding
+- [x] CLI: `cyclopts`-based, one subcommand per stage
+- [x] Pleasant UX: `rich` logging and progress bars
+- [x] Fully typed: complete type annotations, checked with `pyrefly`
+- [x] Testing: unit tests for every stage, incl. resumability/atomicity edge cases; a few
+      network-backed tests marked `slow`
 
 ## Installation
 
@@ -38,7 +43,10 @@ uv run pre-commit install
 ## Usage
 
 ```bash
-uv run gfetch --help
+uv run gfetch init config.yaml   # scaffold a config template, then edit its AOI/time range
+uv run gfetch search config.yaml     # internet-connected: find matching STAC items
+uv run gfetch download config.yaml   # internet-connected: download assets to a local cache
+uv run gfetch mosaic config.yaml     # compute-only: load, cloud-mask, composite, write to Zarr
 ```
 
 ## Configuration

@@ -617,27 +617,55 @@ the repro and fix — gfetch's download stage must apply this fix before handing
   be dropped before a region-write call). Also found and fixed a real scaffolding gap:
   `zarr` itself was missing from the dependency list despite being the v1 output format
   since the first architecture decision.
+- **2026-09-19** — Implemented the pipeline for real: `src/gfetch/{sources,profiles,
+  search,download,mosaic,write}.py` plus a `cyclopts`/`omegaconf` CLI
+  (`gfetch init`/`search`/`download`/`mosaic`), and a real test suite (23 tests, 2
+  network-backed and marked `slow`). All the POC-verified patterns above carried over
+  directly. Two real bugs were caught by tests/a CLI smoke test that the earlier POCs
+  hadn't exercised:
+  - **Retry-across-attempts item corruption**: `download_item()` mutates its input
+    `Item` in place (sets its self href, rewrites asset hrefs). The download stage's
+    retry wrapper was reusing the *same* item object across retry attempts, so a
+    failed first attempt (e.g. a real `TimeoutError` hit during the CLI smoke test)
+    left the item in a half-mutated state that broke the next attempt (`KeyError` on
+    an asset key that should have existed). Fix: `copy.deepcopy(item)` fresh for each
+    retry attempt, inside the retried closure. A dedicated regression test
+    (`test_download_items_retry_does_not_corrupt_item`, monkeypatching `stac_asset.
+    download_item` to fail once then succeed) reproduces and confirms the fix.
+  - **Temp-dir-then-move ordering**: an earlier draft moved the downloaded file out of
+    its temp directory *after* the `with tempfile.TemporaryDirectory()` block that
+    downloaded it had already exited (and deleted the directory) — a plain
+    `FileNotFoundError`, caught immediately by the first download unit test. Fix: the
+    move must happen inside the same `with` block as the download.
+  - Neither bug was visible in the earlier hand-run POC scripts, which never happened
+    to retry or hit this exact code path — real test coverage (including a CLI smoke
+    test against live Earth Search data, not just unit tests against local files)
+    caught both before they'd have surfaced as confusing failures on an actual HPC job.
+  - **CLI stage-granularity decision**: `search` and `download` map to their own CLI
+    subcommands (matching the internet-connected-node split), but `mosaic`/`write`
+    share a single `gfetch mosaic` subcommand rather than two, since they always run
+    on the same compute-only node/job back-to-back with no natural serialization point
+    for a lazy dask-backed `xr.Dataset` between them — splitting them into separate
+    CLI invocations would only add pointless intermediate I/O. The underlying
+    `gfetch.mosaic`/`gfetch.write` *library* functions stay separate and independently
+    testable/importable either way.
+  - CLI stage hand-off between processes (`search` → `download` → `mosaic`) is done by
+    serializing/deserializing `pystac.ItemCollection` JSON files under `output_dir`
+    (`items.json`, `cached_items.json`) — confirmed round-trips absolute local hrefs
+    and self hrefs correctly before relying on it.
 
 ## Next steps
 
-Design phase, scaffolding, and a full pipeline POC (search → download → load/mosaic →
-write, including the HPC disjoint-region write pattern) are all done and passing. Next,
-in rough order:
+Design, scaffolding, a full pipeline POC, and a working implementation (with tests and
+a real CLI smoke test against live data) are all done. Remaining work, in rough order:
 
-1. **Implement `search` and `download` stages first** (against both Planetary Computer
-   and Earth Search, per the v1 source decision), since they're the least architecturally
-   risky and unblock testing the atomic-write + sentinel-file resume design for real,
-   before tackling the `load`/`mosaic`/`write` stages. Use the verified pattern from the
-   "POC log" above (`Config.include` + `keep_non_downloaded` + temp-dir + rename +
-   sentinel files) — not the earlier owner-backref workaround, which is no longer part
-   of the design.
-2. Implement `load`/`mosaic` and `write` stages using the verified pattern from the
-   "Full pipeline POC" entry above (`groupby="solar_day"` + SCL mask + composite;
-   `to_zarr(compute=False)` metadata pass + per-worker disjoint-region writes, dropping
-   scalar coords first).
+1. Exercise the Planetary Computer source end-to-end (currently registered/collection-
+   mapped but only Earth Search has actually been run against).
+2. Add a `landsat` satellite profile once its collection ids are verified per source
+   (currently deferred — see "Explicitly rejected dependencies"/source landscape above).
 3. Proper benchmarking (cloud-colocated compute, varying AOI size/resolution/band count,
    Dask cluster vs. local threads) is real future work — the POC's ~0.02 Mpix/s number is
    a home-internet/single-laptop data point, not a library performance ceiling, and
    shouldn't be used for capacity planning as-is.
-4. Start a `claude/tasks.md` (mirroring lsatfetch's) once real implementation issues
-   start turning up.
+4. Start a `claude/tasks.md` (mirroring lsatfetch's) once further implementation issues
+   turn up.
