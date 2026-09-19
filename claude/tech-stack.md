@@ -492,6 +492,53 @@ the repro and fix — gfetch's download stage must apply this fix before handing
     (above) is genuinely necessary, not defensive overengineering.
   - Confirmed against `stac-asset==0.4.7`, `odc-stac==0.5.3`, `pystac==1.15.2`.
 
+- **2026-09-19 — Full pipeline POC (search → load/mosaic → write, incl. disjoint-region
+  writes): PASSED end-to-end**, at the user's request to de-risk the whole pipeline
+  before writing production code, not just the download↔load handoff. Searched Earth
+  Search for a month of Sentinel-2 over a ~6.7×5.6km AOI near Paris (8 items, 2 adjacent
+  MGRS tiles, cloud cover < 40%), loaded 3 bands + SCL at native 10m resolution with
+  `odc.stac.load(items, bands=[...], geobox=geobox, groupby="solar_day", chunks={...})`
+  (6 solar-day groups), masked clouds/shadow/cirrus/no-data via the SCL band (classes
+  `{0,1,3,8,9,10}`), and took a `median(dim="time", skipna=True)` composite — the
+  recommended-stack shape from Pangeo thread 5010 ("Best practices for large-scale
+  Sentinel-2 mosaics"), now confirmed to actually run correctly end-to-end rather than
+  just cited.
+  - **Zarr write**: `computed.to_zarr(path, mode="w")` then `xr.open_zarr(path)` —
+    round-tripped values match exactly (`np.allclose(..., equal_nan=True)`, since the
+    masked composite legitimately contains NaNs where every timestep at a pixel was
+    cloud-masked).
+  - **Pre-planned disjoint-region write (the HPC write-stage pattern from "Compute-stage
+    output durability" above): PASSED**, confirming the design is actually implementable
+    with the tools we chose, not just plausible on paper. Pattern: write the store's
+    metadata/coords once with `template.to_zarr(path, compute=False, mode="w")`, then
+    have each independent "worker" write only its own non-overlapping slice with
+    `worker_slice.to_zarr(path, region={"x": slice(...), "y": slice(None)})`. One real
+    gotcha: xarray's region-write rejects the call if *any* variable being written lacks
+    a dimension in common with the region (our case: the scalar `spatial_ref` CRS
+    coordinate) — fix is `worker_slice.drop_vars([c for c in worker_slice.coords if c
+    not in worker_slice.dims])` before the per-region write (the coordinate was already
+    written once, correctly, by the metadata-only pass). Two workers writing disjoint
+    x-slices reassembled to values identical to the single in-memory mosaic.
+  - **Rough benchmark, single laptop over home/office internet (not HPC/cloud-colocated)**:
+    computing the 6-solar-day × 3-band, ~6.06M-pixel mosaic (full dask graph: remote COG
+    reads + reprojection + SCL masking + median reduction) took **~250-300s** (~0.02
+    Mpix/s) across three runs. This is not comparable to the Pangeo benchmark's cited
+    74.7 Mpix/s for odc-stac wide/mosaic workloads — that number almost certainly reflects
+    compute co-located with the data (in-region cloud) or cached reads, whereas this run
+    is dominated by real WAN download bandwidth for genuinely fresh COG reads, not CPU or
+    library overhead. Useful as gfetch's own real-world expectation-setting data point
+    (rough budget: single-machine, home-internet, full-resolution multi-band monthly
+    mosaics over a small AOI take a few minutes, dominated by network, not compute) —
+    not as a library performance verdict. Proper benchmarking (cloud-colocated, varying
+    AOI size/resolution/band count, Dask cluster vs. local threads) is future work, not
+    done here.
+  - **Dependency gap found and fixed**: `zarr` itself was missing from gfetch's chosen
+    dependency list (only `pystac-client`/`stac-asset`/`odc-stac`/`odc-geo`/`rich`/
+    `cyclopts`/`omegaconf`/`retry` had been added) despite Zarr being the v1 output
+    format since the very first architecture decision — added via `uv add zarr`
+    (`zarr==3.4.0`).
+  - Confirmed against `zarr==3.4.0`, `xarray==2026.7.0`, `odc-stac==0.5.3`, `dask==2026.8.0`.
+
 ## Decision log
 
 - **2026-09-19** — Chose `odc-stac` over `stackstac` for array loading (Pangeo community
@@ -558,13 +605,24 @@ the repro and fix — gfetch's download stage must apply this fix before handing
   reviewed; also confirmed, by re-reading `stac-asset`'s source directly, that its
   writes are genuinely non-atomic, so gfetch's own temp-dir+rename wrapper is
   necessary, not defensive overengineering.
+- **2026-09-19** — At the user's request, POC'd the *whole* pipeline end-to-end
+  (search → load/mosaic → write, incl. the pre-planned disjoint-region write pattern),
+  not just the download↔load handoff, plus a rough real-world throughput benchmark —
+  see the new "Full pipeline POC" entry above. Everything passed: the Pangeo-recommended
+  `groupby="solar_day"` + SCL-cloud-mask + `median` composite shape actually runs
+  correctly against real Earth Search data, `to_zarr()` round-trips a masked
+  (NaN-containing) composite exactly, and the disjoint-region write pattern that
+  gfetch's HPC write-stage design depends on is confirmed implementable with xarray/zarr
+  as chosen (one real gotcha found and fixed: scalar coordinates like `spatial_ref` must
+  be dropped before a region-write call). Also found and fixed a real scaffolding gap:
+  `zarr` itself was missing from the dependency list despite being the v1 output format
+  since the first architecture decision.
 
 ## Next steps
 
-Design phase and scaffolding are both done; the odc-stac local-href POC (the only
-remaining unverified-but-load-bearing assumption) has passed, and the download-stage
-implementation pattern is validated end-to-end (including simulated resume). Next, in
-rough order:
+Design phase, scaffolding, and a full pipeline POC (search → download → load/mosaic →
+write, including the HPC disjoint-region write pattern) are all done and passing. Next,
+in rough order:
 
 1. **Implement `search` and `download` stages first** (against both Planetary Computer
    and Earth Search, per the v1 source decision), since they're the least architecturally
@@ -573,5 +631,13 @@ rough order:
    "POC log" above (`Config.include` + `keep_non_downloaded` + temp-dir + rename +
    sentinel files) — not the earlier owner-backref workaround, which is no longer part
    of the design.
-2. Start a `claude/tasks.md` (mirroring lsatfetch's) once real implementation issues
+2. Implement `load`/`mosaic` and `write` stages using the verified pattern from the
+   "Full pipeline POC" entry above (`groupby="solar_day"` + SCL mask + composite;
+   `to_zarr(compute=False)` metadata pass + per-worker disjoint-region writes, dropping
+   scalar coords first).
+3. Proper benchmarking (cloud-colocated compute, varying AOI size/resolution/band count,
+   Dask cluster vs. local threads) is real future work — the POC's ~0.02 Mpix/s number is
+   a home-internet/single-laptop data point, not a library performance ceiling, and
+   shouldn't be used for capacity planning as-is.
+4. Start a `claude/tasks.md` (mirroring lsatfetch's) once real implementation issues
    start turning up.
