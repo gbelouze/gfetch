@@ -169,6 +169,46 @@ pieces of its design are worth carrying forward rather than re-deriving:
   candidate future source, accessed via generic STAC + S3 rather than phidown's bespoke
   API.
 
+### Project Pythia cookbooks (cookbooks.projectpythia.org)
+
+Added 2026-09-19, re-checked at the user's request specifically to validate/simplify the
+download-stage implementation before writing it (see the corrected POC log entry above).
+
+- **landsat-ml-cookbook** (`ProjectPythia/landsat-ml-cookbook`, notebook
+  `1.0_Data_Ingestion-Geospatial.ipynb`, read from the actual notebook source via the
+  GitHub API, not just the rendered page): `pystac_client.Client.open(url,
+  modifier=planetary_computer.sign_inplace)` for search — PC's `modifier` hook signs
+  every item's asset hrefs *in place* as part of the search call itself — then
+  `odc.stac.stac_load([selected_item], bands=..., bbox=..., chunks={})` called
+  **directly on the signed remote item, with no separate download step at all**.
+  odc-stac/GDAL streams bytes on demand from the signed URL; nothing is persisted
+  locally.
+- **eo-datascience-cookbook**, **interactive-sentinel-2-cookbook**: landing pages only
+  exposed high-level descriptions (STAC + Dask Gateway, Sentinel-2 dashboards); actual
+  notebook source wasn't pulled for these since the landsat-ml-cookbook notebook already
+  gave a concrete, representative code sample and the pattern it confirms (search with
+  a signing modifier, load straight from the remote href) is what mattered for this
+  check.
+- **Implication for gfetch, confirmed rather than contradicted**: this is the standard
+  pattern for *interactive/exploratory* use on an internet-connected machine, and it
+  validates that `odc.stac.load()` needs no local copy at all in that setting — gfetch's
+  `search` → `load`/`mosaic` stages can be chained directly with no `download` step in
+  between when running single-machine with internet access throughout. It does **not**
+  contradict gfetch's HPC design: the cookbook has no offline-compute-node constraint,
+  so it never needed a persisted local cache. gfetch's `download` stage stays a real,
+  separate, *optional* stage — needed specifically when the compute step will run
+  offline (HPC compute partitions) or when a durable local cache is wanted for its own
+  sake, not needed otherwise.
+
+### Earthmover blog (`cloud-native-dataloader`) — re-checked
+
+Re-read specifically for STAC-asset download/caching patterns (not just the dataloader
+tuning findings already captured above). **Confirmed it has none**: the post's pipeline
+starts from Zarr arrays already sitting in cloud storage (GCS) and is entirely about
+Xarray → Xbatcher → Dask → PyTorch `DataLoader` tuning downstream of that. It doesn't
+touch STAC search, COG reading, or asset download/caching at all — not a source for the
+download-stage design, confirmed rather than newly discovered.
+
 ## Adjacent tooling assessed (not in the user's original notes)
 
 | Library | Verdict | Notes |
@@ -401,40 +441,56 @@ the repro and fix — gfetch's download stage must apply this fix before handing
 
 ## POC log
 
-- **2026-09-19 — odc-stac local-href POC: PASSED, but surfaced a real `stac-asset` bug
-  to work around.** Searched one Sentinel-2 item on Earth Search, downloaded its
-  smallest band (`coastal`/B01, 60m) via `stac_asset.download_item()`, and compared
+- **2026-09-19 — odc-stac local-href POC: PASSED.** Searched one Sentinel-2 item on
+  Earth Search, downloaded a band via `stac_asset.download_item()`, and compared
   `odc.stac.load()` output between the original remote-href item and the
   downloaded/rewritten local-href item over the same small window: identical shape,
-  dtype, and pixel values.
-  - **Bug found**: `download_item()`'s returned `Item` has each `Asset.owner` still
-    pointing at the *original* (pre-download) item object, whose self href is the
-    remote STAC API URL, not the new local one. `odc.stac.load()` resolves asset hrefs
-    via `Asset.get_absolute_href()`, which joins `asset.href` against `asset.owner`'s
-    self href — so without a fix, it silently re-resolves the (now-relative-looking)
-    local href against the *remote* STAC endpoint, producing bogus URLs like
-    `https://earth-search.aws.../items/B01.tif` (404) or, after a naive
-    `item.make_asset_hrefs_absolute()` fix attempt, worse ones like
-    `https://earth-search.aws.../tmp/gfetch_poc_cache/B01.tif` (403) — both `git`-blame
-    to the same root cause, not two separate bugs. `Item.make_asset_hrefs_absolute()`
-    alone does not fix this, because it only rewrites `.href` — it doesn't touch the
-    stale `.owner` backref that `get_absolute_href()` actually reads.
-  - **Fix**: after calling `download_item()`, explicitly re-point every asset at the
-    returned item before resolving hrefs absolute:
+  dtype, and pixel values. Also confirmed a resumed/mixed download (one asset
+  pre-cached, one freshly downloaded in the same call) loads correctly and never
+  re-downloads the pre-cached asset.
+  - **First attempt hit a self-inflicted pitfall, not a library bug** — worth recording
+    since it's an easy mistake to repeat: manually filtering an item's assets before
+    calling `download_item()` (`item.assets = {key: item.assets[key]}`) breaks
+    `Asset.owner`, because pystac's `.assets` is a plain dict attribute — reassigning it
+    does **not** re-point the contained assets' `owner` backref at the item you just
+    assigned them onto. The asset object keeps pointing at whatever item it was taken
+    from. `odc.stac.load()` resolves hrefs via `Asset.get_absolute_href()`, which joins
+    a relative href against `asset.owner.get_self_href()` — so a wrongly-owned asset
+    silently resolves against the *remote* STAC endpoint instead of the local cache,
+    producing bogus URLs (404/403) instead of an obvious error.
+  - **The fix is to not do that.** `stac_asset.download_item()`'s own `Config.include`/
+    `exclude` parameters are the documented way to restrict which assets get downloaded,
+    and they don't disturb ownership — this is also exactly what's needed for resuming
+    a partial download (pass `include=<pending asset keys>`, `keep_non_downloaded=True`
+    to keep already-cached assets' entries in the returned item). Verified working
+    pattern for gfetch's download stage (atomic + resumable, per the durability design
+    above):
     ```python
-    result = await download_item(item, cache_dir, config=Config())
-    for asset in result.assets.values():
-        asset.set_owner(result)
-    result.make_asset_hrefs_absolute()
+    pending = [k for k in wanted_keys if not (item_dir / f"{k}.complete").exists()]
+    with tempfile.TemporaryDirectory(dir=item_dir) as tmp:
+        result = await download_item(
+            item, Path(tmp), config=Config(include=pending), keep_non_downloaded=True
+        )
+        for key in pending:
+            # .href is relative once a self href is set (which download_item always
+            # does) - get_absolute_href() is required to get the real temp-dir path.
+            tmp_path = Path(result.assets[key].get_absolute_href())
+            final_path = item_dir / f"{key}{tmp_path.suffix}"
+            shutil.move(tmp_path, final_path)  # atomic on the same filesystem
+            (item_dir / f"{key}.complete").touch()
+            result.assets[key].href = str(final_path)
+    # assets not in `pending` keep their original remote href here - point them at
+    # their already-downloaded local path too before handing the item off.
+    result.set_self_href(str(item_dir / f"{item.id}.json"))
     ```
-  - **Action item**: gfetch's download-stage wrapper around `stac_asset.download_item()`
-    must apply this fix before handing items off to the `load`/`mosaic` stage — codify
-    it as a small helper (e.g. `gfetch.download.finalize_item()` or similar) rather than
-    something call sites have to remember. Confirmed against `stac-asset==0.4.7`,
-    `odc-stac==0.5.3`, `pystac==1.15.2` — worth a quick recheck if any of those are
-    upgraded later, in case upstream fixes the owner-backref bug and the workaround
-    becomes a no-op (harmless either way, since `set_owner` to the already-correct owner
-    is a no-op).
+  - **Verified independently, re-reading `stac-asset==0.4.7`'s source**: its writes
+    really are non-atomic against a killed process, confirming the concern that
+    motivated this whole design (see "Download-stage durability" above) — `Client.
+    download_href()` streams straight into the final target path via `aiofiles.open
+    (path, "wb")`; the partial file is only deleted in the `except` block, which a
+    SIGKILL/walltime-preemption never reaches. gfetch's own temp-dir + rename layer
+    (above) is genuinely necessary, not defensive overengineering.
+  - Confirmed against `stac-asset==0.4.7`, `odc-stac==0.5.3`, `pystac==1.15.2`.
 
 ## Decision log
 
@@ -488,19 +544,34 @@ the repro and fix — gfetch's download stage must apply this fix before handing
   and installed on 3.12 with no GDAL/uv conflict — the fallback conda env wasn't needed.
 - **2026-09-19** — Ran the odc-stac local-href POC (see "POC log" above): **passed**,
   confirming `odc.stac.load()` reads locally-rewritten STAC items identically to
-  remote-href ones, but only after working around a `stac-asset` owner-backref bug.
-  gfetch's download stage must apply the documented fix (`asset.set_owner(result)` before
-  `make_asset_hrefs_absolute()`) before handing items to the `load`/`mosaic` stage.
+  remote-href ones.
+- **2026-09-19** — At the user's request, re-checked Project Pythia cookbooks (not
+  previously reviewed) and re-checked the Earthmover blog and Pangeo threads
+  specifically for STAC-download implementation patterns, before finalizing the
+  download-stage code — see the new "Project Pythia cookbooks" and "Earthmover blog —
+  re-checked" entries above. Net effect: found and fixed a self-inflicted pitfall in the
+  first download-stage POC attempt (manually filtering `item.assets` breaks
+  `Asset.owner`; use `stac_asset.Config.include`/`exclude` instead, which is also the
+  correct mechanism for resume) — see the corrected "POC log" entry above for the
+  working pattern. Confirmed gfetch's `download` stage design itself (separate,
+  optional, atomic, resumable) is correct and not contradicted by any external source
+  reviewed; also confirmed, by re-reading `stac-asset`'s source directly, that its
+  writes are genuinely non-atomic, so gfetch's own temp-dir+rename wrapper is
+  necessary, not defensive overengineering.
 
 ## Next steps
 
 Design phase and scaffolding are both done; the odc-stac local-href POC (the only
-remaining unverified-but-load-bearing assumption) has passed. Next, in rough order:
+remaining unverified-but-load-bearing assumption) has passed, and the download-stage
+implementation pattern is validated end-to-end (including simulated resume). Next, in
+rough order:
 
 1. **Implement `search` and `download` stages first** (against both Planetary Computer
    and Earth Search, per the v1 source decision), since they're the least architecturally
    risky and unblock testing the atomic-write + sentinel-file resume design for real,
-   before tackling the `load`/`mosaic`/`write` stages. The download stage must bake in
-   the `stac-asset` owner-backref fix found during the POC.
+   before tackling the `load`/`mosaic`/`write` stages. Use the verified pattern from the
+   "POC log" above (`Config.include` + `keep_non_downloaded` + temp-dir + rename +
+   sentinel files) — not the earlier owner-backref workaround, which is no longer part
+   of the design.
 2. Start a `claude/tasks.md` (mirroring lsatfetch's) once real implementation issues
    start turning up.
