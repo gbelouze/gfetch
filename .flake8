@@ -1,0 +1,5 @@
+[flake8]
+show-source = True
+builtins = unicode
+select = DOC
+extend-ignore = DOC5
