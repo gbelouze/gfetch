@@ -32,6 +32,7 @@ def download(config_path: Path) -> None:
     asset_keys = list(cfg.bands) if cfg.bands else list(profile.default_bands)
     if profile.cloud_mask_band is not None and profile.cloud_mask_band not in asset_keys:
         asset_keys.append(profile.cloud_mask_band)
+    log.debug(f"Resolved asset keys: {asset_keys}")
 
     with default_bar() as progress:
         cached_items = asyncio.run(
@@ -45,4 +46,4 @@ def download(config_path: Path) -> None:
         )
 
     pystac.ItemCollection(cached_items).save_object(str(cfg.cached_items_path))
-    log.info(f"Downloaded {len(cached_items)} items into {cfg.cache_dir}")
+    log.info(f"Wrote {len(cached_items)} cached items to {cfg.cached_items_path}")

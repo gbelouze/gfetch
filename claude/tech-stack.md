@@ -511,6 +511,25 @@ the repro and fix — gfetch's download stage must apply this fix before handing
   near-term need, or can it stay a "designed for, not built" abstraction for longer?
 - Should `rioxarray` become a real dependency (e.g. for reading assets `stac-asset`
   downloaded locally) or stay opportunistic/optional?
+- **`SatelliteProfile`'s "default resampling" (mentioned in "Chosen architecture" above)
+  was never actually built, found 2026-09-22 answering a user question.** Neither
+  `SatelliteProfile` nor `mosaic()`/`load()`/`mosaic_by_zone()` expose a `resampling`
+  parameter at all, so every band silently gets `odc.stac.load()`'s own default,
+  confirmed to be `"nearest"` (`odc.loader.types.RasterLoadParams().resampling ==
+  "nearest"`). Defensible for the categorical cloud-mask band (`scl`), questionable
+  for continuous reflectance bands with a coarser native resolution than the output
+  grid (e.g. 60m `coastal`/`nir09` resampled to a 10m mosaic) - nearest-neighbor
+  upsampling by 6x will look visibly blocky versus bilinear/cubic. Not fixed; offered
+  to the user as a follow-up (config field + threaded through to `odc.stac.load(
+  resampling=...)`, per-band override via `odc.stac.load`'s own `dict[str, str]`
+  support), declined for now.
+- **`SatelliteProfile.default_bands` for `sentinel-2` is RGB-only (`("red", "green",
+  "blue")`), found 2026-09-22 answering the same user question.** Worth remembering
+  when estimating job size (per-item byte volume scales directly with band count -
+  see `benchmark/README.md`'s per-item throughput numbers, which were all RGB-only)
+  or when a user's mosaic looks unexpectedly thin on bands - `bands:` in the config
+  fully replaces the default list rather than extending it, so getting RGB *and*
+  something else means listing all of them explicitly.
 - Icechunk's behavior when a worker dies mid-write (before merge/commit) isn't documented
   anywhere found — probably benign for the cooperative fork/merge pattern, but unverified.
   Matters if/when Icechunk is revisited as an S3-backed output option.
@@ -833,6 +852,80 @@ the repro and fix — gfetch's download stage must apply this fix before handing
     35S/36S boundary near 30°E correctly split into two `mosaic_epsg327{35,36}.zarr`
     stores via the full `gfetch search` → `gfetch mosaic` CLI path, both readable back
     with `xarray.open_zarr()` and the expected CRS.
+- **2026-09-22** — Went from sparse to routine logging across every stage
+  (`search`/`download`/`mosaic`/`write`, their CLI wrappers, config loading), at the
+  user's explicit request after a large `gfetch search` (Tanzania, 10,456 matched
+  items) looked hung with zero log output between "Searching..." and "Found N items" -
+  it wasn't hung, just silent through a long STAC API pagination loop (confirmed live
+  via `lsof`/`nettop` on the running process: an active connection, steadily receiving
+  bytes). **Policy going forward: prefer adding `log.debug`/`log.info` at any
+  potentially-long or otherwise-opaque step over leaving it silent** - the user
+  explicitly said not to be shy about this. Concretely: `search()` now logs the STAC
+  API's reported match count up front (`ItemSearch.matched()`) and one `log.debug` per
+  page fetched; `download_items()` logs a start/end summary; `mosaic()`/`load()`/
+  `mosaic_by_zone()` log item/zone counts and geobox shape before the actual
+  (potentially slow, silent) `odc.stac.load()` call; `write()`/`prepare_template()`
+  log before the blocking `to_zarr()` call; `cli/config.py` gained a logger it didn't
+  have at all before.
+- **2026-09-22** — Reworked `download_items()`'s progress display from one bar for the
+  whole batch to **one bar per concurrently-downloading item, plus the existing
+  overall bar** - matching `benchmark/`'s dask-callback pattern (a single `rich.
+  Progress` instance can render multiple live bars, whether fed by dask callbacks or,
+  here, `stac_asset`'s own per-asset message stream), and confirmed the same
+  single-process precondition holds (`download_items()` is pure `asyncio.gather` +
+  a semaphore, no multiprocessing, so one shared `Progress` object works). Considered
+  and rejected building a separate message-router task: instead, each item's own
+  download coroutine (`_download_item()`) is fully self-contained - it adds its own
+  task via the existing `temporary_task()` helper (same add/cleanup pattern already
+  used for the main bar) and, if a `progress` tracker was passed, creates its own
+  local `asyncio.Queue` for `stac_asset.download_item(messages=...)`, running a small
+  helper (`_report_asset_progress()`) concurrently via `asyncio.gather()` to turn
+  `OpenUrl`/`WriteChunk` messages into real byte counts. No message queue or
+  progress-reporting task lives outside the function that owns it. Verified live
+  (`max_concurrent_items=3`, real Earth Search downloads, forced-terminal `rich`
+  output): exactly one main bar plus up to 3 simultaneous per-item bars, each with
+  independent byte counts/speed/ETA, correctly relabeling as each slot picks up its
+  next item, all bars cleanly removed on completion (asserted via a `mock.patch.
+  object` spy on `Progress.add_task` in the new `test_download_items_reports_progress`
+  test: exactly `1 + n_items` tasks created, zero left over).
+- **2026-09-22 — found and fixed a real HPC-only bug: `gfetch download` could hang
+  forever on a network requiring an HTTP(S) proxy for egress, even though `gfetch
+  search` and plain `curl` worked fine on the same node.** Reported by the user on an
+  HPC cluster; root-caused without direct access to that machine, then confirmed fixed
+  there. Diagnosis, in order:
+  - Ruled out DNS/general connectivity (curl succeeded) and ruled out `odc.stac.
+    load()`'s known S3-credential-chain hang (point 17 above - `download` never calls
+    `odc.stac.load()`, and Earth Search asset hrefs are plain `https://`, not `s3://`,
+    so `stac_asset` routes them through its `HttpClient`, not an S3 client, confirmed
+    by reading `stac_asset.client.Clients.get_client()`'s scheme-dispatch directly).
+  - Root cause: `stac_asset.HttpClient` builds a bare `aiohttp.ClientSession(timeout=
+    ..., headers=..., middlewares=...)` with no `trust_env=True` - confirmed by
+    reading `stac_asset/http_client.py` directly. Unlike `requests`/`curl` (which read
+    `HTTP_PROXY`/`HTTPS_PROXY` automatically), `aiohttp` silently ignores those env
+    vars unless `trust_env=True` is passed explicitly, and `stac_asset.Config` exposes
+    no field for it. On a network that mandates a proxy for outbound access, this
+    means `search` (via `pystac_client`/`requests`) and `curl` work while `download`
+    (via `stac_asset`/`aiohttp`) attempts a direct connection that the network drops
+    silently - explaining exactly the reported symptom (search fine, download hangs
+    at the very start, no error).
+  - Confirmed on the user's actual HPC node before writing any fix: `env | grep -i
+    proxy` showed proxy vars set, and a bare `aiohttp.ClientSession()` (no
+    `trust_env`) reproduced the hang against the same host `curl` reached fine.
+  - **Fix**: `download.py` now patches `stac_asset.http_client.ClientSession` (the
+    name that module's `from_config()` calls) with a plain factory function
+    defaulting `trust_env=True` - not a subclass, since `aiohttp` explicitly
+    discourages subclassing `ClientSession` (confirmed via a `DeprecationWarning` from
+    an earlier subclassing attempt, corrected before shipping). Applied unconditionally
+    at module import time; safe when no proxy is configured (`trust_env=True` is a
+    strict superset of default behavior).
+  - **Verified the mechanism itself**, not just "no more hang": pointed
+    `HTTP_PROXY`/`HTTPS_PROXY` at a closed local port *after* a real search had
+    already succeeded (isolating `aiohttp`'s behavior specifically), then ran a real
+    download. Before the fix this would succeed (proxy silently ignored); after the
+    fix it failed with `ClientProxyConnectionError: Cannot connect to host
+    127.0.0.1:1` - proof the patch is genuinely routing through the configured proxy,
+    not a false positive. **Confirmed on the user's HPC cluster afterward: downloads
+    now work.**
 
 ## Next steps
 

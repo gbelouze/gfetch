@@ -1,9 +1,11 @@
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest import mock
 
 import pystac
 import pytest
+from rich.progress import Progress
 
 from gfetch.download import download_items
 
@@ -135,6 +137,37 @@ def test_download_items_retry_does_not_corrupt_item(
     item_dir = cache_dir / "item-1"
     assert (item_dir / "red.tif").read_bytes() == b"RED-BYTES"
     assert result.assets["red"].href == str(item_dir / "red.tif")
+
+
+def test_download_items_reports_progress(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    items = []
+    for i in range(3):
+        src = source_dir / f"red-{i}.tif"
+        src.write_bytes(f"RED-{i}".encode() * 1000)
+        items.append(_make_item(f"item-{i}", {"red": src}))
+
+    cache_dir = tmp_path / "cache"
+    progress = Progress(disable=True)
+
+    with mock.patch.object(progress, "add_task", wraps=progress.add_task) as add_task:
+        results = asyncio.run(
+            download_items(items, cache_dir, ["red"], max_concurrent_items=2, progress=progress)
+        )
+
+    assert len(results) == 3
+    for i, result in enumerate(results):
+        item_dir = cache_dir / f"item-{i}"
+        assert (item_dir / "red.tif").read_bytes() == f"RED-{i}".encode() * 1000
+        assert result.assets["red"].href == str(item_dir / "red.tif")
+
+    # One task for the main "Downloading items" bar, plus one per item's own
+    # byte-progress bar.
+    assert add_task.call_count == 1 + len(items)
+    # ...and every one of them was cleaned up (temporary_task's finally block) once
+    # it finished; none linger after the call returns.
+    assert len(progress.tasks) == 0
 
 
 def test_download_items_multiple_items(tmp_path: Path) -> None:

@@ -82,6 +82,7 @@ def search(
     log.info(
         f"Searching {source.name} collection {collection!r} for bbox={bbox} datetime={datetime}"
     )
+    log.debug(f"Opening STAC catalog at {source.api_url}")
     catalog = pystac_client.Client.open(source.api_url)
     result = catalog.search(
         collections=[collection],
@@ -90,7 +91,15 @@ def search(
         query=query,
         max_items=max_items,
     )
-    items = list(result.items())
+
+    matched = result.matched()
+    log.info(f"{matched} item(s) match; fetching..." if matched is not None else "Fetching...")
+
+    items: list[pystac.Item] = []
+    for page_num, page in enumerate(result.pages(), start=1):
+        items.extend(page.items)
+        total = f"/{matched}" if matched is not None else ""
+        log.debug(f"Fetched page {page_num} ({len(items)}{total} items so far)")
     if satellite == "sentinel-2":
         deduped = _dedupe_sentinel2_processing_baseline(items)
         if len(deduped) != len(items):

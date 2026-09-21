@@ -18,7 +18,9 @@ for the full architecture writeup.
 
 - [x] Search: STAC search against Element84 Earth Search (tested) and Planetary Computer
       (source/collection mapping registered, not yet exercised end-to-end)
-- [x] Download: resumable, atomic (temp-write + rename), sentinel-file completion markers
+- [x] Download: resumable, atomic (temp-write + rename), sentinel-file completion
+      markers, works through an HTTP(S) proxy (needed on many HPC compute nodes),
+      one live byte-progress bar per concurrently-downloading item
 - [x] Mosaic: `odc-stac`-backed load/reproject, one native UTM zone at a time, cloud
       masking + composite (an AOI spanning several zones is never warped into one
       arbitrarily-chosen zone)
@@ -56,6 +58,11 @@ uv run gfetch mosaic config.yaml     # compute-only: load, cloud-mask, composite
 (`<output_dir>/mosaic_epsg<code>.zarr`) — a country-scale AOI crossing several zones
 produces several stores, each in its own zone's native CRS, rather than one store
 reprojected into a single arbitrarily-chosen zone.
+
+On an HPC compute node that requires an HTTP(S) proxy for outbound access, set
+`HTTP_PROXY`/`HTTPS_PROXY` as usual — both `search` and `download` respect them (the
+latter needed a fix, since its underlying HTTP library doesn't do this by default; see
+`claude/tech-stack.md`'s decision log for details).
 
 ## Configuration
 

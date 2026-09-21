@@ -37,6 +37,7 @@ def mosaic(config_path: Path) -> None:
         return
 
     items = list(pystac.ItemCollection.from_file(items_path))
+    log.debug(f"Loaded {len(items)} item(s) from {items_path}")
     profile = get_profile(cfg.satellite)
     bands = list(cfg.bands) if cfg.bands else list(profile.default_bands)
 
@@ -52,4 +53,5 @@ def mosaic(config_path: Path) -> None:
     for crs, ds in zone_datasets.items():
         log.info(f"Computing mosaic for {crs}...")
         computed = ds.compute()
+        log.debug(f"{crs}: computed dataset {dict(computed.sizes)}")
         write(computed, cfg.zarr_path(crs))

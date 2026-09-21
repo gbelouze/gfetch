@@ -17,14 +17,52 @@ import tempfile
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
+import aiohttp
 import pystac
+import stac_asset.http_client
 from stac_asset import Config, download_item
+from stac_asset.messages import (
+    ErrorAssetDownload,
+    FinishAssetDownload,
+    Message,
+    OpenUrl,
+    SkipAssetDownload,
+    WriteChunk,
+)
 
 from gfetch.utils.progress import Progress, TaskID, temporary_task
 
 log = logging.getLogger(__name__)
+
+
+def _patch_stac_asset_proxy_support() -> None:
+    """
+    Make stac-asset's downloads respect `HTTP_PROXY`/`HTTPS_PROXY`.
+
+    `stac_asset.HttpClient` builds its `aiohttp.ClientSession` with `trust_env`'s
+    default (`False`) - unlike `requests`/`curl`, `aiohttp` then silently ignores
+    proxy environment variables and attempts a direct connection, which just hangs
+    forever on a network that requires a proxy for egress (e.g. many HPC compute
+    nodes) rather than raising an error. `stac_asset` exposes no config option for
+    this, so this replaces the `ClientSession` constructor it calls with one that
+    defaults `trust_env=True`.
+    """
+
+    def _client_session(*args: Any, trust_env: bool = True, **kwargs: Any) -> aiohttp.ClientSession:
+        # A plain factory, not a ClientSession subclass: aiohttp explicitly
+        # discourages subclassing it, and stac_asset only ever calls this as a
+        # constructor-shaped callable, never checks its type.
+        return aiohttp.ClientSession(*args, trust_env=trust_env, **kwargs)
+
+    # Deliberately swapping a class for a constructor-shaped factory function -
+    # not expressible as a type[ClientSession], since it isn't one.
+    stac_asset.http_client.ClientSession = _client_session  # type: ignore[assignment]
+
+
+_patch_stac_asset_proxy_support()
 
 __all__ = ["download_items"]
 
@@ -77,12 +115,49 @@ async def _retry_async[T](
             delay *= backoff
 
 
+async def _report_asset_progress(
+    messages: asyncio.Queue[Message], progress: Progress, task: TaskID, n_assets: int
+) -> None:
+    """
+    Drive one item's progress bar from its `stac_asset.download_item()` message stream.
+
+    Runs concurrently with the `download_item()` call it was handed the other end of
+    `messages` for, terminating once every asset in that call has reported a terminal
+    message - `download_item()` itself never signals "queue done", so this counts
+    terminal messages instead of waiting for one.
+
+    Parameters
+    ----------
+    messages : asyncio.Queue[Message]
+        The `messages` queue passed to `download_item()`.
+    progress : Progress
+        Progress tracker owning `task`.
+    task : TaskID
+        This item's own bar, already added by the caller.
+    n_assets : int
+        Number of assets being downloaded in this call - how many terminal messages
+        (finish/error/skip) to wait for before returning.
+    """
+    total = 0
+    done = 0
+    while done < n_assets:
+        message = await messages.get()
+        if isinstance(message, OpenUrl) and message.size:
+            total += message.size
+            progress.update(task, total=total)
+        elif isinstance(message, WriteChunk):
+            progress.advance(task, message.size)
+        elif isinstance(message, FinishAssetDownload | ErrorAssetDownload | SkipAssetDownload):
+            done += 1
+
+
 async def _download_item(
     item: pystac.Item,
     cache_dir: Path,
     asset_keys: Sequence[str],
     config: Config,
     semaphore: asyncio.Semaphore,
+    progress: Progress | None = None,
 ) -> pystac.Item:
     """
     Download the requested assets of one STAC item into `cache_dir`, atomically and
@@ -101,6 +176,10 @@ async def _download_item(
         is overridden per call to restrict downloads to the pending asset subset.
     semaphore : asyncio.Semaphore
         Bounds the number of items downloading concurrently across the whole batch.
+    progress : Progress | None
+        Rich progress tracker. When given, this item gets its own byte-progress bar
+        for the duration of its download (added/removed here, self-contained - no
+        separate progress-reporting task elsewhere). Defaults to None.
 
     Returns
     -------
@@ -124,10 +203,28 @@ async def _download_item(
             # per attempt too: download_item() mutates its input item in place (sets
             # its self href, rewrites asset hrefs), so retrying against the same
             # object would hand a failed attempt's corrupted state to the next one.
+            log.debug(f"{item.id}: starting download of {pending_keys}")
             with tempfile.TemporaryDirectory(dir=item_dir) as tmp:
-                downloaded = await download_item(
-                    copy.deepcopy(item), Path(tmp), config=download_config, keep_non_downloaded=True
-                )
+                if progress is None:
+                    downloaded = await download_item(
+                        copy.deepcopy(item),
+                        Path(tmp),
+                        config=download_config,
+                        keep_non_downloaded=True,
+                    )
+                else:
+                    messages: asyncio.Queue[Message] = asyncio.Queue()
+                    with temporary_task(progress, item.id, total=None) as task:
+                        downloaded, _ = await asyncio.gather(
+                            download_item(
+                                copy.deepcopy(item),
+                                Path(tmp),
+                                config=download_config,
+                                keep_non_downloaded=True,
+                                messages=messages,
+                            ),
+                            _report_asset_progress(messages, progress, task, len(pending_keys)),
+                        )
                 for key in pending_keys:
                     # .get_absolute_href() (not .href) is required here:
                     # download_item() always relative-ifies asset hrefs once it
@@ -192,7 +289,11 @@ async def download_items(
         Maximum number of items downloading concurrently; each item's own assets are
         additionally downloaded concurrently by stac-asset internally. Defaults to 4.
     progress : Progress | None
-        Rich progress tracker, advanced once per completed item. Defaults to None.
+        Rich progress tracker: one main bar advanced per completed item, plus one
+        byte-progress bar per item currently downloading (up to `max_concurrent_items`
+        at once) - all on this same tracker, since rich requires a single `Progress`
+        instance to render multiple concurrent bars correctly. Defaults to None (no
+        progress bars).
 
     Returns
     -------
@@ -204,9 +305,13 @@ async def download_items(
     cache_dir.mkdir(parents=True, exist_ok=True)
     config = config or Config()
     semaphore = asyncio.Semaphore(max_concurrent_items)
+    log.info(
+        f"Downloading {len(items)} item(s) x {len(asset_keys)} asset(s) into {cache_dir} "
+        f"(max_concurrent_items={max_concurrent_items})"
+    )
 
     async def _download_one(item: pystac.Item, task: TaskID | None) -> pystac.Item:
-        result = await _download_item(item, cache_dir, asset_keys, config, semaphore)
+        result = await _download_item(item, cache_dir, asset_keys, config, semaphore, progress)
         if progress is not None and task is not None:
             progress.advance(task)
         return result
@@ -216,4 +321,6 @@ async def download_items(
         if progress is not None
         else nullcontext(None)
     ) as task:
-        return list(await asyncio.gather(*(_download_one(item, task) for item in items)))
+        result = list(await asyncio.gather(*(_download_one(item, task) for item in items)))
+    log.info(f"Downloaded {len(result)} item(s) into {cache_dir}")
+    return result

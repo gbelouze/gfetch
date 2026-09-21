@@ -34,6 +34,7 @@ def write(ds: xr.Dataset, path: Path, *, mode: _ZarrMode = "w") -> None:
     mode : _ZarrMode
         `xarray.Dataset.to_zarr` write mode. Defaults to 'w' (overwrite).
     """
+    log.debug(f"Writing dataset {dict(ds.sizes)} to {path} (mode={mode})")
     ds.to_zarr(path, mode=mode)
     log.info(f"Wrote dataset to {path}")
 

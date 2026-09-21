@@ -25,6 +25,7 @@ def search(config_path: Path) -> None:
     query = (
         {"eo:cloud_cover": {"lt": cfg.max_cloud_cover}} if cfg.max_cloud_cover is not None else None
     )
+    log.debug(f"query={query}")
     items = search_items(source, cfg.satellite, cfg.aoi.bbox, cfg.time_range.datetime, query=query)
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)

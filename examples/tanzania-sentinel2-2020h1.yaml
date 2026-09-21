@@ -30,6 +30,6 @@ output_dir: ./output/tanzania-2020h1
 satellite: sentinel-2
 source: earthsearch
 
-max_cloud_cover: 60 # drop scenes that are mostly cloudy before downloading
+max_cloud_cover: 20 # drop scenes that are mostly cloudy before downloading
 resolution: 10.0
 n_workers: 16 # concurrent item downloads; see benchmark/README.md for tuning notes

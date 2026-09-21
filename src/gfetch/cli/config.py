@@ -1,8 +1,11 @@
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 from odc.geo.crs import CRS
 from omegaconf import OmegaConf
+
+log = logging.getLogger(__name__)
 
 __all__ = ["AOIConfig", "Config", "TimeRangeConfig", "load"]
 
@@ -178,8 +181,11 @@ def load(path: Path) -> Config:
     Config
         Fully validated configuration object.
     """
+    log.debug(f"Loading config from {path}")
     from_yaml = OmegaConf.load(path)
     structured = OmegaConf.structured(Config)
     merged = OmegaConf.merge(structured, from_yaml)
     OmegaConf.resolve(merged)
-    return OmegaConf.to_object(merged)  # type: ignore[no-any-return]
+    cfg: Config = OmegaConf.to_object(merged)  # type: ignore[assignment]
+    log.debug(f"Resolved output_dir={cfg.output_dir}")
+    return cfg

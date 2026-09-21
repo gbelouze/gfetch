@@ -67,6 +67,7 @@ def load(
     # Blob Storage with its SAS token already embedded in the href, so `aws_unsigned`
     # is always safe here.
     odc.stac.configure_s3_access(aws_unsigned=True)
+    log.debug(f"Loading {len(items)} item(s), bands={list(bands)}, geobox shape={geobox.shape}")
     ds = odc.stac.load(
         items, bands=list(bands), geobox=geobox, groupby=groupby, chunks=chunks or {}
     )
@@ -300,8 +301,11 @@ def mosaic_by_zone(
     """
     zones = group_by_utm_zone(items)
     log.info(f"Items span {len(zones)} UTM zone(s): {[crs.epsg for crs in zones]}")
-    return {
-        crs: mosaic(
+
+    result: dict[CRS, xr.Dataset] = {}
+    for crs, zone_items in zones.items():
+        log.debug(f"{crs}: {len(zone_items)} item(s)")
+        result[crs] = mosaic(
             zone_items,
             zone_geobox(crs, aoi_bbox, resolution),
             bands,
@@ -311,5 +315,4 @@ def mosaic_by_zone(
             chunks=chunks,
             method=method,
         )
-        for crs, zone_items in zones.items()
-    }
+    return result
