@@ -11,11 +11,21 @@ from collections.abc import Sequence
 import odc.stac
 import pystac
 import xarray as xr
+from odc.geo.crs import CRS
 from odc.geo.geobox import GeoBox
+from odc.geo.geom import BoundingBox, bbox_intersection
 
 log = logging.getLogger(__name__)
 
-__all__ = ["composite", "load", "mask_clouds", "mosaic"]
+__all__ = [
+    "composite",
+    "group_by_utm_zone",
+    "load",
+    "mask_clouds",
+    "mosaic",
+    "mosaic_by_zone",
+    "zone_geobox",
+]
 
 
 def load(
@@ -161,3 +171,145 @@ def mosaic(
     if mask_band is not None:
         ds = mask_clouds(ds, mask_band, mask_out)
     return composite(ds, method=method)
+
+
+def group_by_utm_zone(items: Sequence[pystac.Item]) -> dict[CRS, list[pystac.Item]]:
+    """
+    Group items by the UTM zone their own footprint naturally falls in.
+
+    Each item's zone is resolved from its own STAC `bbox`, not the AOI as a whole -
+    a single Sentinel-2/Landsat tile always fits within one UTM zone, so this reflects
+    each item's actual native CRS.
+
+    Parameters
+    ----------
+    items : Sequence[pystac.Item]
+        Items to group, e.g. as returned by `gfetch.search.search`.
+
+    Returns
+    -------
+    dict[CRS, list[pystac.Item]]
+        Items grouped by native UTM CRS, in first-seen order.
+    """
+    groups: dict[CRS, list[pystac.Item]] = {}
+    for item in items:
+        assert item.bbox is not None
+        crs = CRS.utm(BoundingBox(*item.bbox, crs="EPSG:4326"))
+        groups.setdefault(crs, []).append(item)
+    return groups
+
+
+def _utm_zone_lon_band(crs: CRS) -> tuple[float, float]:
+    """
+    Longitude band (EPSG:4326) covered by a UTM zone.
+
+    Parameters
+    ----------
+    crs : CRS
+        A UTM CRS, as returned by `odc.geo.crs.CRS.utm`.
+
+    Returns
+    -------
+    tuple[float, float]
+        `(west, east)` longitude bounds of the zone's natural 6-degree-wide band.
+    """
+    utm_zone = crs.proj.utm_zone
+    assert utm_zone is not None, f"{crs} is not a UTM CRS"
+    zone_number = int(utm_zone[:-1])
+    west = -180.0 + 6.0 * (zone_number - 1)
+    return west, west + 6.0
+
+
+def zone_geobox(crs: CRS, aoi_bbox: tuple[float, float, float, float], resolution: float) -> GeoBox:
+    """
+    Build the output pixel grid for one UTM zone: the AOI clipped to that zone's own
+    natural longitude band.
+
+    Parameters
+    ----------
+    crs : CRS
+        Target UTM CRS for this zone.
+    aoi_bbox : tuple[float, float, float, float]
+        Full AOI bounding box (min_lon, min_lat, max_lon, max_lat) in EPSG:4326 -
+        may span more than one UTM zone.
+    resolution : float
+        Output pixel resolution, in `crs`'s units (meters, for UTM).
+
+    Returns
+    -------
+    GeoBox
+        Pixel grid covering the portion of `aoi_bbox` that falls within `crs`'s zone.
+    """
+    west, east = _utm_zone_lon_band(crs)
+    aoi = BoundingBox(*aoi_bbox, crs="EPSG:4326")
+    zone_band = BoundingBox(west, aoi.bottom, east, aoi.top, crs="EPSG:4326")
+    # GeoBox.from_bbox() only reprojects when crs is literally the string "utm" - a
+    # resolved CRS object is instead taken as the CRS the bbox values are already in,
+    # so the intersection (computed in EPSG:4326) must be reprojected explicitly first.
+    extent = bbox_intersection([aoi, zone_band]).to_crs(crs)
+    return GeoBox.from_bbox(extent, resolution=resolution)
+
+
+def mosaic_by_zone(
+    items: Sequence[pystac.Item],
+    aoi_bbox: tuple[float, float, float, float],
+    bands: Sequence[str],
+    *,
+    resolution: float,
+    mask_band: str | None = None,
+    mask_out: frozenset[int] = frozenset(),
+    groupby: str = "solar_day",
+    chunks: dict | None = None,
+    method: str = "median",
+) -> dict[CRS, xr.Dataset]:
+    """
+    Mosaic items into one composite per native UTM zone the AOI spans.
+
+    Items are grouped by their own footprint's UTM zone rather than reprojected into
+    one AOI-wide zone chosen from the AOI's centroid - a country-scale AOI spanning
+    several zones produces one dataset per zone instead of warping everything into a
+    single arbitrarily-chosen one.
+
+    Parameters
+    ----------
+    items : Sequence[pystac.Item]
+        Items to mosaic, e.g. as returned by `gfetch.search.search`.
+    aoi_bbox : tuple[float, float, float, float]
+        Full AOI bounding box (min_lon, min_lat, max_lon, max_lat) in EPSG:4326.
+    bands : Sequence[str]
+        Asset keys to load and composite, passed to `mosaic`.
+    resolution : float
+        Output pixel resolution, in each zone's own UTM CRS units (meters).
+    mask_band : str | None
+        Classification band used for cloud masking, passed to `mosaic`. Defaults to
+        None (no masking).
+    mask_out : frozenset[int]
+        Classification values to mask out, passed to `mosaic`. Defaults to an empty
+        frozenset.
+    groupby : str
+        odc-stac grouping strategy, passed to `mosaic`. Defaults to 'solar_day'.
+    chunks : dict | None
+        Dask chunk sizes, passed to `mosaic`. Defaults to None.
+    method : str
+        Composite reduction method, passed to `mosaic`. Defaults to 'median'.
+
+    Returns
+    -------
+    dict[CRS, xr.Dataset]
+        One lazy, dask-backed mosaic per UTM zone spanned by `items`.
+    """
+    zones = group_by_utm_zone(items)
+    log.info(f"Items span {len(zones)} UTM zone(s): {[crs.epsg for crs in zones]}")
+    return {
+        crs: mosaic(
+            zone_items,
+            zone_geobox(crs, aoi_bbox, resolution),
+            bands,
+            mask_band=mask_band,
+            mask_out=mask_out,
+            groupby=groupby,
+            chunks=chunks,
+            method=method,
+        )
+        for crs, zone_items in zones.items()
+    }

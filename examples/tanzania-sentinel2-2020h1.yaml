@@ -5,8 +5,13 @@
 # is a scene-level pre-filter only: it skips downloading scenes that are mostly
 # cloudy to begin with, it isn't what makes the output cloud-free.
 #
-# Whole-country AOIs at Sentinel-2's native 10m resolution produce a large item list
-# and a large output Zarr store - see claude/tech-stack.md's note on Zarr's
+# Tanzania spans three UTM zones (35S/36S/37S). `gfetch mosaic` writes one Zarr store
+# per zone it actually spans (mosaic_epsg327{35,36,37}.zarr under output_dir), each
+# reprojected/resampled independently rather than warped into one arbitrarily-chosen
+# zone - see gfetch.mosaic.mosaic_by_zone.
+#
+# Whole-country AOIs at Sentinel-2's native 10m resolution still produce a large item
+# list and large per-zone Zarr stores - see claude/tech-stack.md's note on Zarr's
 # one-file-per-chunk layout at country scale. Run `gfetch search` first and check the
 # item count before committing to `download`/`mosaic`.
 

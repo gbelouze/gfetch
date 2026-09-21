@@ -19,8 +19,11 @@ for the full architecture writeup.
 - [x] Search: STAC search against Element84 Earth Search (tested) and Planetary Computer
       (source/collection mapping registered, not yet exercised end-to-end)
 - [x] Download: resumable, atomic (temp-write + rename), sentinel-file completion markers
-- [x] Mosaic: `odc-stac`-backed load/reproject onto a common AOI grid, cloud masking + composite
-- [x] Write: plain Zarr output, incl. pre-planned per-worker disjoint-region writes
+- [x] Mosaic: `odc-stac`-backed load/reproject, one native UTM zone at a time, cloud
+      masking + composite (an AOI spanning several zones is never warped into one
+      arbitrarily-chosen zone)
+- [x] Write: plain Zarr output, one store per UTM zone the AOI spans, incl. pre-planned
+      per-worker disjoint-region writes
 - [x] Stage separation: `search`/`download`/`mosaic` independently callable CLI subcommands
       (mosaic build + write share one subcommand — no benefit to splitting across SLURM jobs
       when both run compute-only, back to back, in the same process)
@@ -48,6 +51,11 @@ uv run gfetch search config.yaml     # internet-connected: find matching STAC it
 uv run gfetch download config.yaml   # internet-connected: download assets to a local cache
 uv run gfetch mosaic config.yaml     # compute-only: load, cloud-mask, composite, write to Zarr
 ```
+
+`mosaic` writes one Zarr store per UTM zone the AOI spans
+(`<output_dir>/mosaic_epsg<code>.zarr`) — a country-scale AOI crossing several zones
+produces several stores, each in its own zone's native CRS, rather than one store
+reprojected into a single arbitrarily-chosen zone.
 
 ## Configuration
 

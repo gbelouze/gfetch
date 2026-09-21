@@ -366,6 +366,13 @@ layer: it fixes the collection name per source (`sentinel-2-l2a` vs
 (Sentinel-2 SCL), default resampling, and default `groupby`/chunking — so the common case
 really is "give me an AOI," while every default stays overridable.
 
+**2026-09-21 update**: `[load/mosaic]`/`[write]` produce **one `xarray.Dataset`/Zarr
+store per UTM zone the AOI spans**, not the single dataset/store the diagram above
+shows — see the Decision log entry below for why. `mosaic_by_zone()` groups items by
+their own native UTM zone (not the AOI's), builds one `GeoBox` per zone (clipped to
+that zone's natural longitude band), and mosaics each zone independently; `[write]` is
+called once per zone's dataset.
+
 ## HPC / distributed execution
 
 Added 2026-09-19 after the initial architecture pass, in response to a hard requirement:
@@ -786,6 +793,46 @@ the repro and fix — gfetch's download stage must apply this fix before handing
     gfetch's own default source, confirmed still worth keeping (see `benchmark/
     README.md` point 18 for the full reasoning and the open question of whether
     Planetary Computer's collection has the same issue).
+- **2026-09-21** — Reworked the mosaic/write stage to produce **one output per native
+  UTM zone an AOI spans**, instead of reprojecting everything into a single zone
+  auto-picked from the AOI's centroid (`GeoBox.from_bbox(bbox, crs="utm", ...)`, the
+  original v1 design). Prompted by the user asking what CRS a country-scale AOI (e.g.
+  Tanzania, spanning UTM zones 35S/36S/37S) would end up in - the honest answer was
+  "one arbitrarily-chosen zone, with real distortion growing toward the AOI's edges
+  and a needlessly huge single grid (Tanzania: ~123,873 x 120,008px at 10m in one
+  zone)." Decided **not** to keep this as the default and add a `crs` override later;
+  instead, native-per-zone is now the only mode (a `crs` override to force one from
+  the CLI/config, e.g. for users who explicitly want a single-zone output despite the
+  distortion, is a plausible small follow-up but not built).
+  - `gfetch.mosaic.group_by_utm_zone()`: groups items by their **own** footprint's
+    UTM zone (resolved via `odc.geo.crs.CRS.utm()` on each item's STAC `bbox`), not
+    the AOI as a whole - correct even if a single search AOI spans items whose tiles
+    fall in different zones near a boundary.
+  - `gfetch.mosaic.zone_geobox()`: builds each zone's output grid from the AOI bbox
+    **clipped to that zone's natural 6-degree-wide longitude band** (derived from the
+    zone number), not from the union of whichever items happened to be returned -
+    deterministic and reproducible independent of item availability/gaps near a zone
+    boundary.
+  - `gfetch.mosaic.mosaic_by_zone()`: the new top-level entry point, returns
+    `dict[CRS, xr.Dataset]`; `cli/mosaic.py` calls `write()` once per zone, to
+    `Config.zarr_path(crs)` (now a method, not a fixed property) -
+    `<output_dir>/mosaic_epsg<code>.zarr` per zone.
+  - **Real bug found while implementing this, worth recording**: `GeoBox.from_bbox()`
+    only reprojects its `bbox` argument when `crs` is literally the string `"utm"` (a
+    special-cased sentinel) - passing a concrete, already-resolved `CRS` object
+    instead makes it treat the bbox's raw numeric values as **already being in that
+    CRS's units**, with no reprojection at all (confirmed by reading
+    `GeoBox.from_bbox`'s source directly: a plain tuple or a `BoundingBox` with a
+    non-None `.crs` bypasses the "utm"-string reprojection branch entirely). This
+    silently produced a nonsensical 1x1-pixel geobox near the UTM false-origin in an
+    early version of `zone_geobox()` before being caught by a unit test. **Fix**:
+    explicitly `.to_crs(crs)` the EPSG:4326 intersection bbox before calling
+    `GeoBox.from_bbox()`, never relying on `from_bbox`'s own `crs=` kwarg to
+    reproject a resolved (non-"utm"-string) CRS.
+  - Verified end-to-end against live Earth Search data: a real AOI straddling the
+    35S/36S boundary near 30°E correctly split into two `mosaic_epsg327{35,36}.zarr`
+    stores via the full `gfetch search` → `gfetch mosaic` CLI path, both readable back
+    with `xarray.open_zarr()` and the expected CRS.
 
 ## Next steps
 
@@ -802,3 +849,7 @@ a real CLI smoke test against live data) are all done. Remaining work, in rough 
    shouldn't be used for capacity planning as-is.
 4. Start a `claude/tasks.md` (mirroring lsatfetch's) once further implementation issues
    turn up.
+5. Optional `crs` override for `mosaic`/`mosaic_by_zone`, for users who want a single
+   target CRS despite the per-zone default (e.g. matching an existing dataset's grid) —
+   requested as a "maybe later" by the user when native-per-zone was decided
+   (2026-09-21), not designed or built yet.

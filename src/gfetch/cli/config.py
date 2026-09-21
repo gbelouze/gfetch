@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from odc.geo.crs import CRS
 from omegaconf import OmegaConf
 
 __all__ = ["AOIConfig", "Config", "TimeRangeConfig", "load"]
@@ -144,15 +145,23 @@ class Config:
         """
         return self.output_dir / "cached_items.json"
 
-    @property
-    def zarr_path(self) -> Path:
+    def zarr_path(self, crs: CRS) -> Path:
         """
+        Output Zarr store path for one UTM zone's mosaic, written by the `write`
+        stage. The AOI may span several UTM zones, each written to its own store -
+        see `gfetch.mosaic.mosaic_by_zone`.
+
+        Parameters
+        ----------
+        crs : CRS
+            UTM zone this mosaic was computed in.
+
         Returns
         -------
         Path
-            Output Zarr store path, written by the `write` stage.
+            Output Zarr store path for this zone.
         """
-        return self.output_dir / "mosaic.zarr"
+        return self.output_dir / f"mosaic_epsg{crs.epsg}.zarr"
 
 
 def load(path: Path) -> Config:

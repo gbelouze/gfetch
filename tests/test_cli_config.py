@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import yaml
+from odc.geo.crs import CRS
 
 from gfetch.cli.config import load
 
@@ -35,7 +36,7 @@ def test_config_derived_paths(tmp_path: Path) -> None:
     assert cfg.cache_dir == cfg.output_dir / "cache"
     assert cfg.items_path == cfg.output_dir / "items.json"
     assert cfg.cached_items_path == cfg.output_dir / "cached_items.json"
-    assert cfg.zarr_path == cfg.output_dir / "mosaic.zarr"
+    assert cfg.zarr_path(CRS("EPSG:32736")) == cfg.output_dir / "mosaic_epsg32736.zarr"
 
 
 def test_load_overrides(tmp_path: Path) -> None:
