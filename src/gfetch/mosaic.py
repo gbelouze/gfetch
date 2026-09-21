@@ -51,6 +51,12 @@ def load(
     xr.Dataset
         Lazy, dask-backed dataset with one data variable per band.
     """
+    # Without this, GDAL/rasterio falls through to botocore's full credential chain on
+    # every S3 asset, hanging on an EC2-instance-metadata lookup that never succeeds
+    # off-EC2. Every gfetch STAC source is either an unsigned public S3 bucket or Azure
+    # Blob Storage with its SAS token already embedded in the href, so `aws_unsigned`
+    # is always safe here.
+    odc.stac.configure_s3_access(aws_unsigned=True)
     ds = odc.stac.load(
         items, bands=list(bands), geobox=geobox, groupby=groupby, chunks=chunks or {}
     )

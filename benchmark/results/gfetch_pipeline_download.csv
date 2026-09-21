@@ -1,0 +1,3 @@
+scenario,n_items,n_bytes,elapsed_s,mb_s
+wide,9,5557954121,69.08,80.46
+deep,13,7931663963,87.92,90.21

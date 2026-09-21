@@ -222,6 +222,82 @@ download-stage design, confirmed rather than newly discovered.
 | `sentinelhub-py` / `eo-learn` | **Rejected** | Tied to Sentinel Hub's paid API; EO Browser/Dashboard sunset already announced — same vendor-risk class we're avoiding. |
 | `cdsetool` | **Rejected** | Narrow CDSE-specific CLI/API tool, same category as phidown, low priority. |
 
+## Reference implementations (inspiration repos)
+
+Full end-to-end pipelines worth checking against when designing/implementing a gfetch
+stage — not dependencies, but real running code solving close variants of the same
+problem. Each entry below was actually cloned and read (source, not just the landing
+page/README) before being added here.
+
+- **[ljstrnadiii/flytemosaic](https://github.com/ljstrnadiii/flytemosaic)** (reviewed
+  2026-09-19, re-reviewed 2026-09-20 — see `benchmark/README.md` for the full
+  investigation log). STAC → GDAL Raster Tile Index (GTI) → rioxarray → Zarr mosaic
+  pipeline, orchestrated with Flyte (explicitly not adopted — gfetch has no hosted-
+  orchestration ambition). Worth stealing:
+  - `flytemosaic/gdal_configs.py::get_worker_config()` — a concrete, real-world set of
+    cloud-tuned GDAL/CPL options (HTTP/2 multiplexing, bigger `CPL_VSIL_CURL_CHUNK_SIZE`,
+    `GDAL_NUM_THREADS=ALL_CPUS`), reused directly in `benchmark/wide_gdal_config.py`.
+  - `flyte/build.py::write_mosaic_partition_task` — the real production concurrency
+    pattern behind that config: a **single-threaded** dask scheduler per worker, relying
+    on GDAL's own internal thread pool + HTTP/2 instead of a big Python thread pool, and
+    scaling out via **separate processes** (one per chunk partition) instead. A live,
+    not-yet-confirmed candidate for gfetch's own `mosaic`/`write` stage concurrency
+    model — see the "Open threads" in `benchmark/README.md`.
+  - `flytemosaic/mosaics.py::build_recommended_gti` / `build_gti_xarray` — builds a GDAL
+    Raster Tile Index (`ogr2ogr`-built FlatGeobuf, embedding dtype/extent/CRS/band-count)
+    so GDAL never has to open/inspect each source COG to plan a mosaic. odc-stac solves
+    the same problem differently (via STAC item properties), so not directly portable,
+    but confirms metadata-probe overhead is a real, known cost class here.
+  - Not adopted: Flyte orchestration itself, and the separate ingest stage that
+    re-downloads/re-encodes every source file into a uniformly-tiled COG before
+    mosaicking (a stronger, more invasive version of gfetch's `download` stage, which
+    only caches original bytes) — flagged as a possible future refinement, not decided.
+
+- **[earth-mover/serverless-datacube-demo](https://github.com/earth-mover/serverless-datacube-demo)**
+  (landing-page-level review 2026-09-19, actual source read 2026-09-20). STAC (Earth
+  Search) → `odc.stac.load` → SCL cloud-mask → median composite → Zarr/Icechunk cube,
+  runnable on Coiled/Modal/Lithops behind one `click` CLI. Demo-quality, "fork and
+  modify" per its own README, not a maintained package. Worth stealing:
+  - `src/lib.py::JobConfig.tiles` uses `odc.geo.geobox.GeoboxTiles` to derive a strict
+    tile grid over the target geobox, then indexes each processing job by
+    `(tile_index, year, month)` — a cleaner, library-provided way to get gfetch's
+    already-verified disjoint-region-per-worker write plan (see "HPC / distributed
+    execution" above) than hand-rolled index math.
+  - `src/lib.py::JobConfig.generate_jobs` skips tiles that don't intersect land
+    (`cartopy.feature.LAND.intersecting_geometries`) before ever issuing a STAC search
+    for that tile — a real "skip known-empty work early" pattern worth considering once
+    gfetch does country/continent-scale tiling.
+  - `src/lib.py`'s cloud-masking uses `odc.algo.mask_cleanup`/`erase_bad` (morphological
+    closing/opening on the SCL-derived mask before compositing) rather than a bare
+    boolean class-exclusion mask — more robust than gfetch's current POC-stage SCL
+    handling (a plain `{0,1,3,8,9,10}` class-set exclusion, see "POC log" below); worth
+    adopting `odc.algo` for the real `mosaic` stage's cloud-masking instead of hand-rolling.
+  - `src/storage.py::AbstractStorage` (`initialize()`/`get_zarr_store()`/`commit()`)
+    cleanly abstracts a plain-Zarr/fsspec store vs. an Icechunk-backed one behind one
+    interface — the same "plain Zarr default, Icechunk opt-in" shape gfetch already
+    decided on (see "Compute-stage output durability" below), concretely implemented.
+    Worth using as a reference shape for gfetch's own write-stage storage abstraction
+    when that's built, rather than re-deriving the interface from scratch.
+  - `icechunk.distributed.merge_sessions()`, used in `ArraylakeStorage.commit()` to
+    merge each worker's `icechunk.Session` into one commit — **real, running proof** of
+    the "many workers write disjoint chunks via per-worker sessions, then merge via a
+    coordinator" pattern that `tech-stack.md`'s Icechunk section flagged as the
+    documented distributed-write model but noted as unverified for worker-death
+    behavior. Doesn't resolve that open question (worker-death-before-merge still
+    isn't exercised here), but confirms the happy-path mechanism is real and used in
+    production-adjacent code, not just documented in theory.
+  - `src/lib.py::ChunkProcessingJob.process` writes raw numpy arrays directly into a
+    `zarr.Array` via slice assignment (`target_array[target_slice] = raw_data[None,
+    ...]`) instead of `xarray.Dataset.to_zarr(region=...)` — a lower-level, likely
+    faster path that avoids per-write xarray/dask overhead, at the cost of manually
+    tracking the time index (their own comment: "not writing with xarray, so have to
+    reverse engineer the time index"). An alternative worth benchmarking against
+    gfetch's current xarray-region-write pattern (POC log below) before the real
+    `write` stage is built, not something to adopt sight-unseen.
+  - Not adopted: the multi-backend serverless dispatch (Coiled/Modal/Lithops) and
+    Arraylake as a storage target — both out of scope per gfetch's non-goals (no hosted
+    service, no proprietary storage backend as anything but an opt-in).
+
 ## STAC source landscape
 
 "STAC source" is not one architectural shape — there's a real fork between a live search
@@ -438,6 +514,16 @@ the repro and fix — gfetch's download stage must apply this fix before handing
   user wants a Dask-based compute stage alongside a separate download stage, they'll need
   two `SLURMCluster`s handed off via shared filesystem. This is a user-facing
   documentation point for gfetch, not something gfetch needs to solve in code.
+- **Long-term goal, flagged pre-production (2026-09-19):** Zarr's default layout is
+  one file per chunk per variable. A country-scale AOI at 10m resolution with small
+  chunks (e.g. the ~5km default) and several bands can land in the tens/hundreds of
+  thousands of files — a real concern on Lustre/GPFS-class HPC filesystems (per-user
+  inode quotas, metadata-server overhead), not just a performance nicety. Needs a
+  deliberate chunk-size sizing pass (and/or Zarr v3 sharding, which packs multiple
+  chunks into one file specifically to address this) before gfetch is used in
+  production at country scale. Not blocking v1/POC work.
+- ~~Sentinel-2 `search` stage needs processing-baseline resolution~~ — **resolved
+  2026-09-21**, see Decision log.
 
 ## POC log
 
@@ -653,6 +739,53 @@ the repro and fix — gfetch's download stage must apply this fix before handing
     serializing/deserializing `pystac.ItemCollection` JSON files under `output_dir`
     (`items.json`, `cached_items.json`) — confirmed round-trips absolute local hrefs
     and self hrefs correctly before relying on it.
+- **2026-09-20** — Started a "Reference implementations (inspiration repos)" list (see
+  above) of full end-to-end pipelines worth checking against when building a gfetch
+  stage, as opposed to individual libraries. Added `ljstrnadiii/flytemosaic` (already
+  under investigation for `benchmark/`'s GDAL-config work) and
+  `earth-mover/serverless-datacube-demo` (previously only skimmed at the landing-page
+  level in "Source-by-source findings" above, now actually read source-first) as the
+  first two entries, each with concrete "worth stealing" vs. "not adopted" call-outs
+  rather than a general summary.
+- **2026-09-21** — Fed two `benchmark/`-investigation findings back into `src/gfetch/`
+  (see `benchmark/README.md` for the full investigation this drew from):
+  - `mosaic.py::load()` now calls `odc.stac.configure_s3_access(aws_unsigned=True)`
+    before `odc.stac.load()`. Without it, GDAL/rasterio falls through to botocore's
+    full credential chain (including an EC2-instance-metadata lookup that hangs until
+    TCP timeout off-EC2) on every S3 asset — this alone took the benchmark's measured
+    throughput from ~4MB/s to ~11-16MB/s. `aws_unsigned=True` is safe unconditionally:
+    both current sources (Earth Search's public S3 bucket, Planetary Computer's SAS-
+    signed Azure Blob hrefs) work fine with it, since it only affects AWS credential
+    resolution.
+  - `search()` now dedupes Sentinel-2 results to one item per (tile, date), keeping the
+    highest `s2:processing_baseline`, resolving the open question above. Confirmed via
+    the benchmark that Earth Search legitimately double-lists reprocessed
+    tiles/dates and that blending baselines in one composite is a radiometric
+    correctness risk (baseline 04.00 changed how DN values encode reflectance), not
+    just wasted bandwidth.
+  - **Not applied**: dask thread-count tuning for the compute step. The benchmark
+    found opposite-direction effects (more threads help a remote/direct load, but can
+    actively hurt a post-download local load via memory pressure) with no single good
+    default across scenarios — left as future, scenario-aware tuning rather than a
+    blanket change. GDAL config tuning (`GDAL_HTTP_MULTIPLEX`/aggressive caching) was
+    inconclusive in the benchmark (two configs pathologically hung rather than being
+    confirmed slower) and also not carried over.
+  - Added `benchmark/gfetch_pipeline.py`, a benchmark case that exercises gfetch's own
+    `search`/`download`/`mosaic` functions end-to-end against the same "wide"/"deep"
+    scenarios as the rest of `benchmark/`, to check gfetch's real throughput against
+    these reference numbers now that the fixes above are in place. **Ran it**:
+    download throughput is 80-90 MB/s (wide/deep), load throughput up to ~440 Mpix/s
+    (wide, chunk=7168) - in line with, not behind, the reference numbers; an initial
+    reading that gfetch's download was ~2x slower than `two_stage_mosaic.py`'s own
+    reimplementation turned out to be a stale-cache measurement artifact in the
+    latter's own reference CSV, not a real gap (see `benchmark/README.md` point 18).
+    Also confirmed gfetch's actual configured Earth Search collection
+    (`sentinel-2-c1-l2a`) doesn't hit the processing-baseline duplication bug the
+    dedup fix above targets - Element84's Collection 1 reprocessing already resolves
+    to one item per tile/date - so that fix is currently defensive/dormant against
+    gfetch's own default source, confirmed still worth keeping (see `benchmark/
+    README.md` point 18 for the full reasoning and the open question of whether
+    Planetary Computer's collection has the same issue).
 
 ## Next steps
 

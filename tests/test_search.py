@@ -1,7 +1,39 @@
+import datetime
+
+import pystac
 import pytest
 
-from gfetch.search import search
+from gfetch.search import _dedupe_sentinel2_processing_baseline, search
 from gfetch.sources import get_source
+
+
+def _s2_item(item_id: str, *, grid_code: str, date: str, baseline: str) -> pystac.Item:
+    return pystac.Item(
+        id=item_id,
+        geometry=None,
+        bbox=None,
+        datetime=datetime.datetime.fromisoformat(date).replace(tzinfo=datetime.UTC),
+        properties={"grid:code": grid_code, "s2:processing_baseline": baseline},
+    )
+
+
+def test_dedupe_sentinel2_processing_baseline_keeps_highest_baseline() -> None:
+    old = _s2_item("old", grid_code="MGRS-35MNM", date="2020-06-06", baseline="02.14")
+    new = _s2_item("new", grid_code="MGRS-35MNM", date="2020-06-06", baseline="05.00")
+
+    deduped = _dedupe_sentinel2_processing_baseline([old, new])
+
+    assert [item.id for item in deduped] == ["new"]
+
+
+def test_dedupe_sentinel2_processing_baseline_keeps_distinct_tiles_and_dates() -> None:
+    tile_a = _s2_item("a", grid_code="MGRS-35MNM", date="2020-06-06", baseline="02.14")
+    tile_b = _s2_item("b", grid_code="MGRS-35MNN", date="2020-06-06", baseline="02.14")
+    other_date = _s2_item("c", grid_code="MGRS-35MNM", date="2020-06-16", baseline="02.14")
+
+    deduped = _dedupe_sentinel2_processing_baseline([tile_a, tile_b, other_date])
+
+    assert {item.id for item in deduped} == {"a", "b", "c"}
 
 
 @pytest.mark.slow

@@ -16,3 +16,6 @@ wheels/
 
 # MacOS
 .DS_Store
+
+# Benchmark scratch data (downloaded imagery, not source)
+benchmark/cache/

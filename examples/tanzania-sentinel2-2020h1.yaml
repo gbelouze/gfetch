@@ -1,0 +1,30 @@
+# Sentinel-2 cloud-free median mosaic over Tanzania, January-June 2020.
+#
+# Per-pixel cloud/shadow masking (via the SCL band) and the median composite are
+# automatic for the sentinel-2 profile - see gfetch.profiles. `max_cloud_cover` below
+# is a scene-level pre-filter only: it skips downloading scenes that are mostly
+# cloudy to begin with, it isn't what makes the output cloud-free.
+#
+# Whole-country AOIs at Sentinel-2's native 10m resolution produce a large item list
+# and a large output Zarr store - see claude/tech-stack.md's note on Zarr's
+# one-file-per-chunk layout at country scale. Run `gfetch search` first and check the
+# item count before committing to `download`/`mosaic`.
+
+aoi:
+  left: 29.34
+  bottom: -11.75
+  right: 40.45
+  top: -0.99
+
+time_range:
+  start: "2020-01-01"
+  end: "2020-07-01" # exclusive-ish: covers all of June
+
+output_dir: ./output/tanzania-2020h1
+
+satellite: sentinel-2
+source: earthsearch
+
+max_cloud_cover: 60 # drop scenes that are mostly cloudy before downloading
+resolution: 10.0
+n_workers: 16 # concurrent item downloads; see benchmark/README.md for tuning notes

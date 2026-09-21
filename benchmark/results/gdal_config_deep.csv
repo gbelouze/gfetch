@@ -1,0 +1,8 @@
+config,num_workers,n_bytes,elapsed_s,mpix_s,mb_s,timed_out,completed_tasks,total_tasks
+baseline,11,3132417536,120.01,13.0512,26.1,True,485,672
+baseline,64,4340174400,49.03,44.2628,88.53,False,672,672
+multiplex_only,11,3177627686,120.0,13.24,26.48,True,492,672
+multiplex_only,64,4340174400,45.43,47.7664,95.53,False,672,672
+aggressive,11,703986621,121.23,2.9036,5.81,True,109,672
+aggressive,64,477935871,120.47,1.9837,3.97,True,74,672
+single_threaded_gdal_threads,1,310012457,120.06,1.2911,2.58,True,48,672

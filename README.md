@@ -51,6 +51,9 @@ uv run gfetch mosaic config.yaml     # compute-only: load, cloud-mask, composite
 
 ## Configuration
 
+See [`examples/tanzania-sentinel2-2020h1.yaml`](examples/tanzania-sentinel2-2020h1.yaml)
+for a worked example (Sentinel-2 cloud-free median mosaic, Tanzania, Jan-Jun 2020).
+
 See `claude/tech-stack.md` and `claude/dev-stack.md` for the architecture and tooling
 decisions behind this project.
 
