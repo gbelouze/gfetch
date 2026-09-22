@@ -26,6 +26,7 @@ def test_load_minimal_config(tmp_path: Path) -> None:
     assert cfg.satellite == "sentinel-2"
     assert cfg.source == "earthsearch"
     assert cfg.bands is None
+    assert cfg.resampling == {}
     assert cfg.orbit_state is None
     assert cfg.output_dir == Path(tmp_path).expanduser().absolute()
 
@@ -48,6 +49,7 @@ def test_load_overrides(tmp_path: Path) -> None:
         bands=["red", "green"],
         max_cloud_cover=20.0,
         n_workers=8,
+        resampling={"*": "bilinear", "scl": "nearest"},
         orbit_state="ascending",
     )
     cfg = load(config_path)
@@ -56,4 +58,5 @@ def test_load_overrides(tmp_path: Path) -> None:
     assert cfg.bands == ["red", "green"]
     assert cfg.max_cloud_cover == 20.0
     assert cfg.n_workers == 8
+    assert cfg.resampling == {"*": "bilinear", "scl": "nearest"}
     assert cfg.orbit_state == "ascending"

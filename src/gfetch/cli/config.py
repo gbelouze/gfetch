@@ -1,5 +1,5 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from odc.geo.crs import CRS
@@ -104,6 +104,12 @@ class Config:
         Defaults to 10.0.
     n_workers : int
         Maximum number of items downloading concurrently. Defaults to 4.
+    resampling : dict[str, str]
+        Per-band resampling method, e.g. `{"nir09": "bilinear"}`. A `"*"` key sets the
+        default for bands not otherwise listed. The satellite profile's cloud-mask
+        band, if any, is always loaded with 'nearest' resampling regardless of this
+        setting. Defaults to an empty dict, which uses odc-stac's own default
+        ('nearest' for every band).
     """
 
     aoi: AOIConfig
@@ -116,6 +122,7 @@ class Config:
     orbit_state: str | None = None
     resolution: float = 10.0
     n_workers: int = 4
+    resampling: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.output_dir = Path(self.output_dir).expanduser().absolute()

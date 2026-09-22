@@ -3,10 +3,17 @@ import datetime
 import numpy as np
 import pystac
 import pytest
+import xarray as xr
 from odc.geo.crs import CRS
 from odc.geo.geobox import GeoBox
 
-from gfetch.mosaic import group_by_utm_zone, mosaic, mosaic_by_zone, zone_geobox
+from gfetch.mosaic import (
+    _pin_mask_band_resampling,
+    group_by_utm_zone,
+    mosaic,
+    mosaic_by_zone,
+    zone_geobox,
+)
 from gfetch.profiles import get_profile
 from gfetch.search import search
 from gfetch.sources import get_source
@@ -55,6 +62,52 @@ def test_zone_geobox_clips_aoi_to_zone_band() -> None:
     assert clipped.left == pytest.approx(29.0, abs=0.05)
     assert clipped.right == pytest.approx(30.0, abs=0.05)
     assert clipped.right < 31.0  # stayed clipped to the 35S zone, not the full AOI
+
+
+@pytest.mark.parametrize(
+    ("resampling", "mask_band", "expected"),
+    [
+        (None, None, None),
+        (None, "scl", {"scl": "nearest"}),
+        ("bilinear", "scl", {"*": "bilinear", "scl": "nearest"}),
+        ({"nir09": "cubic"}, "scl", {"nir09": "cubic", "scl": "nearest"}),
+        # user-requested resampling for the mask band itself is overridden
+        ({"scl": "bilinear"}, "scl", {"scl": "nearest"}),
+    ],
+)
+def test_pin_mask_band_resampling(
+    resampling: str | dict[str, str] | None,
+    mask_band: str | None,
+    expected: str | dict[str, str] | None,
+) -> None:
+    assert _pin_mask_band_resampling(resampling, mask_band) == expected
+
+
+def test_mosaic_pins_mask_band_to_nearest_even_with_explicit_override(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_load(items, geobox, bands, *, groupby, chunks, resampling):
+        captured["resampling"] = resampling
+        return xr.Dataset(
+            {
+                "red": (("time", "y", "x"), np.array([[[1.0]]])),
+                "scl": (("time", "y", "x"), np.array([[[4]]])),
+            },
+            coords={"time": [datetime.datetime(2020, 6, 6, tzinfo=datetime.UTC)]},
+        )
+
+    monkeypatch.setattr("gfetch.mosaic.load", fake_load)
+
+    mosaic(
+        [],
+        GeoBox.from_bbox((0, 0, 1, 1), crs="EPSG:4326", shape=(1, 1)),
+        ["red"],
+        mask_band="scl",
+        mask_out=frozenset({0}),
+        resampling={"*": "bilinear", "scl": "cubic"},
+    )
+
+    assert captured["resampling"] == {"*": "bilinear", "scl": "nearest"}
 
 
 @pytest.mark.slow

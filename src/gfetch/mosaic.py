@@ -35,6 +35,7 @@ def load(
     *,
     groupby: str = "solar_day",
     chunks: dict | None = None,
+    resampling: str | dict[str, str] | None = None,
 ) -> xr.Dataset:
     """
     Load STAC items onto a common grid, lazily (dask-backed).
@@ -55,6 +56,11 @@ def load(
     chunks : dict | None
         Dask chunk sizes, e.g. `{"time": 1, "x": 512, "y": 512}`. Defaults to None,
         which uses odc-stac's own default chunking.
+    resampling : str | dict[str, str] | None
+        Resampling method, passed straight through to `odc.stac.load`. Either one
+        method for every band, or a per-band `dict[str, str]` (a `"*"` key sets the
+        default for bands not otherwise listed). Defaults to None, which falls back to
+        odc-stac's own default ('nearest' for every band).
 
     Returns
     -------
@@ -69,7 +75,12 @@ def load(
     odc.stac.configure_s3_access(aws_unsigned=True)
     log.debug(f"Loading {len(items)} item(s), bands={list(bands)}, geobox shape={geobox.shape}")
     ds = odc.stac.load(
-        items, bands=list(bands), geobox=geobox, groupby=groupby, chunks=chunks or {}
+        items,
+        bands=list(bands),
+        geobox=geobox,
+        groupby=groupby,
+        chunks=chunks or {},
+        resampling=resampling,
     )
     log.info(f"Loaded dataset: {dict(ds.sizes)}")
     return ds
@@ -123,6 +134,41 @@ def composite(ds: xr.Dataset, *, dim: str = "time", method: str = "median") -> x
     return reducer(dim=dim, skipna=True)
 
 
+def _pin_mask_band_resampling(
+    resampling: str | dict[str, str] | None, mask_band: str | None
+) -> str | dict[str, str] | None:
+    """
+    Force `mask_band` to 'nearest' resampling, regardless of `resampling`.
+
+    A classification band (e.g. Sentinel-2's SCL) holds categorical values -
+    interpolating them with anything but nearest-neighbor produces class values that
+    were never in the source data.
+
+    Parameters
+    ----------
+    resampling : str | dict[str, str] | None
+        Resampling method requested for the data bands, as passed to `mosaic`.
+    mask_band : str | None
+        Classification band to pin to 'nearest', or None if there is none.
+
+    Returns
+    -------
+    str | dict[str, str] | None
+        `resampling` unchanged if `mask_band` is None, otherwise a `dict[str, str]`
+        with `mask_band` forced to 'nearest'.
+    """
+    if mask_band is None:
+        return resampling
+    if resampling is None:
+        per_band: dict[str, str] = {}
+    elif isinstance(resampling, dict):
+        per_band = dict(resampling)
+    else:
+        per_band = {"*": resampling}
+    per_band[mask_band] = "nearest"
+    return per_band
+
+
 def mosaic(
     items: Sequence[pystac.Item],
     geobox: GeoBox,
@@ -133,6 +179,7 @@ def mosaic(
     groupby: str = "solar_day",
     chunks: dict | None = None,
     method: str = "median",
+    resampling: str | dict[str, str] | None = None,
 ) -> xr.Dataset:
     """
     Load, cloud-mask, and composite STAC items into a single mosaic.
@@ -158,6 +205,10 @@ def mosaic(
         Dask chunk sizes, passed to `load`. Defaults to None.
     method : str
         Composite reduction method, passed to `composite`. Defaults to 'median'.
+    resampling : str | dict[str, str] | None
+        Resampling method for the data bands, passed to `load`. `mask_band`, if given,
+        is always loaded with 'nearest' resampling regardless of this setting, since it
+        holds categorical values. Defaults to None (odc-stac's own default).
 
     Returns
     -------
@@ -168,7 +219,14 @@ def mosaic(
     if mask_band is not None and mask_band not in load_bands:
         load_bands.append(mask_band)
 
-    ds = load(items, geobox, load_bands, groupby=groupby, chunks=chunks)
+    ds = load(
+        items,
+        geobox,
+        load_bands,
+        groupby=groupby,
+        chunks=chunks,
+        resampling=_pin_mask_band_resampling(resampling, mask_band),
+    )
     if mask_band is not None:
         ds = mask_clouds(ds, mask_band, mask_out)
     return composite(ds, method=method)
@@ -262,6 +320,7 @@ def mosaic_by_zone(
     groupby: str = "solar_day",
     chunks: dict | None = None,
     method: str = "median",
+    resampling: str | dict[str, str] | None = None,
 ) -> dict[CRS, xr.Dataset]:
     """
     Mosaic items into one composite per native UTM zone the AOI spans.
@@ -293,6 +352,10 @@ def mosaic_by_zone(
         Dask chunk sizes, passed to `mosaic`. Defaults to None.
     method : str
         Composite reduction method, passed to `mosaic`. Defaults to 'median'.
+    resampling : str | dict[str, str] | None
+        Resampling method for the data bands, passed to `mosaic`. `mask_band`, if
+        given, is always loaded with 'nearest' resampling regardless of this setting.
+        Defaults to None (odc-stac's own default).
 
     Returns
     -------
@@ -314,5 +377,6 @@ def mosaic_by_zone(
             groupby=groupby,
             chunks=chunks,
             method=method,
+            resampling=resampling,
         )
     return result
