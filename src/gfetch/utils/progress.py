@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
+from dask.callbacks import Callback
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -12,11 +13,12 @@ from rich.progress import (
     Progress,
     TaskID,
     TextColumn,
+    TimeElapsedColumn,
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
 
-__all__ = ["default_bar", "gfetch_debug", "temporary_task"]
+__all__ = ["count_bar", "dask_progress", "default_bar", "gfetch_debug", "temporary_task"]
 
 log = logging.getLogger(__name__)
 
@@ -33,9 +35,9 @@ def gfetch_debug() -> bool:
     return os.getenv("GFETCH_DEBUG") in ("1", "true")
 
 
-def default_bar() -> Progress:
+def _disabled() -> bool:
     """
-    Build the shared `rich.progress.Progress` instance used across gfetch commands.
+    Whether a `Progress` instance should render disabled.
 
     Disabled when `GFETCH_DEBUG` is set, or when stdout isn't attached to a terminal
     (e.g. a SLURM batch job's captured stdout/stderr), so batch logs aren't spammed
@@ -43,13 +45,26 @@ def default_bar() -> Progress:
 
     Returns
     -------
-    Progress
-        A `rich.progress.Progress` instance, built once per CLI command and passed
-        down to whatever needs to report progress.
+    bool
+        True if progress bars should be disabled.
     """
     disabled = gfetch_debug() or not Console().is_terminal
     if disabled:
         log.debug("Progress bar is disabled.")
+    return disabled
+
+
+def default_bar() -> Progress:
+    """
+    Build the shared `rich.progress.Progress` instance used for byte-oriented
+    progress (e.g. downloads) across gfetch commands.
+
+    Returns
+    -------
+    Progress
+        A `rich.progress.Progress` instance, built once per CLI command and passed
+        down to whatever needs to report progress.
+    """
     return Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
@@ -58,8 +73,80 @@ def default_bar() -> Progress:
         TransferSpeedColumn(),
         TimeRemainingColumn(),
         refresh_per_second=1,
-        disable=disabled,
+        disable=_disabled(),
     )
+
+
+def count_bar() -> Progress:
+    """
+    Build the shared `rich.progress.Progress` instance used for count-oriented
+    progress (e.g. zones, dask task completion) across gfetch commands.
+
+    Returns
+    -------
+    Progress
+        A `rich.progress.Progress` instance, built once per CLI command and passed
+        down to whatever needs to report progress.
+    """
+    return Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        refresh_per_second=1,
+        disable=_disabled(),
+    )
+
+
+class _RichDaskCallback(Callback):
+    """
+    Dask scheduler callback that drives a `rich.progress.Progress` task.
+
+    Reports per-task completion of one `.compute()`/`.load()` call on `progress`, as
+    a stand-in for `dask.diagnostics.ProgressBar()`'s own separate text bar - letting
+    a dask computation's progress live in the same `Progress` instance (and terminal
+    region) as any other bar the caller is tracking.
+    """
+
+    def __init__(self, progress: Progress, task: TaskID) -> None:
+        self._progress = progress
+        self._task = task
+
+    def _start_state(self, dsk: Any, state: dict[str, Any]) -> None:
+        total = len(state["finished"]) + sum(len(state[k]) for k in ("ready", "waiting", "running"))
+        self._progress.update(self._task, total=total)
+
+    def _posttask(
+        self, key: Any, result: Any, dsk: Any, state: dict[str, Any], worker_id: Any
+    ) -> None:
+        self._progress.advance(self._task)
+
+
+@contextmanager
+def dask_progress(progress: Progress, description: str) -> Iterator[None]:
+    """
+    Track one dask-backed `.compute()`/`.load()` call's tasks on `progress`.
+
+    Adds a temporary task to `progress` for the duration of the `with` block,
+    advanced once per completed dask task, then removes it.
+
+    Parameters
+    ----------
+    progress : Progress
+        The shared `Progress` instance to add a task to.
+    description : str
+        Description shown next to this call's task-completion bar.
+
+    Yields
+    ------
+    None
+    """
+    with (
+        temporary_task(progress, description, total=None) as task,
+        _RichDaskCallback(progress, task),
+    ):
+        yield
 
 
 @contextmanager

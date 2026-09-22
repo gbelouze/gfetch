@@ -110,6 +110,20 @@ class Config:
         band, if any, is always loaded with 'nearest' resampling regardless of this
         setting. Defaults to an empty dict, which uses odc-stac's own default
         ('nearest' for every band).
+    n_compute_workers : int | None
+        Number of dask threads used to compute and write the `mosaic` stage's
+        per-zone output. Defaults to None, which uses `gfetch.utils.system.
+        available_cpus` (the CPUs actually reserved for this process, e.g. by a
+        SLURM job's `--cpus-per-task`, not the whole node). Lower this to bound how
+        many chunks compute concurrently.
+    chunks : dict[str, int] | None
+        Dask chunk sizes for the `mosaic` stage's load step, e.g. `{"x": 512, "y":
+        512}`. Smaller spatial chunks bound the memory a single output chunk's
+        `gfetch.mosaic.composite` reduction needs: a non-associative reduction (e.g.
+        the default 'median') must gather its whole `time` axis into memory per
+        spatial chunk, so peak memory scales with spatial chunk size regardless of
+        how `time` itself is chunked. Defaults to None, which uses `gfetch.mosaic.
+        load`'s own default of `{"x": 2048, "y": 2048}`.
     """
 
     aoi: AOIConfig
@@ -123,6 +137,8 @@ class Config:
     resolution: float = 10.0
     n_workers: int = 4
     resampling: dict[str, str] = field(default_factory=dict)
+    n_compute_workers: int | None = None
+    chunks: dict[str, int] | None = None
 
     def __post_init__(self) -> None:
         self.output_dir = Path(self.output_dir).expanduser().absolute()

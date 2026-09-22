@@ -11,6 +11,8 @@ from typing import Literal
 
 import xarray as xr
 
+from gfetch.utils.memory import log_chunk_footprint
+
 log = logging.getLogger(__name__)
 
 __all__ = ["prepare_template", "write", "write_region"]
@@ -35,6 +37,7 @@ def write(ds: xr.Dataset, path: Path, *, mode: _ZarrMode = "w") -> None:
         `xarray.Dataset.to_zarr` write mode. Defaults to 'w' (overwrite).
     """
     log.debug(f"Writing dataset {dict(ds.sizes)} to {path} (mode={mode})")
+    log_chunk_footprint(ds, log)
     ds.to_zarr(path, mode=mode)
     log.info(f"Wrote dataset to {path}")
 
@@ -78,5 +81,6 @@ def write_region(ds: xr.Dataset, path: Path, region: dict[str, slice]) -> None:
     # `region` - scalar coordinates like a CRS grid mapping variable must be dropped,
     # since they were already written once by prepare_template.
     ds = ds.drop_vars([c for c in ds.coords if c not in ds.dims])
+    log_chunk_footprint(ds, log)
     ds.to_zarr(path, region=region)
     log.debug(f"Wrote region {region} to {path}")

@@ -7,6 +7,7 @@ single-machine, internet-connected use.
 
 import logging
 from collections.abc import Sequence
+from typing import Literal, cast
 
 import odc.stac
 import pystac
@@ -16,7 +17,20 @@ from odc.geo.geobox import GeoBox
 from odc.geo.geom import BoundingBox, bbox_intersection
 from pyproj.database import query_utm_crs_info
 
+from gfetch.utils.memory import log_chunk_footprint
+
 log = logging.getLogger(__name__)
+
+_DEFAULT_CHUNKS: dict[str, int] = {"x": 2048, "y": 2048}
+
+# `composite`'s default `median` isn't chunk-wise associative, so dask must gather an
+# entire spatial chunk's `time` axis into one chunk before it can reduce - if `time`
+# arrives already split into several chunks (e.g. one per `groupby` group), dask
+# inserts a rechunk step to consolidate them first, which copies every chunk through
+# `dask.array.chunk.getitem` (split) and `np.concatenate` (merge). A single full-length
+# `time` chunk from the start avoids that rechunk entirely.
+_DEFAULT_TIME_CHUNK = -1
+
 
 __all__ = [
     "composite",
@@ -35,7 +49,7 @@ def load(
     bands: Sequence[str],
     *,
     groupby: str = "solar_day",
-    chunks: dict | None = None,
+    chunks: dict[str, int] | None = None,
     resampling: str | dict[str, str] | None = None,
 ) -> xr.Dataset:
     """
@@ -54,9 +68,12 @@ def load(
         odc-stac grouping strategy for merging same-group overlapping scenes before
         compositing. Defaults to 'solar_day', recommended for wide-AOI Sentinel-2
         mosaics over stacking every individual scene as a separate time step.
-    chunks : dict | None
+    chunks : dict[str, int] | None
         Dask chunk sizes, e.g. `{"time": 1, "x": 512, "y": 512}`. Defaults to None,
-        which uses odc-stac's own default chunking.
+        which chunks the spatial dims at `{"x": 2048, "y": 2048}` - passing `None`
+        through to odc-stac itself would instead load everything eagerly, without
+        Dask. Regardless of this argument, `time` itself defaults to a single
+        full-length chunk unless explicitly given here.
     resampling : str | dict[str, str] | None
         Resampling method, passed straight through to `odc.stac.load`. Either one
         method for every band, or a per-band `dict[str, str]` (a `"*"` key sets the
@@ -75,15 +92,18 @@ def load(
     # is always safe here.
     odc.stac.configure_s3_access(aws_unsigned=True)
     log.debug(f"Loading {len(items)} item(s), bands={list(bands)}, geobox shape={geobox.shape}")
+    effective_chunks = dict(chunks) if chunks is not None else dict(_DEFAULT_CHUNKS)
+    effective_chunks.setdefault("time", _DEFAULT_TIME_CHUNK)
     ds = odc.stac.load(
         items,
         bands=list(bands),
         geobox=geobox,
         groupby=groupby,
-        chunks=chunks or {},
+        chunks=cast("dict[str, int | Literal['auto']]", effective_chunks),
         resampling=resampling,
     )
     log.info(f"Loaded dataset: {dict(ds.sizes)}")
+    log_chunk_footprint(ds, log)
     return ds
 
 
@@ -178,7 +198,7 @@ def mosaic(
     mask_band: str | None = None,
     mask_out: frozenset[int] = frozenset(),
     groupby: str = "solar_day",
-    chunks: dict | None = None,
+    chunks: dict[str, int] | None = None,
     method: str = "median",
     resampling: str | dict[str, str] | None = None,
 ) -> xr.Dataset:
@@ -202,7 +222,7 @@ def mosaic(
         Classification values to mask out. Unused if `mask_band` is None.
     groupby : str
         odc-stac grouping strategy, passed to `load`. Defaults to 'solar_day'.
-    chunks : dict | None
+    chunks : dict[str, int] | None
         Dask chunk sizes, passed to `load`. Defaults to None.
     method : str
         Composite reduction method, passed to `composite`. Defaults to 'median'.
@@ -400,7 +420,7 @@ def mosaic_by_zone(
     mask_band: str | None = None,
     mask_out: frozenset[int] = frozenset(),
     groupby: str = "solar_day",
-    chunks: dict | None = None,
+    chunks: dict[str, int] | None = None,
     method: str = "median",
     resampling: str | dict[str, str] | None = None,
 ) -> dict[CRS, xr.Dataset]:
@@ -433,7 +453,7 @@ def mosaic_by_zone(
         frozenset.
     groupby : str
         odc-stac grouping strategy, passed to `mosaic`. Defaults to 'solar_day'.
-    chunks : dict | None
+    chunks : dict[str, int] | None
         Dask chunk sizes, passed to `mosaic`. Defaults to None.
     method : str
         Composite reduction method, passed to `mosaic`. Defaults to 'median'.
