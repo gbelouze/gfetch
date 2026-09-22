@@ -344,6 +344,55 @@ STAC property on both sources' items (confirmed on real items) — exposed as
 source-level plumbing needed. See `claude/tasks.md`'s 2026-09-22 entry for the full
 reasoning and the `group_by_utm_zone` generalization this required.
 
+**Planetary Computer: asset-key divergence (confirmed 2026-09-22)**, exercising the
+"Next steps" item below to actually run PC end-to-end for the first time:
+
+- **No authentication needed at all, for any collection tried so far** - confirmed
+  live, not assumed from the "anonymous search; SAS-signed assets" row above.
+  `stac_asset.PlanetaryComputerClient._get_token()` (gfetch's existing download
+  dependency) fetches its SAS token from `planetarycomputer.microsoft.com/api/sas/
+  v1/token/<account>/<container>` as a plain unauthenticated GET - no subscription
+  key, no header, no `planetary_computer.settings.set_subscription_key()` call
+  anywhere in the code path gfetch actually uses. Verified with a real search +
+  single-asset download against `sentinel-2-l2a` with zero credentials configured
+  anywhere in the environment.
+- **PC's `sentinel-2-l2a` items use different asset keys and properties than Earth
+  Search's `sentinel-2-c1-l2a`** - confirmed by dumping a real item's assets/
+  properties, not assumed from either catalog's docs:
+  - Asset keys are raw band ids (`B04`/`B03`/`B02`/...), not the common-name aliases
+    (`red`/`green`/`blue`) Earth Search uses. `SatelliteProfile.default_bands =
+    ("red", "green", "blue")` therefore resolves to **zero** matching assets on a PC
+    item - `download_items()`'s "keys not present on item are silently skipped"
+    behavior (by design, for the normal case of an item missing one band) means this
+    fails silently: no error, just an empty download. A `visual` asset (pre-composited
+    true-color COG, `common_name=["red","green","blue"]` on the *same* asset) exists
+    as an alternative but wasn't used here, to keep the per-band comparison
+    apples-to-apples with Earth Search's separate `red`/`green`/`blue` COGs.
+  - The cloud-mask band is `SCL` (uppercase), not `scl`.
+  - `grid:code` (the `grid` STAC extension Earth Search's `_dedupe_sentinel2_processing_baseline`/deep-scenario-tile-filter keys off) is **absent** on PC items
+    entirely (`None`). PC instead exposes `s2:mgrs_tile` as a bare tile id (`"35MNM"`,
+    no `"MGRS-"` prefix).
+  - `s2:processing_baseline` is present in the same format on both sources
+    (`"02.12"`-style), so `search()`'s existing dedup-by-baseline logic still applies
+    correctly to PC results in principle - though since it falls back to `item.id` as
+    the dedup key when `grid:code` is missing (as it always is for PC), and PC item
+    ids differ per processing run, it doesn't actually collapse cross-baseline
+    duplicates for PC today. Not confirmed to be a real problem (unclear whether PC's
+    catalog even has the same superseded-baseline-duplicate listing behavior Earth
+    Search does) - not investigated further, since it wasn't blocking the benchmark
+    work below.
+- **Not fixed at the library level yet** - `gfetch.profiles.PROFILES`/`gfetch.sources`
+  have no per-source band-name mapping mechanism today; `SatelliteProfile` assumes one
+  band-naming convention shared across every source registered for a satellite, which
+  this finding shows is false for real, already-registered sources. Worked around for
+  now only inside `benchmark/gfetch_pipeline.py` (`common.py::SOURCE_BANDS`/
+  `SOURCE_DEEP_TILE_PROPERTY`, a per-source lookup local to that script), **not** in
+  `gfetch/profiles.py` itself - so `gfetch mosaic --source planetary-computer` (the
+  real CLI) still silently downloads zero Sentinel-2 bands today. Flagged as an open
+  question below rather than fixed, since it's a real design decision (how should a
+  profile's band list vary by source - a nested dict? a per-source override in
+  `sources.py`'s `StacSource`? something else?) that wasn't asked for yet.
+
 ## Chosen architecture
 
 ```
@@ -393,10 +442,19 @@ profile-driven per-satellite defaults for these were considered but not built, s
 
 **2026-09-21 update**: `[load/mosaic]`/`[write]` produce **one `xarray.Dataset`/Zarr
 store per UTM zone the AOI spans**, not the single dataset/store the diagram above
-shows — see `claude/tasks.md`'s 2026-09-21 entry for why. `mosaic_by_zone()` groups items by
-their own native UTM zone (not the AOI's), builds one `GeoBox` per zone (clipped to
-that zone's natural longitude band), and mosaics each zone independently; `[write]` is
-called once per zone's dataset.
+shows — see `claude/tasks.md`'s 2026-09-21 entry for why. `group_by_utm_zone()` groups
+items by their own native UTM zone (not the AOI's); `cli/mosaic.py` builds one `GeoBox`
+per zone (`zone_geobox()`, clipped to that zone's natural longitude band, see "Resolved
+2026-09-22" below for the patch-level split within it) and mosaics each zone
+independently, one `[write]` per zone's own store.
+
+`gfetch.mosaic` also briefly had a `mosaic_by_zone()` convenience wrapper composing the
+above into one call returning `dict[CRS, xr.Dataset]` - removed 2026-09-22 as dead code
+once `cli/mosaic.py` (which used to call it, per the 2026-09-21 entry above) had long
+since been rewritten to inline the same loop itself without anyone reconciling the two.
+Its whole-zone-dict-at-once shape was also a poor fit for the patch-level writes
+introduced below anyway. `group_by_utm_zone`/`zone_geobox`/`mosaic` composed directly,
+as `cli/mosaic.py` already does, remain the actual building blocks - no wrapper on top.
 
 ## HPC / distributed execution
 
@@ -493,6 +551,55 @@ proven on S3-compatible object storage, not on the local/shared POSIX filesystem
   POSIX). Worth keeping as a **later, narrower optimization** — e.g. serving a single
   MGRS tile's time series without ever touching pixel values — not something to design
   the v1 write stage around.
+- **Resolved 2026-09-22: resumable/concurrent mosaic writes, built on the
+  disjoint-region-per-worker plan above.** The `mosaic` stage now splits each UTM
+  zone's output into **patches** - a configurable multiple (`Config.patch_chunks`,
+  default 1) of the store's own native Zarr chunk size in both `x`/`y` - via
+  `gfetch.mosaic.patch_geoboxes()` (`odc.geo.geobox.GeoboxTiles` over the zone's
+  geobox). A patch, not the native chunk itself, is the unit of resumable/
+  parallelizable work: fine enough to bound memory and support HPC job-array
+  splitting, coarse enough to amortize odc-stac's per-call item-parsing overhead
+  across more pixels than one native chunk would.
+  - **Skip-on-resume needs no side-car bookkeeping.** `gfetch.write.
+    region_is_written()` checks the store's own chunk files directly (`zarr.Array.
+    metadata.encode_chunk_key()` + `store.exists()`, both public zarr-python v3
+    APIs). A chunk file existing already means it was fully written, given the atomic temp+rename write
+    confirmed above, so there's no partial-write state a side-car would need to
+    protect against that the store doesn't already encode. A patch counts as done
+    only once every native chunk it covers exists for every requested variable; a
+    partially-written patch (crash mid-`write_region`) is recomputed and rewritten
+    as a whole, not patched up - simpler than partial-patch bookkeeping, and cheap
+    given the composite computation dominates cost over rewriting a few
+    already-correct chunks.
+  - **`prepare_template()` is now idempotent** (`mode="w-"`, catching
+    `FileExistsError`) instead of requiring a separate one-time init step or
+    ordering between tasks - verified empirically that a second `mode="w-"` call
+    against an already-initialized store raises a clean `FileExistsError` rather
+    than corrupting anything, and that even a genuine race between two callers only
+    risks a harmless duplicate write of identical metadata (every caller derives
+    the same template from the same deterministic config).
+  - **odc-stac already filters items by the geobox you pass it - no manual
+    per-patch item pre-filtering needed.** Traced into `odc.stac._stac_load`: it
+    builds its own internal `GeoboxTiles` over whatever `geobox=` is passed and
+    bins each item by `item.safe_geometry()` overlap (STAC-metadata footprint
+    only, no raster I/O) before ever building the dask graph - an item with zero
+    overlap with a small per-patch geobox is never opened. This is the same
+    per-item overlap computation `group_by_utm_zone` does by hand for zones,
+    confirming a manual bbox pre-filter per patch would be redundant.
+  - **CLI surface**: `gfetch mosaic <config> [--task-id N] [--n-tasks M]`
+    (`gfetch/cli/mosaic.py`). Every invocation independently builds the full `(zone, patch)` list and keeps
+    `patches[task_id::n_tasks]`, so a SLURM job array's `$SLURM_ARRAY_TASK_ID`/
+    `$SLURM_ARRAY_TASK_COUNT` map directly onto `--task-id`/`--n-tasks` with no
+    orchestration gfetch needs to own, consistent with the "stage separation, not
+    orchestration" stance above. Default (`--task-id 0 --n-tasks 1`) reproduces
+    single-process behavior, now with resumability as a free side effect.
+  - Two options considered and explicitly dropped during design, in favor of the
+    above: a two-step `init`/`run` CLI split (unnecessary once `prepare_template`
+    was made idempotent); and a sentinel-file-per-tile scheme mirroring the
+    download stage's (rejected - the store's own chunk files already carry the
+    same atomicity guarantee a sentinel would exist to provide, and there was no
+    non-atomicity problem left for a side-car to solve here, unlike `stac-asset`'s
+    genuinely non-atomic download writes).
 - **Optional upgrade:** Icechunk, when the output target is genuinely S3-compatible
   (cloud deployment, or an on-prem S3 gateway such as Ceph RGW/Garage/SeaweedFS — note
   MinIO's OSS repo was archived in early 2026 as the company shifted to a commercial
@@ -544,12 +651,14 @@ gfetch already has, rather than needing new low-level machinery:
   files the download stage already writes for resumability (`claude/tech-stack.md`'s
   download-durability design) — no new manifest needed, same "no central bookkeeping,
   no locking" property gfetch already relies on elsewhere.
-- **Writing a tile's chunks in isolation**: already built and tested, just not wired into
-  the CLI yet — `gfetch.write.prepare_template()`/`write_region()`
-  (`src/gfetch/write.py`) already implement "write the full store's metadata once, then
-  write disjoint regions independently, safe on any POSIX filesystem." `cli/mosaic.py`
-  currently only calls the one-shot `write()`; switching to template-once +
-  region-write-per-ready-tile is the only change needed on the write side.
+- **Writing a tile's chunks in isolation**: fully wired into the CLI as of 2026-09-22,
+  one layer up from what this note originally anticipated — see "Resolved 2026-09-22"
+  under "Compute-stage output durability" above. `cli/mosaic.py` already does
+  template-once + region-write-per-patch, with `gfetch.write.region_is_written()`
+  handling readiness detection for the mosaic stage's own resumability. That's a
+  different readiness question from this section's ("has every item a tile needs
+  finished downloading yet") but the write-side mechanics this bullet asked for are the
+  same primitives, already exercised in production code.
 - **New pieces actually needed**: (1) a chunk↔required-tiles dependency map, computed
   from geometry alone at search time (no data needed); (2) reference-counted cache
   eviction — delete a tile's cached assets only once *every* chunk it feeds has been
@@ -582,6 +691,180 @@ gfetch already has, rather than needing new low-level machinery:
 picked up, since it doesn't require revisiting gfetch's "no workflow-orchestration-engine"
 non-goal. No code, no scaffolding, no `claude/tasks.md` follow-up items beyond this note.
 
+## Vector data: GEDI via SlideRule (orthogonal pipeline, added 2026-09-22)
+
+Added 2026-09-22 at the user's request, to extend gfetch beyond raster mosaics to
+point/footprint vector data - GEDI to start, "potentially others" later. Framed by the
+user as "pretty much orthogonal" to the raster `search`/`download`/`load-mosaic`/`write`
+pipeline above, and the research below confirms that framing rather than contradicting
+it: this is a second, independent pipeline, not a new stage bolted onto the first one.
+
+### SlideRule (slideruleearth.io)
+
+- A hosted (AWS `us-west-2`) client-server service that performs **on-demand,
+  server-side subsetting of remote HDF5 granules** - the client sends an AOI polygon
+  (+ optional time range/filters), and the server reads only the matching byte ranges
+  out of the source HDF5 files in S3, returning an already-subsetted result. This is
+  exactly the property the user was after: GEDI is distributed as whole-orbit granules
+  (~1/4 orbit each, tens of MB), and SlideRule avoids downloading a whole granule to get
+  a handful of footprints inside a small AOI.
+  - Python client: `sliderule` (PyPI/conda-forge), `from sliderule import sliderule,
+    gedi`. Installed via `uv add sliderule` - pulled in `geopandas`, `pyarrow`, and
+    `pyogrio` as transitive dependencies (useful: `pyarrow` is what makes
+    `GeoDataFrame.to_parquet()` work for the CLI's output step, no extra dependency
+    needed for that).
+  - **No user credentials needed against the public cluster (the default,
+    `slideruleearth.io`).** NASA Earthdata authentication against the source DAAC is
+    handled server-side by SlideRule's own AWS deployment - confirmed via the docs'
+    own wording ("If running SlideRule locally and not using the AWS service, data
+    will need to be retrieved from NASA" - i.e. `.netrc`/Earthdata-login setup is only
+    needed for a **self-hosted** deployment, not the public one gfetch uses by
+    default). This removes an entire credentialed-source problem class gfetch doesn't
+    have anywhere else yet (see the raster pipeline's Sentinel-1 RTC note above, the
+    only other place a credential gap was flagged).
+  - `gedi.gedi02ap(parms)` (parallel/AOI-driven L2A entry point) takes a `parms` dict
+    with `"poly"` (a closed, counter-clockwise ring of `{"lon", "lat"}` dicts - built
+    by hand for a plain bbox, no need for `sliderule.toregion` which exists for
+    GeoJSON/Shapefile AOIs), and optional `"t0"`/`"t1"` (`%Y-%m-%dT%H:%M:%SZ`). No
+    `resources`/`asset` needed - when only `poly` is given, SlideRule resolves the
+    matching granules via CMR itself. Returns a `geopandas.GeoDataFrame` directly:
+    search and "download" collapse into one server-side call, there is no
+    separate local asset cache the way `stac-asset` needs for rasters.
+- **Verified live against the public cluster, not just read from docs** (small AOI
+  around Fontainebleau forest, `bbox=(2.55, 48.35, 2.75, 48.50)`, all of 2020): the
+  actual returned `gedi02ap` schema is `['orbit', 'solar_elevation', 'track',
+  'elevation_hr', 'elevation_lm', 'sensitivity', 'flags', 'beam', 'geometry']`,
+  indexed by acquisition `time`, CRS `EPSG:7912` (ITRF2014, GEDI's standard). This
+  **differs from the rendered docs** (`docs/user_guide/gedi.md` in the `sliderule`
+  repo), which document `elevation_lowestmode`/`elevation_highestreturn` and omit
+  `orbit`/`track`/`sensitivity` entirely - the actual field names are
+  `elevation_lm`/`elevation_hr`, and the field list is larger than documented. Doc
+  fetches against `docs.slideruleearth.io` returned HTTP 403 on every page but the
+  landing page (Cloudflare, not investigated further); the docs source markdown was
+  pulled instead straight from the `SlideRuleEarth/sliderule` repo (`docs/user_guide/
+  gedi.md`, `docs/user_guide/basic_usage.md`, `docs/background/NASA-Earthdata.md`)
+  via `gh api`, and even those were confirmed against a live call before being relied
+  on - per the usual "verify claims with real research" practice, this is exactly the
+  kind of gap that memory/doc-only research would have missed.
+- **Already a fixed, reduced field set, not the full ~100+-variable L2A granule** -
+  this is what satisfies "a subset of variables only" for the POC without needing to
+  build variable selection ourselves. SlideRule's ICESat-2 endpoints (`atl03x`/
+  `atl24x`) document an `anc_fields`/ancillary-field mechanism for requesting
+  additional per-photon/segment fields beyond the default schema, and `gedi.py`'s
+  client code has matching plumbing for ancillary-field record types (`ancfrec`/
+  `ancerec`) - but no GEDI-specific `anc_fields` documentation or working example was
+  found for `gedi02ap` specifically (GitHub code search for `anc_fields` + GEDI came
+  back empty in both `sliderule` and `sliderule-python`). **Flagged as an open
+  question, not built**: whether `gedi02ap` supports requesting L2A fields beyond its
+  fixed 8-column schema (e.g. `quality_flag`, `rh` percentile metrics) is unconfirmed.
+  gfetch's own "subset of variables" is therefore implemented as a plain column
+  filter *on top of* SlideRule's already-reduced schema (`fields=` parameter,
+  defaulting to `elevation_lm`/`elevation_hr` - ground elevation and canopy top), not
+  a passthrough to a richer server-side selection mechanism.
+- **"No filtering" (user's explicit POC scope) maps directly onto SlideRule's own
+  defaults**: `degrade_filter`/`l2_quality_filter`/`surface_filter` all default to
+  `False` (off) - confirmed via the docs and via the live call including visibly noisy
+  `elevation_lm` values (range roughly -1177m to +9597m over a small, mostly-flat
+  forest AOI near Paris) consistent with unfiltered, degraded/low-quality footprints
+  being included as-is. This is expected, not a bug - a real future consumer of this
+  data would very likely want `l2_quality_filter=True` at minimum, deliberately left
+  off here per the user's explicit scope.
+- **France sits near GEDI's orbital coverage limit.** GEDI (ISS-mounted) only covers
+  roughly ±51.6° latitude; mainland France spans ~42°N-51°N, so coverage should exist
+  across almost all of it but thins out near the northern edge. Not yet checked
+  against a full-France request - only a small southern-Paris-region AOI was
+  exercised live.
+
+### Chosen architecture: standalone `gfetch gedi` command, own config schema
+
+- **New module `src/gfetch/gedi.py`**: `fetch_gedi_l2a(bbox, time_range=None,
+  fields=GEDI_L2A_DEFAULT_FIELDS, anc_fields=None) -> geopandas.GeoDataFrame`, a
+  single library function wrapping `sliderule.init()` + `gedi.gedi02ap()` + the
+  AOI-polygon/column bookkeeping above (`anc_fields` added 2026-09-22, see the
+  section above). No `search()`/`download()` split - there's nothing to split,
+  SlideRule already does both server-side in one call.
+- **CLI command `gfetch gedi CONFIG`**, writing a GeoParquet file, backed by its own
+  `gfetch.cli.gedi_config.GediConfig`/`load()` (added 2026-09-22) - **deliberately
+  not wired through the raster pipeline's `cli/config.py::Config`** (which carries
+  `satellite`/`source`/`bands`/`resolution`/`n_workers`/`chunks`/`patch_chunks` - all
+  raster/Zarr-specific, none applicable here). Forcing GEDI through that shared
+  config would be exactly the coupling the user's "orthogonal" framing was warning
+  against; a self-contained config schema (reusing only the generic
+  `AOIConfig`/`TimeRangeConfig` the two pipelines actually share) keeps the two
+  pipelines independent while still giving `gfetch gedi` the same
+  config-file-driven shape as `search`/`download`/`mosaic`, instead of the sprawling
+  CLI-flag set the pass-everything-as-flags design (the initial POC) grew into once
+  `anc_fields`/`rh_percentiles` were added. If/when other SlideRule-backed sources
+  are added (ICESat-2 was explicitly named as a future "potentially others"), revisit
+  whether a shared *vector*-side config/CLI convention is worth factoring out then -
+  not designed for now, per "don't design for hypothetical future requirements."
+- **Output format: GeoParquet** (`GeoDataFrame.to_parquet()`), not Zarr - vector
+  footprint data (one row per shot, heterogeneous per-footprint scalar fields) has
+  no natural gridded-array representation the way raster mosaics do; GeoParquet is
+  the standard, `geopandas`-native columnar format for this shape of data, and
+  `pyarrow` (needed to write it) already arrived as a transitive dependency of
+  `sliderule` itself - no new dependency needed for output.
+- **POC status**: live-verified end to end via both the library function and the CLI
+  command against the public SlideRule cluster, small France AOI (Fontainebleau
+  forest area), full 2020 date range - 63,495 footprints returned and written to
+  GeoParquet in a few seconds. Tests: `tests/test_gedi.py` (`_bbox_to_poly` unit test
+  + two `@pytest.mark.slow` live-network tests, mirroring the raster pipeline's own
+  `@pytest.mark.slow` convention for real-service smoke tests, e.g. `test_search.py`).
+
+### `anc_fields`: reading beyond `gedi02ap`'s fixed schema (added 2026-09-22)
+
+`gedi02ap`'s field-selection ceiling was flagged above as an open question - resolved
+by the maintainer directly
+([SlideRuleEarth/sliderule#539](https://github.com/SlideRuleEarth/sliderule/issues/539#issuecomment-3529180434)):
+SlideRule's `anc_fields` request parameter *is* supported for GEDI, reading named
+fields straight out of the source L2A granule rather than SlideRule's own fixed
+8-column response schema, pointed at by the client repo's
+`clients/python/tests/test_ancillary.py::TestGedi`.
+
+Live-verified against the public cluster (same Fontainebleau AOI as the POC above,
+2020-06-01 to 2020-06-15) against every field from `download.yaml`'s
+`gedi_l2a.selected_bands` not already covered by the fixed schema:
+
+- **Work as their bare geefetch/GEDI name**: `quality_flag`, `degrade_flag`,
+  `surface_flag`, `digital_elevation_model`, `elevation_bias_flag`, `energy_total`,
+  `num_detectedmodes`, `selected_algorithm`, `selected_mode`, `selected_mode_flag`,
+  `delta_time`, `solar_azimuth`.
+- **`rh`** returns the full 101-element per-shot relative-height percentile array
+  (index i == the i-th percentile) - `gfetch.gedi.expand_rh()` slices it into named
+  `rh{p}` columns, matching geefetch's flat `rh0`/`rh2`/.../`rh100` bands.
+- **Need a `land_cover_data/` group prefix**: `landsat_treecover`/`modis_treecover`
+  silently return zero rows under their bare name (the same "empty on failure" trap
+  `fetch_gedi_l2a`'s docstring already warns about) - the working names are
+  `land_cover_data/landsat_treecover`/`land_cover_data/modis_treecover`.
+- **Known broken**: `shot_number` raises `ValueError: Length mismatch` (response has
+  exactly double the expected row count) - a bug in the SlideRule Python client's
+  response-flattening for that specific field, not fixable from gfetch's side.
+
+**Implementation**: `fetch_gedi_l2a()` gained an `anc_fields` parameter, forwarded
+verbatim to `gedi02ap`'s request `parms` and always kept in the result regardless of
+the `fields` filter (which only applies to the fixed schema). `expand_rh()` is a
+separate pure function, not folded into `fetch_gedi_l2a` itself, so a caller that
+wants the raw 101-element array can skip it. `GediConfig`'s `anc_fields`/
+`rh_percentiles` fields mirror this: `rh` is auto-added to `anc_fields` if
+`rh_percentiles` is given without it. Tests: `tests/test_gedi.py` gained
+non-network tests for `anc_fields` pass-through/keep-regardless-of-`fields` and
+`expand_rh`'s pure array-splitting, plus one `@pytest.mark.slow` live test
+requesting all fourteen working `anc_fields` at once.
+
+### Open questions / risks (vector pipeline)
+
+- No time-range default: an AOI with no `time_range` pulls the *entire* GEDI mission
+  archive (2019-present) for every granule intersecting the bbox - fine for a small
+  POC AOI (164 granules/183k footprints for a ~20x15km box), but worth a sane default
+  or an explicit warning before this is used at country scale.
+- L1B (waveforms) and L4A (biomass) follow the exact same `gedi01bp`/`gedi04ap`
+  pattern as L2A (same `parms` shape, same `__processing_request` plumbing in
+  `gedi.py`) - not built, but should be a small, mechanical addition to
+  `gfetch/gedi.py` given the shared client code, if/when needed.
+- Full-France-scale GEDI request (as opposed to the small POC AOI actually exercised)
+  not yet tried - resource/granule count and request duration at that scale are
+  unknown.
+
 ## Explicitly rejected dependencies
 
 | Library/service | Reason |
@@ -608,7 +891,7 @@ non-goal. No code, no scaffolding, no `claude/tasks.md` follow-up items beyond t
 - Should `rioxarray` become a real dependency (e.g. for reading assets `stac-asset`
   downloaded locally) or stay opportunistic/optional?
 - ~~`SatelliteProfile`'s "default resampling" was never actually built~~ — **resolved
-  2026-09-22**: `load()`/`mosaic()`/`mosaic_by_zone()` and `Config.resampling` now
+  2026-09-22**: `load()`/`mosaic()` and `Config.resampling` now
   expose a per-band resampling override (`dict[str, str]`, `"*"` sets the default for
   unlisted bands), threaded through to `odc.stac.load(resampling=...)`; the satellite
   profile's `cloud_mask_band` is always pinned to `"nearest"` inside `mosaic()`
@@ -643,22 +926,34 @@ non-goal. No code, no scaffolding, no `claude/tasks.md` follow-up items beyond t
   production at country scale. Not blocking v1/POC work.
 - ~~Sentinel-2 `search` stage needs processing-baseline resolution~~ — **resolved
   2026-09-21**, see `claude/tasks.md`.
+- **Per-source band-naming, unresolved (found 2026-09-22)**: `SatelliteProfile.
+  default_bands`/`cloud_mask_band` are plain asset keys, assumed shared across every
+  source registered for a satellite - false for Sentinel-2 on Planetary Computer (see
+  "STAC source landscape" above). `gfetch mosaic --source planetary-computer` silently
+  downloads zero bands today, as-is. Needs a real design decision (per-source override
+  on `SatelliteProfile`? on `StacSource`? a separate mapping table?), not designed yet
+  - worked around only inside `benchmark/gfetch_pipeline.py` so far.
 
 ## Next steps
 
 Design, scaffolding, a full pipeline POC, and a working implementation (with tests and
 a real CLI smoke test against live data) are all done. Remaining work, in rough order:
 
-1. Exercise the Planetary Computer source end-to-end (currently registered/collection-
-   mapped but only Earth Search has actually been run against).
+1. ~~Exercise the Planetary Computer source end-to-end~~ — **partially resolved
+   2026-09-22**: confirmed live via `benchmark/gfetch_pipeline.py --sources
+   planetary-computer` that search+download+load all work with zero authentication,
+   but only after working around the asset-key divergence above at the benchmark-script
+   level. The actual `gfetch mosaic`/`gfetch download` CLI path (via `SatelliteProfile`)
+   is still unfixed - see the new open question above.
 2. Add a `landsat` satellite profile once its collection ids are verified per source
    (currently deferred — see "Explicitly rejected dependencies"/source landscape above).
 3. Proper benchmarking (cloud-colocated compute, varying AOI size/resolution/band count,
    Dask cluster vs. local threads) is real future work — the POC's ~0.02 Mpix/s number is
    a home-internet/single-laptop data point, not a library performance ceiling, and
    shouldn't be used for capacity planning as-is.
-4. Optional `crs` override for `mosaic`/`mosaic_by_zone`, for users who want a single
-   target CRS despite the per-zone default (e.g. matching an existing dataset's grid) —
+4. Optional `crs` override for `mosaic`/`cli/mosaic.py`'s per-zone loop, for users who
+   want a single target CRS despite the per-zone default (e.g. matching an existing
+   dataset's grid) —
    requested as a "maybe later" by the user when native-per-zone was decided
    (2026-09-21), not designed or built yet.
 5. **Long-term, explicitly deferred**: disk-bounded streaming download+mosaic (interleave

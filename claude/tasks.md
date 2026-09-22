@@ -636,3 +636,476 @@ that state was reached, and should be read chronologically, not as reference mat
     to actually prevent the crash on a direct repro, and reverted rather than shipped
     half-verified - left as an open question, not resolved.
 
+- **2026-09-22** — Designed and implemented resumable/concurrent `mosaic`-stage writes
+  (see "Compute-stage output durability" → "Resolved 2026-09-22" in `tech-stack.md` for
+  the full design). Discussed in chat first per the usual practice, with the user
+  pushing back hard on the first two drafts - both rejections led to a simpler design
+  than originally proposed:
+  - **First draft** (two-step `init`/`run` CLI, sentinel-file-per-tile bookkeeping,
+    tile size decoupled from native chunk size as a separate concept) was rejected
+    outright: "I don't like the two-step cli... I don't like the sentinel.complete
+    thing... more options = more opportunities to go wrong." Each objection was
+    verified against the actual library rather than argued from first principles -
+    all three turned out to be droppable: `to_zarr(mode="w-")`
+    against an already-initialized store raises a clean `FileExistsError` (tested
+    directly), so `prepare_template()` could just catch it and become idempotent,
+    removing the need for a separate init step or any ordering between tasks; and
+    zarr-python v3's chunk files are themselves already the completion record (traced
+    `zarr/storage/_local.py`'s `_atomic_write` - temp file + rename, confirmed same
+    guarantee the download stage's sentinel exists to provide), so `region_is_written()`
+    could check `store.exists()` on the store's own chunk keys instead of a side-car.
+  - **Second draft** introduced a separate "tile size" concept distinct from the native
+    chunk size, defended as necessary for job-array task granularity. Also rejected:
+    "what's the difference with the native zarr atomic size?" Investigating the actual
+    question (how does odc-stac restrict computation to part of an AOI) resolved it -
+    `odc.stac.load(geobox=...)` is the only restriction mechanism needed, and it already
+    internally filters items by overlap with whatever geobox is passed (traced
+    `odc.stac._stac_load`'s own `GeoboxTiles`+`_tyx_bins` binning), so no manual
+    per-tile item pre-filtering was needed either, further simplifying the first draft.
+  - **User's own counter-proposal, adopted as the final design**: reintroduce a coarser
+    unit above the native chunk after all, but as a pure multiplier
+    (`Config.patch_chunks`, e.g. patches of 10x10 native chunks) rather than an
+    independent size - justified as amortizing odc-stac's per-call item-parsing
+    overhead across more pixels, explicitly framed as "just a computation
+    hyperparameter" rather than a correctness requirement. Paired with an explicit,
+    deliberate simplification: a patch with any missing native chunk is recomputed and
+    rewritten **as a whole**, never partially - confirmed as the intended trade-off
+    (simplicity over avoiding redundant recompute of already-correct chunks) rather
+    than an oversight.
+  - **Implementation** (`gfetch/mosaic.py::resolve_chunks`/`patch_geoboxes`,
+    `gfetch/write.py::region_is_written`, `Config.patch_chunks`, `cli/mosaic.py`
+    rewritten around a flat `patches[task_id::n_tasks]` split, `--task-id`/`--n-tasks`
+    added to the `mosaic` CLI command) landed with new unit tests (`patch_geoboxes`
+    tiling/edge-clipping, `region_is_written`'s per-variable/partial-write semantics,
+    `prepare_template` idempotency, and CLI-level skip-on-resume/task-splitting via a
+    call-counting fake `build_mosaic`). Full fast suite (58 tests) and
+    `pre-commit run --all-files` (ruff, pyrefly, pydoclint) both pass.
+  - **Found along the way**: a `pystac.Item` built with
+    `geometry=None` silently loses its `bbox` too on a save/reload round-trip (pystac
+    drops both together) - only surfaced because the new CLI-level test round-trips a
+    fake item through disk the way `gfetch mosaic` really does, unlike `test_mosaic.py`'s
+    existing in-memory-only `_item` helper. Not a real-world concern (real STAC items
+    always carry geometry) - noted here only because it cost a debugging pass and could
+    resurface in a future test.
+  - **Real bug found the same day, from an actual HPC run** (Jean Zay, 3-zone,
+    1491-item Sentinel-2 job, `--verbose` log pasted by the user): `cli/mosaic.py`'s
+    `prepare_template(build(zone_items, geobox), path)` line called the *full*
+    `mosaic()`/`load()` pipeline over the **entire zone's item list and geobox**
+    (hundreds of items, geobox shapes up to 66786x119109px) just to read off the
+    template dataset's shape/dtype - on **every single invocation**, even a fully
+    resumed one where `prepare_template` was about to no-op anyway (confirmed in the
+    log: `already initialized, skipping template write` printed right after each
+    zone's expensive load). Real, non-trivial waste: odc-stac has
+    to bin every item against the whole zone's tile grid to build the graph even at
+    `compute=False` (multi-second delays per zone in the log), and `log_chunk_footprint`
+    printed the whole throwaway graph's theoretical footprint (943 GB, 1336 GB
+    "total") for data that's never read - which is also what made three sequential
+    template-builds look, at a glance, like several huge datasets loading at once.
+    Multiplied by however many SLURM array tasks a job launches (each redoes this for
+    every zone). **Fix**: added `gfetch.write.store_initialized()` (checks for the
+    root `zarr.json` - a cheap existence check, no store open) and gated the
+    `build()`/`prepare_template()` call on it in `cli/mosaic.py`, so the expensive
+    template build only ever runs once per zone, on the store's actual first
+    initialization. Updated the call-counting CLI tests accordingly (a resumed run
+    now expects **zero** `build_mosaic` calls, not one).
+
+- **2026-09-22** — Built and live-verified a GEDI L2A vector-fetch POC via SlideRule
+  (see `tech-stack.md`'s new "Vector data: GEDI via SlideRule" section for the full
+  research/design writeup). New `src/gfetch/gedi.py::fetch_gedi_l2a()` + `gfetch gedi`
+  CLI command, standalone from the raster pipeline (own AOI/time-range flags, not
+  `cli/config.py::Config`), writing GeoParquet.
+  - Docs for `docs.slideruleearth.io` 403'd on every page but the landing page
+    (Cloudflare) - pulled the same content as raw markdown from the
+    `SlideRuleEarth/sliderule` GitHub repo (`docs/user_guide/gedi.md` etc.) via `gh
+    api` instead, then verified against a live call anyway - good thing, since the
+    rendered docs turned out to be wrong: they document `elevation_lowestmode`/
+    `elevation_highestreturn`, but the real returned columns are `elevation_lm`/
+    `elevation_hr`, plus three undocumented columns (`orbit`, `track`, `sensitivity`).
+  - Live smoke test: `bbox=(2.55, 48.35, 2.75, 48.50)` (Fontainebleau forest, small
+    AOI near Paris chosen to keep the POC request fast rather than querying all of
+    France), full 2020 - 47-164 granules depending on time range, tens of thousands
+    of footprints, few seconds end to end via both the library call and the CLI.
+  - No NASA Earthdata credentials were needed against SlideRule's public cluster -
+    confirmed via docs wording, not assumed (self-hosted-only requirement).
+  - `fields=` (defaulting to `elevation_lm`/`elevation_hr` only) implements gfetch's
+    "subset of variables" requirement as a plain post-hoc column filter on
+    SlideRule's already-reduced ~8-column schema; a richer server-side field-selection
+    mechanism (`anc_fields`, documented for ICESat-2's `atl03x`/`atl24x` but not found
+    documented or example-referenced for GEDI) was investigated and left unconfirmed,
+    not built.
+  - Tests: `tests/test_gedi.py`, one pure unit test (`_bbox_to_poly`) plus two
+    `@pytest.mark.slow` live-network tests against the real public cluster, same
+    convention as the raster pipeline's `test_search.py`. Full fast suite (60 tests)
+    and `pre-commit run --all-files` (ruff, pyrefly, pydoclint) both pass; the two new
+    slow tests were also run live and pass.
+
+- **2026-09-22** — Real crash bug in `fetch_gedi_l2a()`, found by the user running
+  `benchmark/gedi_aoi_sweep.py`'s default spatial sweep and pasting a traceback: a
+  `KeyError: "['elevation_lm', 'elevation_hr'] not in index"` on the sweep's largest
+  case, after SlideRule's own log showed `"Unexpected termination of response...
+  attempt 3 of 3"` and `"Received 0 footprint(s)"`.
+  - **Root cause**: `sliderule.gedi.gedi02ap()` returns `sliderule.emptyframe()` (a
+    `GeoDataFrame` with *only* a `geometry` column, no data columns at all) both when
+    an AOI/time range genuinely matches zero footprints and when the request fails
+    server-side entirely - traced into `gedi.py`'s `__flattenbatches`:
+    `if rsps == None: return sliderule.emptyframe(...)`. `fetch_gedi_l2a()`'s column
+    selection (`gdf[[*fields, gdf.geometry.name]]`) had no empty-response guard, so
+    it crashed with a confusing `KeyError` instead of surfacing the real problem
+    (SlideRule already logs the failure loudly on its own - the crash added nothing).
+  - **Fix**: `fetch_gedi_l2a()` (`src/gfetch/gedi.py`) now checks for missing
+    requested columns before selecting: if the response is empty, it logs a
+    `WARNING` (empty could mean genuine zero-match *or* a server-side failure - the
+    caller can't tell which from this alone, so it's flagged either way) and adds
+    the missing fields as empty columns instead of crashing; if the response is
+    **not** empty and a field is still missing (a real caller typo), it now raises a
+    clear `KeyError` naming the bad field(s), instead of pandas' own less legible one.
+  - **Regression tests** (`tests/test_gedi.py`, fast/non-network, via
+    `monkeypatch.setattr` on `gedi_module.gedi.gedi02ap`/`gedi_module.sliderule.init`):
+    one reproducing the empty/failed-response case directly against
+    `sliderule.emptyframe()` (no live SlideRule failure needed to exercise it), one
+    confirming a genuine bad field name against a non-empty response still raises.
+    Full fast suite (62 tests) and `pre-commit run --all-files` both pass.
+  - **Separately, found while investigating**: a `benchmark/results/gedi_spatial_sweep.csv`
+    was found sitting in the working tree mid-session with 5/6 default sweep rows
+    filled in (up to `side_deg=1.0`) - turned out to be the user's own local run
+    (the traceback above is from it), not something the assistant produced; flagged
+    to the user rather than silently deleted or assumed, per the usual "investigate
+    unfamiliar state before touching it" practice.
+
+- **2026-09-22** — Closed the GEDI L2A field-selection gap flagged as an open question
+  the same day (see `tech-stack.md`'s new "`anc_fields`: reading beyond `gedi02ap`'s
+  fixed schema" section for the full writeup). Started from the user pasting a GitHub
+  issue comment
+  ([SlideRuleEarth/sliderule#539](https://github.com/SlideRuleEarth/sliderule/issues/539#issuecomment-3529180434))
+  where the maintainer confirms `anc_fields` works for GEDI and points at
+  `clients/python/tests/test_ancillary.py::TestGedi` - fetched via `gh api` (`gh issue
+  view` itself failed with a "Projects (classic)" GraphQL error on this repo).
+  - Live-verified every field from `download.yaml`'s `gedi_l2a.selected_bands` not
+    already in `gedi02ap`'s fixed schema, one at a time then all together, against the
+    same small Fontainebleau AOI the existing tests use: all confirmed working under
+    their bare name except `landsat_treecover`/`modis_treecover` (need a
+    `land_cover_data/` group prefix, discovered after the bare name silently returned
+    0 rows rather than erroring) and `shot_number` (client-side bug: response comes
+    back with exactly double the expected row count, raises `ValueError` on
+    assignment - not fixable from gfetch's side).
+  - `rh` returns the full 101-element relative-height percentile array per shot, not
+    the named `rh0`/`rh2`/.../`rh100` bands geefetch exposed - added
+    `gfetch.gedi.expand_rh()` as a separate pure function to slice it into those named
+    columns, rather than folding the slicing into `fetch_gedi_l2a` itself.
+  - **Implementation**: `fetch_gedi_l2a()` gained `anc_fields` (forwarded to
+    `gedi02ap`'s `parms`, always kept regardless of the `fields` filter - required
+    reworking the missing-column check to cover both together, since the old code
+    would have silently dropped any requested `anc_fields` column not also listed in
+    `fields`). CLI gained `--anc-fields`/`--rh-percentiles` (`gfetch/cli/gedi.py`,
+    wired through `gfetch/cli/main.py`), with `rh` auto-added to `anc_fields` if
+    `rh_percentiles` is given without it.
+  - Tests: `tests/test_gedi.py` gained three fast/non-network tests (`anc_fields`
+    forwarded into the request parms, kept in the result regardless of `fields`,
+    `expand_rh`'s array-splitting) and one `@pytest.mark.slow` live test requesting
+    all fourteen working `anc_fields` at once plus `expand_rh`. Full fast suite (70
+    tests) and `pre-commit run --all-files` (ruff, pyrefly, pydoclint) pass; the new
+    live test also run and passing against the real public cluster.
+  - Updated `~/Documents/jz/src/configs/mozambania/v6/2020/download_gfetch/gedi.yaml`
+    (a reference-only file in a separate configs repo, not consumed by `gfetch gedi`
+    itself - see its own header comment) to use the newly-available `anc_fields`/
+    `rh_percentiles`, closing all but one (`shot_number`) of the fields it previously
+    flagged as unmappable from `download.yaml`'s `gedi_l2a.selected_bands`.
+
+- **2026-09-22** — Made `gfetch gedi` load a config file instead of the sprawling
+  CLI-flag set the previous entry's `--anc-fields`/`--rh-percentiles` additions left
+  it with (surfaced when the user, having just hand-translated `gedi.yaml` into a
+  16-line CLI invocation to answer "what command do I run", asked "Can we not use the
+  config file anymore?"). Narrower than the design rejected earlier the same day
+  (`gfetch gedi CONFIG`, not a raster `Config` field) - see `tech-stack.md`'s
+  "Chosen architecture" section for the updated writeup.
+  - New `gfetch.cli.gedi_config.GediConfig`/`load()` (`src/gfetch/cli/gedi_config.py`),
+    reusing `cli/config.py`'s generic `AOIConfig`/`TimeRangeConfig` (`time_range`
+    optional, unlike the raster `Config` - GEDI's own "no time range" meaning, the
+    whole mission archive, needed to survive) but not the raster-specific `Config`
+    itself, keeping the two pipelines' schemas independent as originally decided.
+  - `cli/gedi.py`'s `gedi()` now takes a single `config_path: Path` (mirroring
+    `search`/`download`/`mosaic`'s own CLI functions) instead of `output`/`bbox`/
+    `start`/`end`/`fields`/`anc_fields`/`rh_percentiles`; `cli/main.py`'s `gedi`
+    command shrank to `gfetch gedi CONFIG [--verbose]` to match.
+  - Tests: new `tests/test_gedi_config.py` (`GediConfig` defaults/overrides,
+    mirroring `test_cli_config.py`'s pattern) and `tests/test_cli_gedi.py` (CLI
+    wiring via a monkeypatched `fetch_gedi_l2a`, covering the `rh_percentiles`->
+    auto-added-`rh` behavior and the config's defaults). Full fast suite (71 tests)
+    and `pre-commit run --all-files` pass. Also live-verified end to end via the real
+    `gfetch gedi` command against a real config file and the public SlideRule
+    cluster (small Fontainebleau AOI, `rh0`/`rh50`/`rh100`/`quality_flag` all came
+    back correctly), not just the mocked CLI tests.
+  - Updated `gedi.yaml` to drop its now-inaccurate "reference-only, not consumed by
+    `gfetch gedi`" header comment - it's now the literal file to pass to the command.
+
+- **2026-09-22** — Fixed `fetch_gedi_l2a()` failing to connect at all on Jean Zay's
+  `archive` partition, found from the user's first real `gfetch gedi --config
+  gedi.yaml` run there (`srun --pty ...`): every SlideRule request timed out
+  ("Timed-out connecting... attempt 1/2/3 of 3"), even though the node has working
+  internet via an IDRIS-mandated HTTP proxy (`https_proxy=http://prodprox.idris.fr:3128`).
+  - **Root cause**: `sliderule.init()`'s `Session` hardcodes `requests.Session.trust_env
+    = False` and exposes no way to override it - `trust_env=False` makes `requests`
+    ignore `https_proxy`/`no_proxy` entirely and always attempt a direct connection,
+    which Jean Zay's compute/archive nodes don't have. Traced via `sliderule/session.py`
+    (`Session.__init__`'s `trust_env` param, defaulted and not forwarded by `init()`)
+    after ruling out several other candidate causes live on the user's node: not node-
+    to-node proxy variance (same `salloc` allocation throughout), not proxy env vars
+    missing (confirmed present and correctly picked up by `requests.utils.
+    get_environ_proxies`), not a `requests.Session`-vs-module-level-`requests.get`
+    difference (an exact hand-built replica of `sliderule`'s own `session.get(url,
+    data=..., headers=..., timeout=(10,120), verify=True)` call succeeded once
+    `trust_env=True` was set), and not a custom transport adapter (`sliderule`'s
+    `Session.__init__` mounts none - confirmed by reading the source, not assumed).
+  - Also chased down and corrected a red herring along the way: `sliderule/__init__.py`
+    does `from .sliderule import *`, so the top-level `sliderule.slideruleSession` a
+    user (or a diagnostic script) accesses via a plain `import sliderule` is a stale
+    snapshot frozen at package-import time (always `None`) - the live global `init()`
+    actually updates lives at `sliderule.sliderule.slideruleSession`. Not gfetch's own
+    bug (`gfetch/gedi.py` already does `from sliderule import gedi, sliderule`, which
+    imports the *submodule* directly and was never affected), but cost real back-and-
+    forth to pin down before realizing it was a dead end for the actual connectivity
+    problem.
+  - **Fix**: `fetch_gedi_l2a()` now calls `sliderule.create_session(trust_env=True)`
+    (which does accept `trust_env` - it's a thin `Session(**kwargs)` wrapper) and
+    assigns the result to the module's global `slideruleSession` directly, in place of
+    `sliderule.init(verbose=False)`. Trades away `init()`'s client/server version-
+    compatibility warning (a nicety, not essential) for working connectivity on a
+    proxied network; harmless on an unproxied one since `trust_env=True` with no proxy
+    env vars set behaves identically to a direct connection.
+  - Live-verified twice: the user confirmed the underlying `create_session(trust_env=
+    True)` + explicit-session pattern works end-to-end on Jean Zay's `archive`
+    partition (`check_version()`/`source()`/a raw `.session.get()` call all succeeded
+    through the proxy); the assistant separately re-ran gfetch's full non-network suite
+    (71 tests) plus all `@pytest.mark.slow` live GEDI tests against the real public
+    cluster from an unproxied network, confirming no regression there.
+  - Tests: `tests/test_gedi.py`'s existing `monkeypatch.setattr(gedi_module.sliderule,
+    "init", ...)` calls updated to patch `"create_session"` instead, matching the code
+    change; no new test added (there's nothing to unit-test about `trust_env` itself -
+    it's a passthrough to a third-party library's own connection behavior, and the
+    real coverage here is the live HPC verification plus the existing slow tests
+    continuing to pass against the real service).
+  - **This fix turned out to be wrong / incomplete**: the user's next real
+    `gfetch gedi --config ...` run on the `archive` node (a genuinely fresh process,
+    not `srun --pty python -c`) still timed out. Spent a long back-and-forth chasing
+    why, including two real dead ends worth recording so they're not re-chased:
+    (1) `sliderule/__init__.py` does `from .sliderule import *`, so a **diagnostic
+    script** doing plain `import sliderule; sliderule.slideruleSession = ...`
+    touches a stale top-level copy, not the live submodule global - real, but not
+    gfetch's bug (`gfetch/gedi.py` already imports the submodule directly via `from
+    sliderule import gedi, sliderule`); (2) an IPython session with connection
+    counts climbing across supposedly-separate `srun --pty python -c` invocations
+    revealed the user's diagnostics had been running in one long-lived, likely
+    duplicate-module-riddled kernel the whole time - also real, also not gfetch's
+    bug. Neither explained the CLI itself failing in a genuinely fresh process.
+  - **Actual fix**: patch `sliderule.session.Session.__init__`'s own default instead
+    of trying to win a race to set the right global before `gedi02ap()`'s internal
+    `checksession()`-triggered lazy re-init runs. `gfetch/gedi.py` now wraps
+    `Session.__init__` at import time (`kwargs.setdefault("trust_env", True)`) so
+    *every* `Session` constructed anywhere in the process - including SlideRule's
+    own internal fallback, whatever exact path that takes - defaults to
+    `trust_env=True` unless a caller explicitly asks for `False`. `fetch_gedi_l2a()`
+    reverted to plain `sliderule.init(verbose=False)`, now safe since construction
+    itself can no longer produce a `trust_env=False` session by default. Why the
+    external global-assignment approach specifically failed to reach `gedi02ap()`'s
+    session even in a clean process was never conclusively pinned down - the patched
+    default sidesteps needing to know, by fixing the one thing every code path
+    shares (the constructor).
+  - Tests: added `test_session_init_defaults_trust_env_to_true` (constructing a
+    bare, unrelated `Session()` picks up `trust_env=True`; an explicit
+    `trust_env=False` still wins) plus the existing `monkeypatch` fast tests
+    reverted to patching `sliderule.init` again. Full fast suite (72 tests) and all
+    three `@pytest.mark.slow` live GEDI tests (including a real `gedi02ap()` call)
+    re-run and passing from an unproxied network - **not yet re-confirmed on Jean
+    Zay** as of this entry; that's the next thing to verify.
+
+- **2026-09-22** — Real bug found via a live `gfetch mosaic` run on Jean Zay (real
+  1491-item, 3-zone, 12-band mozambania Sentinel-2 config, `--task-id 0 --n-tasks 6`):
+  a `ValueError: Specified Zarr chunks encoding['chunks']=(632, 632) for variable
+  named 'rededge2' would overlap multiple Dask chunks` deep inside `to_zarr`, on the
+  very first patch.
+  - **Investigation**: reproduced the exact same config/real search results/patch
+    (zone 32735, patch 0) locally, both at per-patch scale and at full-zone scale
+    (matching `prepare_template`'s own code path) against gfetch's own pinned
+    dependency versions - every band, including `rededge2`, came out cleanly and
+    consistently chunked at 2048/2048/1747. Could not reproduce the mismatch at all
+    with gfetch's own dependency set on the identical real data.
+  - **Root cause, best-supported explanation**: `mosaic()`'s `chunks=` parameter only
+    pinned the chunk grid at `load()` time - nothing guaranteed `composite()`'s
+    reduction (or any per-band resampling needed to reach the common output grid,
+    e.g. for `rededge2`, a 20m-native band upscaled to the 10m target) preserved that
+    grid identically for every variable across separate calls. `--n-tasks 6` means up
+    to 6 SLURM array tasks each independently build the *same* zone's full dataset
+    and race (via `prepare_template`'s atomic `mode="w-"`) to initialize its store -
+    the code's own correctness relies on every caller's build being byte-for-byte
+    identical, which wasn't actually guaranteed. Whichever task won the race baked
+    its own build's chunk layout permanently into the store; a different task (or a
+    later patch) building a very slightly different version of "the same" dataset no
+    longer matched it. A separate, real possibility for the same symptom (a store
+    left over from an earlier run under different settings, which `prepare_template`
+    silently treats as already-done) was also identified but not confirmed or ruled
+    out - both are "data layout" bugs, not a library-version issue (the user pushed
+    back correctly on an earlier, weaker "different Jean Zay Python env" framing).
+  - **Fix 1** (`src/gfetch/mosaic.py::mosaic`): explicitly `.chunk()` the composited
+    output to the resolved `x`/`y` chunk sizes right before returning, removing the
+    possibility of any two calls disagreeing, by construction, regardless of what
+    `load()`/`composite()`/resampling internally produced. Regression test
+    (`test_mosaic_pins_output_chunks_to_requested_grid`) fakes a `load()` return with
+    deliberately misaligned chunks and asserts `mosaic()` corrects them - confirmed
+    to fail without the fix, pass with it.
+  - **Fix 2, at the user's explicit request after pushing back on "just rechunk to
+    accommodate" as the complete fix**: added `gfetch.write.validate_chunks()` -
+    reads a store's actual on-disk chunk grid straight from its Zarr array metadata
+    (same mechanism `region_is_written()` already uses) and raises a clear
+    `ValueError` naming the store path, variable, and expected-vs-actual chunk size
+    if it disagrees with the current run's config. Wired into `cli/mosaic.py` right
+    after the existing `store_initialized()` check, before any patch is built - so an
+    incompatible pre-existing store (from an earlier run, different config, or older
+    gfetch version) fails immediately and clearly instead of only surfacing deep
+    inside `to_zarr` after a wasted patch computation. Two new tests in
+    `tests/test_write.py` (passes when matching, raises with a clear message on
+    mismatch).
+  - Full fast suite (75 tests) and `pre-commit run --all-files` both pass.
+    **Not yet re-confirmed against a real Jean Zay run** - the original failure was
+    never reproduced locally, so fix 1's effectiveness against the *actual* cause on
+    Jean Zay remains unverified; fix 2 is a general hardening independent of that.
+
+- **2026-09-22, same day** — **Fix 1 above (mosaic()'s silent `.chunk()` correction)
+  reverted**, on the user's pushback: "the changes you introduced could provoke OOM
+  (newly)". Correct: `.chunk()` is cheap (near no-op) when chunks already match, but
+  on the exact mismatch it exists to handle, it's a real dask `rechunk` - gathering
+  multiple source chunks in memory to build each target chunk. Fix 1 was silently
+  trading a cheap, immediate, safe `ValueError` for a potentially memory-hungry
+  rechunk on an already resource-constrained HPC allocation (`--cpus-per-task=5`) -
+  exactly backwards given the "fail fast, don't silently accommodate" principle the
+  user had already pushed for earlier in this same investigation (see the
+  `validate_chunks` entry above). `mosaic()` reverted to its pre-fix-1 form (plain
+  `return composite(ds, method=method)`); its regression test
+  (`test_mosaic_pins_output_chunks_to_requested_grid`) removed since it tested
+  behavior that's now deliberately gone. **Fix 2 (`validate_chunks`) stands
+  unchanged** - it's a pure metadata read, no rechunk, no data touched, and remains
+  the actual defense against the stale/mismatched-store failure class. A genuine
+  per-patch chunk divergence not caught by `validate_chunks` (e.g. real non-
+  determinism in a single build, if that theory is even correct - still unconfirmed)
+  will now fail the same way it did before any of this investigation: loud, cheap,
+  at `to_zarr`, no wasted rechunk. Full fast suite (74 tests, one fewer - the removed
+  test) and `pre-commit run --all-files` both pass.
+
+- **2026-09-22** — Closed out the Jean Zay GEDI connectivity investigation (see the
+  two entries above on the `anc_fields` field-selection work and the
+  `Session.__init__` `trust_env` patch): **`gfetch`'s fix is confirmed correct and
+  needs no further changes.** Root-caused the user's last remaining failure down to
+  hard proof it's IDRIS infrastructure, not gfetch: instrumenting the real
+  `fetch_gedi_l2a()` call (not a hand-rolled reproduction) to print the raw
+  `requests` exception instead of `sliderule`'s bucketed "Connection error" message
+  surfaced `ProxyError(... OSError('Tunnel connection failed: 403 Forbidden'))`, and
+  `session used: trust_env= True` confirmed the patched default was correctly active
+  - the request was reaching and going through the proxy exactly as intended.
+  Re-running the plain `curl -v` connectivity check from earlier (same command,
+  same node/allocation) reproduced the identical `403 ERR_ACCESS_DENIED` straight
+  from squid - **against `debpro144`, a different squid backend than the earlier
+  successful runs' `130.84.11.17`/`debpro17`** (`prodprox.idris.fr` load-balances
+  across several squid instances). A follow-up test then narrowed this further and
+  contradicted the first read of it: `curl` against the `archive` partition's
+  compute-node egress hit `130.84.11.17`/`debpro17` again (the *same* backend that
+  gave `200` on the very first test hours earlier) and got `403` this time - so it
+  isn't simply "some backends allow the domain, others don't" (a static per-backend
+  ACL difference), it's the *same* backend flipping from allow to deny over the
+  course of the debugging session, on a compute-node egress path. Separately, the
+  **front-end/login node** (`jean-zay3`, no `srun`) routes through an entirely
+  different proxy subnet (`130.84.14.27`, vs. the `archive` partition's `130.84.11.x`
+  pool) and succeeded cleanly (`HTTP/2 200`) at the same moment the compute-node path
+  was failing - login-node and compute-node egress are genuinely separate proxy
+  pools at IDRIS, not just different members of one pool. Told the user: nothing
+  left to fix in gfetch (the `trust_env` patch is proven correct and gets requests
+  all the way to the proxy); practical workaround is running `gfetch gedi` from the
+  login node directly, matching the existing "safe to run on an HPC login/data-
+  transfer node" guidance already given for `search`/`download`; the compute-node
+  proxy's time-varying 403 (same backend, same domain, allow -> deny within one
+  session) is worth reporting to IDRIS/GENCI support as its own finding, distinct
+  from - and more actionable than - the "different backends, different ACLs" theory
+  first floated.
+  - **Retrospective note for future sessions**: this whole thread (the `trust_env`
+    global-vs-patched-default saga, several dead-end diagnoses along the way, and
+    finally this proxy-ACL finding) cost a lot of back-and-forth - the user called out
+    partway through that some intermediate diagnostics felt "desperate." The lesson
+    that actually shortened the loop each time: get the **raw, unbucketed exception**
+    (`repr(e)` on the real `requests`/`urllib3` error) instead of reasoning from
+    `sliderule`'s own generic retry-log message ("Connection error", "Timed-out
+    connecting") - the raw `ProxyError`/`403 Forbidden` was the single piece of
+    evidence that actually resolved things, and should have been reached for much
+    earlier than it was.
+
+- **2026-09-22** — **Root cause of the `validate_grid_chunks_alignment` saga (three
+  entries above) finally confirmed, not just theorized** - the user deleted the
+  Jean Zay Zarr stores and reran the exact same job array, and hit the *same* error
+  on a *fresh* store, on a *different* zone (32736) and *different* band (`red`,
+  a native-10m band with no resampling need) than the first report. That single
+  data point definitively ruled out both prior theories (stale store from an older
+  run; a different Python environment on Jean Zay) - a freshly-created store
+  reproducing it, locally, means it's neither.
+  - **Reproduced deterministically, locally**, by finally testing zone 32736 (979
+    items - 5x zone 32735's count, never actually tested before this) instead of
+    only 32735 (206 items, always clean): every one of the 12 configured bands came
+    out chunked at 632x632 instead of 2048x2048, using gfetch's own pinned
+    dependencies, no version mismatch involved at all.
+  - **Isolated to `load()` vs. `composite()`** by inspecting `load()`'s raw,
+    pre-composite output for zone 32736: `time` came out as **three** chunks -
+    `(39, 39, 6)` for 84 distinct dates - not one. x/y were still correctly 2048 at
+    that point. Traced straight to `download_gfetch/s2.yaml`'s `chunks: {..., time:
+    39}` - an explicit config value that overrides `resolve_chunks()`'s safe
+    `time: -1` default (`dict.setdefault` only fills in a default for an *absent*
+    key), almost certainly a leftover from before `_DEFAULT_TIME_CHUNK` existed.
+    With `time` split into 3 chunks, `composite()`'s `.median(dim="time")` has to
+    rechunk internally to consolidate them before reducing - the exact class of bug
+    `_DEFAULT_TIME_CHUNK=-1` was originally added to prevent, just reachable again
+    via a config value nothing warned about. For zone 32736 specifically (by far
+    the widest/largest of the three), that internal rechunk also shrinks the
+    spatial `x`/`y` chunks as a side effect down to 632; zone 32735 hits the same
+    multi-chunk `time` axis but apparently stays under whatever threshold triggers
+    the spatial shrink, which is exactly why it looked clean in every earlier test.
+  - **Verified the fix directly** before writing any code: same real zone/items,
+    `chunks["time"]` forced to `-1` instead of the config's `39` - every band comes
+    out cleanly at 2048/2048.
+  - **Two-part fix, `src/gfetch/mosaic.py::mosaic`**:
+    1. `mosaic()` now overrides a non-default `chunks["time"]` unconditionally
+       (logging a `WARNING` naming the bad value and why) before calling `load()` -
+       `mosaic()` always reduces over the whole time axis, so a smaller `time`
+       chunk is *never* beneficial there and only ever a footgun; forcing it closes
+       the actual, confirmed root cause at the source.
+    2. **Fix 1 from three entries above (the output `x`/`y` chunk pin,
+       `result.chunk({"y":..., "x":...})`) reinstated** - the user reversed their
+       own revert: "there are some mechanism by which zarr can rechunk... I go back
+       on my earlier decision and I would say your earlier fix to ensure chunk
+       alignment is warranted." With the actual trigger now understood and fixed at
+       the source, this pin becomes a rare belt-and-suspenders backstop rather than
+       the routine path silently absorbing an expensive rechunk - the OOM objection
+       that motivated the revert doesn't really apply once it's not the thing
+       catching the common case anymore.
+  - **Verified end-to-end**, real zone 32736, the config's **unmodified**
+    `chunks.time: 39` (not manually overridden) - `mosaic()` now transparently
+    produces clean 2048/2048 chunking for every band with no caller changes needed.
+  - Two new tests in `tests/test_mosaic.py`:
+    `test_mosaic_overrides_non_default_time_chunk_and_warns` (asserts `load()` is
+    called with `time=-1` regardless of what was requested, and that a warning is
+    logged) and `test_mosaic_pins_output_chunks_to_requested_grid` (the fix-1
+    regression test, re-added). Full fast suite (76 tests) and
+    `pre-commit run --all-files` both pass.
+  - **Also surfaced along the way, not yet acted on**: `load()`'s own
+    `log_chunk_footprint` estimated **96.89 GB** peak memory for zone 32736's
+    full-time-axis, 2048-chunk, 12-band composite at 11 concurrent chunks (this
+    machine's core count) - not a bug, just the inherent cost of a `median` needing
+    the whole time axis per spatial chunk in memory, but a very real number given
+    the user had already independently reduced `n_compute_workers` from 5 to 3 in
+    the config between sessions, suggesting they were already fighting memory
+    pressure on Jean Zay before this specific bug was even found. Worth keeping in
+    mind if memory problems continue after this fix - they may be a separate,
+    legitimate capacity question, not another correctness bug.
+  - **Retrospective note**: the user pointed out, correctly, at multiple points in
+    this saga that "it all doesn't seem very robust" and that early theories
+    (dependency version, stale store, non-deterministic concurrent build) were
+    each accepted too readily without being pinned down against the *actual*
+    failing zone. The thing that actually cracked it was finally reproducing
+    against zone 32736 specifically instead of continuing to reason from zone
+    32735's clean result - a reminder to reproduce against the *exact* failing
+    input before trusting a theory that only explains a *similar* one.
+
