@@ -932,9 +932,11 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "cyclopts" },
+    { name = "dask" },
     { name = "odc-geo" },
     { name = "odc-stac" },
     { name = "omegaconf" },
+    { name = "pyproj" },
     { name = "pystac-client" },
     { name = "retry" },
     { name = "rich" },
@@ -956,9 +958,11 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cyclopts", specifier = ">=4.25.3" },
+    { name = "dask", specifier = ">=2026.8.0" },
     { name = "odc-geo", specifier = ">=0.5.3" },
     { name = "odc-stac", specifier = ">=0.5.3" },
     { name = "omegaconf", specifier = ">=2.3.1" },
+    { name = "pyproj", specifier = ">=3.8.0" },
     { name = "pystac-client", specifier = ">=0.9.0" },
     { name = "retry", specifier = ">=0.9.2" },
     { name = "rich", specifier = ">=15.0.0" },

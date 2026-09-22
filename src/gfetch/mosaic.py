@@ -14,6 +14,7 @@ import xarray as xr
 from odc.geo.crs import CRS
 from odc.geo.geobox import GeoBox
 from odc.geo.geom import BoundingBox, bbox_intersection
+from pyproj.database import query_utm_crs_info
 
 log = logging.getLogger(__name__)
 
@@ -232,32 +233,6 @@ def mosaic(
     return composite(ds, method=method)
 
 
-def group_by_utm_zone(items: Sequence[pystac.Item]) -> dict[CRS, list[pystac.Item]]:
-    """
-    Group items by the UTM zone their own footprint naturally falls in.
-
-    Each item's zone is resolved from its own STAC `bbox`, not the AOI as a whole -
-    a single Sentinel-2/Landsat tile always fits within one UTM zone, so this reflects
-    each item's actual native CRS.
-
-    Parameters
-    ----------
-    items : Sequence[pystac.Item]
-        Items to group, e.g. as returned by `gfetch.search.search`.
-
-    Returns
-    -------
-    dict[CRS, list[pystac.Item]]
-        Items grouped by native UTM CRS, in first-seen order.
-    """
-    groups: dict[CRS, list[pystac.Item]] = {}
-    for item in items:
-        assert item.bbox is not None
-        crs = CRS.utm(BoundingBox(*item.bbox, crs="EPSG:4326"))
-        groups.setdefault(crs, []).append(item)
-    return groups
-
-
 def _utm_zone_lon_band(crs: CRS) -> tuple[float, float]:
     """
     Longitude band (EPSG:4326) covered by a UTM zone.
@@ -277,6 +252,115 @@ def _utm_zone_lon_band(crs: CRS) -> tuple[float, float]:
     zone_number = int(utm_zone[:-1])
     west = -180.0 + 6.0 * (zone_number - 1)
     return west, west + 6.0
+
+
+def _utm_zones_for_aoi(aoi: BoundingBox) -> list[CRS]:
+    """
+    Enumerate every UTM zone whose area of use overlaps an AOI.
+
+    Unlike `odc.geo.crs.CRS.utm`, which picks the single best-fit zone for a bbox, this
+    returns every candidate - an AOI spanning several zones needs all of them, not just
+    the best match.
+
+    Parameters
+    ----------
+    aoi : BoundingBox
+        AOI bounding box in EPSG:4326.
+
+    Returns
+    -------
+    list[CRS]
+        Candidate UTM zones (correct hemisphere per latitude), in pyproj's match order.
+    """
+    return [
+        CRS(f"{info.auth_name}:{info.code}")
+        for info in query_utm_crs_info(datum_name="WGS 84", area_of_interest=aoi.aoi)
+    ]
+
+
+def _zone_aoi_extent(crs: CRS, aoi: BoundingBox) -> BoundingBox:
+    """
+    AOI clipped to a UTM zone's natural longitude band, still in EPSG:4326.
+
+    Parameters
+    ----------
+    crs : CRS
+        UTM zone to clip the AOI to.
+    aoi : BoundingBox
+        AOI bounding box in EPSG:4326.
+
+    Returns
+    -------
+    BoundingBox
+        `aoi` intersected with `crs`'s 6-degree-wide longitude band, in EPSG:4326.
+    """
+    west, east = _utm_zone_lon_band(crs)
+    zone_band = BoundingBox(west, aoi.bottom, east, aoi.top, crs="EPSG:4326")
+    return bbox_intersection([aoi, zone_band])
+
+
+def _bbox_overlaps(a: BoundingBox, b: BoundingBox) -> bool:
+    """
+    Check whether two bounding boxes overlap with non-zero area.
+
+    Parameters
+    ----------
+    a : BoundingBox
+        First bounding box, same CRS as `b`.
+    b : BoundingBox
+        Second bounding box, same CRS as `a`.
+
+    Returns
+    -------
+    bool
+        True if `a` and `b` overlap with non-zero area (merely touching doesn't count).
+    """
+    inter = bbox_intersection([a, b])
+    return inter.left < inter.right and inter.bottom < inter.top
+
+
+def group_by_utm_zone(
+    items: Sequence[pystac.Item], aoi_bbox: tuple[float, float, float, float]
+) -> dict[CRS, list[pystac.Item]]:
+    """
+    Assign items to every UTM zone (among those the AOI spans) their footprint overlaps.
+
+    An item is not assumed to fit within a single zone - that holds for Sentinel-2's
+    MGRS-tiled items, but not in general (e.g. Sentinel-1 GRD items are delivered in
+    EPSG:4326 and routinely span several zones). Grouping by AOI-relevant zone overlap
+    instead of one "native" zone per item keeps a wide item's contribution from being
+    silently dropped from a zone its footprint actually covers, while still producing
+    the same result as a one-zone-per-item assignment whenever every item does fit in
+    a single zone.
+
+    Parameters
+    ----------
+    items : Sequence[pystac.Item]
+        Items to group, e.g. as returned by `gfetch.search.search`.
+    aoi_bbox : tuple[float, float, float, float]
+        Full AOI bounding box (min_lon, min_lat, max_lon, max_lat) in EPSG:4326 -
+        determines which UTM zones are even candidates.
+
+    Returns
+    -------
+    dict[CRS, list[pystac.Item]]
+        Items grouped by overlapping UTM zone. An item spanning more than one zone
+        appears in more than one list; a zone the AOI spans but no item overlaps is
+        omitted.
+    """
+    aoi = BoundingBox(*aoi_bbox, crs="EPSG:4326")
+    groups: dict[CRS, list[pystac.Item]] = {}
+    for crs in _utm_zones_for_aoi(aoi):
+        zone_extent = _zone_aoi_extent(crs, aoi)
+        zone_items = [
+            item
+            for item in items
+            if item.bbox is not None
+            and _bbox_overlaps(zone_extent, BoundingBox(*item.bbox, crs="EPSG:4326"))
+        ]
+        if zone_items:
+            groups[crs] = zone_items
+    return groups
 
 
 def zone_geobox(crs: CRS, aoi_bbox: tuple[float, float, float, float], resolution: float) -> GeoBox:
@@ -299,13 +383,11 @@ def zone_geobox(crs: CRS, aoi_bbox: tuple[float, float, float, float], resolutio
     GeoBox
         Pixel grid covering the portion of `aoi_bbox` that falls within `crs`'s zone.
     """
-    west, east = _utm_zone_lon_band(crs)
     aoi = BoundingBox(*aoi_bbox, crs="EPSG:4326")
-    zone_band = BoundingBox(west, aoi.bottom, east, aoi.top, crs="EPSG:4326")
     # GeoBox.from_bbox() only reprojects when crs is literally the string "utm" - a
     # resolved CRS object is instead taken as the CRS the bbox values are already in,
     # so the intersection (computed in EPSG:4326) must be reprojected explicitly first.
-    extent = bbox_intersection([aoi, zone_band]).to_crs(crs)
+    extent = _zone_aoi_extent(crs, aoi).to_crs(crs)
     return GeoBox.from_bbox(extent, resolution=resolution)
 
 
@@ -323,12 +405,15 @@ def mosaic_by_zone(
     resampling: str | dict[str, str] | None = None,
 ) -> dict[CRS, xr.Dataset]:
     """
-    Mosaic items into one composite per native UTM zone the AOI spans.
+    Mosaic items into one composite per UTM zone the AOI spans.
 
-    Items are grouped by their own footprint's UTM zone rather than reprojected into
-    one AOI-wide zone chosen from the AOI's centroid - a country-scale AOI spanning
-    several zones produces one dataset per zone instead of warping everything into a
-    single arbitrarily-chosen one.
+    Items are grouped by which zone(s) their own footprint overlaps (see
+    `group_by_utm_zone`) rather than reprojected into one AOI-wide zone chosen from the
+    AOI's centroid - a country-scale AOI spanning several zones produces one dataset per
+    zone instead of warping everything into a single arbitrarily-chosen one. An item
+    whose own footprint spans more than one zone (not possible for Sentinel-2's
+    MGRS-tiled items, routine for e.g. Sentinel-1) contributes to every zone it
+    overlaps.
 
     Parameters
     ----------
@@ -362,7 +447,7 @@ def mosaic_by_zone(
     dict[CRS, xr.Dataset]
         One lazy, dask-backed mosaic per UTM zone spanned by `items`.
     """
-    zones = group_by_utm_zone(items)
+    zones = group_by_utm_zone(items, aoi_bbox)
     log.info(f"Items span {len(zones)} UTM zone(s): {[crs.epsg for crs in zones]}")
 
     result: dict[CRS, xr.Dataset] = {}
