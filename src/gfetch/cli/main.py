@@ -79,24 +79,31 @@ def download(config: Path, verbose: bool = False) -> None:
 
 
 @app.command
-def mosaic(config: Path, verbose: bool = False) -> None:
+def mosaic(config: Path, task_id: int = 0, n_tasks: int = 1, verbose: bool = False) -> None:
     """
     Load, cloud-mask, composite, and write a job's items to a Zarr mosaic.
 
     Compute-only stage; no internet access required once `gfetch download` has been
-    run (loads from remote hrefs otherwise).
+    run (loads from remote hrefs otherwise). Safe to resume after being killed, and
+    safe to split across several concurrent invocations via `task_id`/`n_tasks` (e.g.
+    a SLURM job array), each writing disjoint patches of the same output store.
 
     Parameters
     ----------
     config : Path
         Path to the configuration YAML file.
+    task_id : int
+        This invocation's index among `n_tasks` concurrent invocations. Defaults to 0.
+    n_tasks : int
+        Total number of concurrent invocations splitting this job's patches between
+        them. Defaults to 1 (no splitting).
     verbose : bool
         Enable verbose (DEBUG) logging. Defaults to False.
     """
     _setup_logging(level=logging.DEBUG if verbose else logging.INFO)
     from gfetch.cli.mosaic import mosaic as mosaic_cmd
 
-    mosaic_cmd(config)
+    mosaic_cmd(config, task_id=task_id, n_tasks=n_tasks)
 
 
 if __name__ == "__main__":

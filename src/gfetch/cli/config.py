@@ -124,6 +124,13 @@ class Config:
         spatial chunk, so peak memory scales with spatial chunk size regardless of
         how `time` itself is chunked. Defaults to None, which uses `gfetch.mosaic.
         load`'s own default of `{"x": 2048, "y": 2048}`.
+    patch_chunks : int
+        Size of the `mosaic` stage's resumable/parallelizable write unit, as a
+        multiple of `chunks`' native chunk size in both `x` and `y` (e.g. `10` means
+        each unit spans a 10x10 block of native chunks). A unit is skipped entirely
+        if every native chunk it covers is already written to the output Zarr store,
+        and recomputed as a whole otherwise - never partially. Defaults to 1 (one
+        native chunk per unit).
     """
 
     aoi: AOIConfig
@@ -139,6 +146,7 @@ class Config:
     resampling: dict[str, str] = field(default_factory=dict)
     n_compute_workers: int | None = None
     chunks: dict[str, int] | None = None
+    patch_chunks: int = 1
 
     def __post_init__(self) -> None:
         self.output_dir = Path(self.output_dir).expanduser().absolute()
@@ -180,7 +188,7 @@ class Config:
         """
         Output Zarr store path for one UTM zone's mosaic, written by the `write`
         stage. The AOI may span several UTM zones, each written to its own store -
-        see `gfetch.mosaic.mosaic_by_zone`.
+        see `gfetch.mosaic.group_by_utm_zone`.
 
         Parameters
         ----------

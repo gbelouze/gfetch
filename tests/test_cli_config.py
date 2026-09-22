@@ -29,6 +29,7 @@ def test_load_minimal_config(tmp_path: Path) -> None:
     assert cfg.resampling == {}
     assert cfg.orbit_state is None
     assert cfg.output_dir == Path(tmp_path).expanduser().absolute()
+    assert cfg.patch_chunks == 1
 
 
 def test_config_derived_paths(tmp_path: Path) -> None:
@@ -51,6 +52,7 @@ def test_load_overrides(tmp_path: Path) -> None:
         n_workers=8,
         resampling={"*": "bilinear", "scl": "nearest"},
         orbit_state="ascending",
+        patch_chunks=10,
     )
     cfg = load(config_path)
 
@@ -60,3 +62,4 @@ def test_load_overrides(tmp_path: Path) -> None:
     assert cfg.n_workers == 8
     assert cfg.resampling == {"*": "bilinear", "scl": "nearest"}
     assert cfg.orbit_state == "ascending"
+    assert cfg.patch_chunks == 10

@@ -3,7 +3,7 @@
 Downloads land at ``<cache_dir>/<item_id>/<asset_key><suffix>``. Each completed asset
 is marked by a sibling ``<cache_dir>/<item_id>/<asset_key>.complete`` sentinel file, so
 a killed/preempted job can resume by skipping assets whose sentinel already exists,
-without needing a central manifest or any locking - many workers can share one cache
+without needing a central manifest or any locking, so many workers can share one cache
 directory safely. Writes are atomic: each item downloads into a temp directory next to
 its final location, and only completed files are moved into place.
 """
@@ -43,7 +43,7 @@ def _patch_stac_asset_proxy_support() -> None:
     Make stac-asset's downloads respect `HTTP_PROXY`/`HTTPS_PROXY`.
 
     `stac_asset.HttpClient` builds its `aiohttp.ClientSession` with `trust_env`'s
-    default (`False`) - unlike `requests`/`curl`, `aiohttp` then silently ignores
+    default (`False`). Unlike `requests`/`curl`, `aiohttp` then silently ignores
     proxy environment variables and attempts a direct connection, which just hangs
     forever on a network that requires a proxy for egress (e.g. many HPC compute
     nodes) rather than raising an error. `stac_asset` exposes no config option for
@@ -57,8 +57,8 @@ def _patch_stac_asset_proxy_support() -> None:
         # constructor-shaped callable, never checks its type.
         return aiohttp.ClientSession(*args, trust_env=trust_env, **kwargs)
 
-    # Deliberately swapping a class for a constructor-shaped factory function -
-    # not expressible as a type[ClientSession], since it isn't one.
+    # Deliberately swapping a class for a constructor-shaped factory function,
+    # not expressible as a type[ClientSession] since it isn't one.
     stac_asset.http_client.ClientSession = _client_session  # type: ignore[assignment]
 
 
@@ -78,13 +78,13 @@ def _s3_uri_to_public_https(href: str) -> str:
 
     `stac_asset` routes `s3://` hrefs through its `S3Client`, which hardcodes its
     default region to 'us-west-2' (`stac_asset.config.DEFAULT_S3_REGION_NAME`)
-    regardless of the bucket's actual region - every request to a bucket hosted
+    regardless of the bucket's actual region: every request to a bucket hosted
     elsewhere (e.g. Sentinel-1's `sentinel-s1-l1c`, actually in `eu-central-1`) pays a
     wrong-region redirect round trip on every single request (confirmed: ~3x slower
     end to end for that bucket). The public virtual-hosted-style URL is served from
     the global S3 endpoint instead, with no region to get wrong, and is routed through
-    `stac_asset`'s plain `HttpClient` - sidesteps the problem for any public bucket
-    regardless of its actual region, not just Sentinel-1's.
+    `stac_asset`'s plain `HttpClient`, which sidesteps the problem for any public
+    bucket, regardless of its actual region.
 
     Parameters
     ----------
@@ -138,7 +138,7 @@ async def _retry_async[T](
     Retry an async callable with exponential backoff.
 
     The synchronous `retry` package used elsewhere in gfetch's sibling projects only
-    wraps regular callables - it never awaits a coroutine, so it can't retry
+    wraps regular callables: it never awaits a coroutine, so it can't retry
     stac-asset's async downloads. This is a small async-aware equivalent, with the
     same tries/backoff defaults.
 
@@ -179,7 +179,7 @@ async def _report_asset_progress(
 
     Runs concurrently with the `download_item()` call it was handed the other end of
     `messages` for, terminating once every asset in that call has reported a terminal
-    message - `download_item()` itself never signals "queue done", so this counts
+    message. `download_item()` itself never signals "queue done", so this counts
     terminal messages instead of waiting for one.
 
     Parameters
@@ -191,7 +191,7 @@ async def _report_asset_progress(
     task : TaskID
         This item's own bar, already added by the caller.
     n_assets : int
-        Number of assets being downloaded in this call - how many terminal messages
+        Number of assets being downloaded in this call: how many terminal messages
         (finish/error/skip) to wait for before returning.
     """
     total = 0
@@ -234,7 +234,7 @@ async def _download_item(
         Bounds the number of items downloading concurrently across the whole batch.
     progress : Progress | None
         Rich progress tracker. When given, this item gets its own byte-progress bar
-        for the duration of its download (added/removed here, self-contained - no
+        for the duration of its download (added/removed here, self-contained, with no
         separate progress-reporting task elsewhere). Defaults to None.
 
     Returns
@@ -347,7 +347,7 @@ async def download_items(
     progress : Progress | None
         Rich progress tracker: one main bar advanced per completed item, plus one
         byte-progress bar per item currently downloading (up to `max_concurrent_items`
-        at once) - all on this same tracker, since rich requires a single `Progress`
+        at once), all on this same tracker, since rich requires a single `Progress`
         instance to render multiple concurrent bars correctly. Defaults to None (no
         progress bars).
 

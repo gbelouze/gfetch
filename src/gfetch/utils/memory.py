@@ -43,7 +43,7 @@ def log_chunk_footprint(ds: xr.Dataset, log: logging.Logger) -> None:
             continue
         chunk_bytes = math.prod(data.chunksize) * data.dtype.itemsize
         total_chunk_bytes += chunk_bytes
-        log.info(
+        log.debug(
             f"{name}: dtype={data.dtype}, shape={var.shape}, chunks={data.chunksize} "
             f"({data.npartitions} chunk(s) total, {chunk_bytes / 1e6:.1f} MB/chunk), "
             f"total={data.nbytes / 1e9:.2f} GB"

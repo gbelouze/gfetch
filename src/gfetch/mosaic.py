@@ -1,19 +1,20 @@
 """Load/mosaic stage: load STAC items onto a common grid, cloud-mask, and composite.
 
 Runs on compute nodes, no internet required, as long as items' asset hrefs already
-point at a local cache (see `gfetch.download`) - or directly against remote hrefs for
+point at a local cache (see `gfetch.download`), or directly against remote hrefs for
 single-machine, internet-connected use.
 """
 
+import itertools
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Literal, cast
 
 import odc.stac
 import pystac
 import xarray as xr
 from odc.geo.crs import CRS
-from odc.geo.geobox import GeoBox
+from odc.geo.geobox import GeoBox, GeoboxTiles
 from odc.geo.geom import BoundingBox, bbox_intersection
 from pyproj.database import query_utm_crs_info
 
@@ -24,7 +25,7 @@ log = logging.getLogger(__name__)
 _DEFAULT_CHUNKS: dict[str, int] = {"x": 2048, "y": 2048}
 
 # `composite`'s default `median` isn't chunk-wise associative, so dask must gather an
-# entire spatial chunk's `time` axis into one chunk before it can reduce - if `time`
+# entire spatial chunk's `time` axis into one chunk before it can reduce. If `time`
 # arrives already split into several chunks (e.g. one per `groupby` group), dask
 # inserts a rechunk step to consolidate them first, which copies every chunk through
 # `dask.array.chunk.getitem` (split) and `np.concatenate` (merge). A single full-length
@@ -38,9 +39,36 @@ __all__ = [
     "load",
     "mask_clouds",
     "mosaic",
-    "mosaic_by_zone",
+    "patch_geoboxes",
+    "resolve_chunks",
     "zone_geobox",
 ]
+
+
+def resolve_chunks(chunks: dict[str, int] | None) -> dict[str, int]:
+    """
+    Resolve a user-supplied chunk dict against gfetch's own defaults.
+
+    Pulled out of `load` so callers that need the actual chunk sizes without loading
+    anything (e.g. to plan patches over a geobox) don't have to duplicate or guess at
+    gfetch's defaults.
+
+    Parameters
+    ----------
+    chunks : dict[str, int] | None
+        Dask chunk sizes as passed to `load`/`mosaic`. Defaults to None, which uses
+        `{"x": 2048, "y": 2048}`.
+
+    Returns
+    -------
+    dict[str, int]
+        `chunks` if given, else gfetch's own spatial defaults, always including a
+        `"time"` entry (a single full-length chunk unless explicitly overridden); see
+        `load`'s docstring for why.
+    """
+    effective = dict(chunks) if chunks is not None else dict(_DEFAULT_CHUNKS)
+    effective.setdefault("time", _DEFAULT_TIME_CHUNK)
+    return effective
 
 
 def load(
@@ -70,7 +98,7 @@ def load(
         mosaics over stacking every individual scene as a separate time step.
     chunks : dict[str, int] | None
         Dask chunk sizes, e.g. `{"time": 1, "x": 512, "y": 512}`. Defaults to None,
-        which chunks the spatial dims at `{"x": 2048, "y": 2048}` - passing `None`
+        which chunks the spatial dims at `{"x": 2048, "y": 2048}`; passing `None`
         through to odc-stac itself would instead load everything eagerly, without
         Dask. Regardless of this argument, `time` itself defaults to a single
         full-length chunk unless explicitly given here.
@@ -92,8 +120,7 @@ def load(
     # is always safe here.
     odc.stac.configure_s3_access(aws_unsigned=True)
     log.debug(f"Loading {len(items)} item(s), bands={list(bands)}, geobox shape={geobox.shape}")
-    effective_chunks = dict(chunks) if chunks is not None else dict(_DEFAULT_CHUNKS)
-    effective_chunks.setdefault("time", _DEFAULT_TIME_CHUNK)
+    effective_chunks = resolve_chunks(chunks)
     ds = odc.stac.load(
         items,
         bands=list(bands),
@@ -161,7 +188,7 @@ def _pin_mask_band_resampling(
     """
     Force `mask_band` to 'nearest' resampling, regardless of `resampling`.
 
-    A classification band (e.g. Sentinel-2's SCL) holds categorical values -
+    A classification band (e.g. Sentinel-2's SCL) holds categorical values;
     interpolating them with anything but nearest-neighbor produces class values that
     were never in the source data.
 
@@ -223,7 +250,13 @@ def mosaic(
     groupby : str
         odc-stac grouping strategy, passed to `load`. Defaults to 'solar_day'.
     chunks : dict[str, int] | None
-        Dask chunk sizes, passed to `load`. Defaults to None.
+        Dask chunk sizes, passed to `load`. A `"time"` entry other than a single
+        full-length chunk is overridden with a logged warning (see `resolve_chunks`'s
+        `_DEFAULT_TIME_CHUNK` note) - `mosaic` always reduces over the whole time
+        axis via `method`, so a smaller one is never beneficial and forces dask to
+        rechunk internally before reducing, which can also shrink the spatial `x`/`y`
+        chunk size as a side effect (confirmed live 2026-09-22, see
+        `claude/tasks.md`). Defaults to None.
     method : str
         Composite reduction method, passed to `composite`. Defaults to 'median'.
     resampling : str | dict[str, str] | None
@@ -240,17 +273,37 @@ def mosaic(
     if mask_band is not None and mask_band not in load_bands:
         load_bands.append(mask_band)
 
+    resolved_chunks = resolve_chunks(chunks)
+    if resolved_chunks["time"] != _DEFAULT_TIME_CHUNK:
+        log.warning(
+            f"chunks['time']={resolved_chunks['time']!r} requested, but mosaic() always "
+            f"reduces over the whole time axis via {method}() - a non-full time chunk is "
+            "never beneficial here and forces dask to rechunk internally before reducing, "
+            "which can also shrink the spatial x/y chunk size as a side effect, breaking "
+            "alignment with any pre-planned Zarr write region. Overriding to a single "
+            f"full-length chunk ({_DEFAULT_TIME_CHUNK})."
+        )
+        resolved_chunks["time"] = _DEFAULT_TIME_CHUNK
+
     ds = load(
         items,
         geobox,
         load_bands,
         groupby=groupby,
-        chunks=chunks,
+        chunks=resolved_chunks,
         resampling=_pin_mask_band_resampling(resampling, mask_band),
     )
     if mask_band is not None:
         ds = mask_clouds(ds, mask_band, mask_out)
-    return composite(ds, method=method)
+    result = composite(ds, method=method)
+
+    # Belt-and-suspenders: the `time` override above removes the known trigger for
+    # composite()'s reduction disturbing the x/y chunk grid, but nothing guarantees
+    # that grid is preserved exactly for every variable regardless (e.g. a band
+    # needing extra resampling to reach the common geobox). write_region()'s Zarr
+    # region-write requires exact alignment for every variable, so pin it explicitly
+    # rather than relying on it holding incidentally.
+    return result.chunk({"y": resolved_chunks["y"], "x": resolved_chunks["x"]})
 
 
 def _utm_zone_lon_band(crs: CRS) -> tuple[float, float]:
@@ -279,8 +332,7 @@ def _utm_zones_for_aoi(aoi: BoundingBox) -> list[CRS]:
     Enumerate every UTM zone whose area of use overlaps an AOI.
 
     Unlike `odc.geo.crs.CRS.utm`, which picks the single best-fit zone for a bbox, this
-    returns every candidate - an AOI spanning several zones needs all of them, not just
-    the best match.
+    returns every candidate: an AOI spanning several zones needs all of them.
 
     Parameters
     ----------
@@ -345,7 +397,7 @@ def group_by_utm_zone(
     """
     Assign items to every UTM zone (among those the AOI spans) their footprint overlaps.
 
-    An item is not assumed to fit within a single zone - that holds for Sentinel-2's
+    An item is not assumed to fit within a single zone; that holds for Sentinel-2's
     MGRS-tiled items, but not in general (e.g. Sentinel-1 GRD items are delivered in
     EPSG:4326 and routinely span several zones). Grouping by AOI-relevant zone overlap
     instead of one "native" zone per item keeps a wide item's contribution from being
@@ -358,8 +410,8 @@ def group_by_utm_zone(
     items : Sequence[pystac.Item]
         Items to group, e.g. as returned by `gfetch.search.search`.
     aoi_bbox : tuple[float, float, float, float]
-        Full AOI bounding box (min_lon, min_lat, max_lon, max_lat) in EPSG:4326 -
-        determines which UTM zones are even candidates.
+        Full AOI bounding box (min_lon, min_lat, max_lon, max_lat) in EPSG:4326,
+        which determines which UTM zones are even candidates.
 
     Returns
     -------
@@ -393,7 +445,7 @@ def zone_geobox(crs: CRS, aoi_bbox: tuple[float, float, float, float], resolutio
     crs : CRS
         Target UTM CRS for this zone.
     aoi_bbox : tuple[float, float, float, float]
-        Full AOI bounding box (min_lon, min_lat, max_lon, max_lat) in EPSG:4326 -
+        Full AOI bounding box (min_lon, min_lat, max_lon, max_lat) in EPSG:4326;
         may span more than one UTM zone.
     resolution : float
         Output pixel resolution, in `crs`'s units (meters, for UTM).
@@ -404,84 +456,47 @@ def zone_geobox(crs: CRS, aoi_bbox: tuple[float, float, float, float], resolutio
         Pixel grid covering the portion of `aoi_bbox` that falls within `crs`'s zone.
     """
     aoi = BoundingBox(*aoi_bbox, crs="EPSG:4326")
-    # GeoBox.from_bbox() only reprojects when crs is literally the string "utm" - a
-    # resolved CRS object is instead taken as the CRS the bbox values are already in,
-    # so the intersection (computed in EPSG:4326) must be reprojected explicitly first.
+    # GeoBox.from_bbox() only reprojects when crs is literally the string "utm";
+    # a resolved CRS object is instead taken as the CRS the bbox values are already
+    # in, so the intersection (computed in EPSG:4326) must be reprojected explicitly
+    # first.
     extent = _zone_aoi_extent(crs, aoi).to_crs(crs)
     return GeoBox.from_bbox(extent, resolution=resolution)
 
 
-def mosaic_by_zone(
-    items: Sequence[pystac.Item],
-    aoi_bbox: tuple[float, float, float, float],
-    bands: Sequence[str],
-    *,
-    resolution: float,
-    mask_band: str | None = None,
-    mask_out: frozenset[int] = frozenset(),
-    groupby: str = "solar_day",
-    chunks: dict[str, int] | None = None,
-    method: str = "median",
-    resampling: str | dict[str, str] | None = None,
-) -> dict[CRS, xr.Dataset]:
+def patch_geoboxes(
+    geobox: GeoBox, patch_shape: tuple[int, int]
+) -> Iterator[tuple[tuple[int, int], GeoBox, dict[str, slice]]]:
     """
-    Mosaic items into one composite per UTM zone the AOI spans.
+    Deterministically tile a geobox into patches, each a whole number of pixels of
+    `patch_shape`.
 
-    Items are grouped by which zone(s) their own footprint overlaps (see
-    `group_by_utm_zone`) rather than reprojected into one AOI-wide zone chosen from the
-    AOI's centroid - a country-scale AOI spanning several zones produces one dataset per
-    zone instead of warping everything into a single arbitrarily-chosen one. An item
-    whose own footprint spans more than one zone (not possible for Sentinel-2's
-    MGRS-tiled items, routine for e.g. Sentinel-1) contributes to every zone it
-    overlaps.
+    A patch is the unit of resumable/parallelizable work for the `mosaic` stage's
+    write step: it's sized independently of the Zarr store's own native chunk size,
+    but `patch_shape` must be an exact multiple of it in both dimensions so every
+    patch's region aligns with `gfetch.write.write_region`'s chunk-boundary
+    requirement.
 
     Parameters
     ----------
-    items : Sequence[pystac.Item]
-        Items to mosaic, e.g. as returned by `gfetch.search.search`.
-    aoi_bbox : tuple[float, float, float, float]
-        Full AOI bounding box (min_lon, min_lat, max_lon, max_lat) in EPSG:4326.
-    bands : Sequence[str]
-        Asset keys to load and composite, passed to `mosaic`.
-    resolution : float
-        Output pixel resolution, in each zone's own UTM CRS units (meters).
-    mask_band : str | None
-        Classification band used for cloud masking, passed to `mosaic`. Defaults to
-        None (no masking).
-    mask_out : frozenset[int]
-        Classification values to mask out, passed to `mosaic`. Defaults to an empty
-        frozenset.
-    groupby : str
-        odc-stac grouping strategy, passed to `mosaic`. Defaults to 'solar_day'.
-    chunks : dict[str, int] | None
-        Dask chunk sizes, passed to `mosaic`. Defaults to None.
-    method : str
-        Composite reduction method, passed to `mosaic`. Defaults to 'median'.
-    resampling : str | dict[str, str] | None
-        Resampling method for the data bands, passed to `mosaic`. `mask_band`, if
-        given, is always loaded with 'nearest' resampling regardless of this setting.
-        Defaults to None (odc-stac's own default).
+    geobox : GeoBox
+        Geobox to tile, e.g. one UTM zone's full output grid.
+    patch_shape : tuple[int, int]
+        `(y, x)` patch size in pixels.
 
-    Returns
-    -------
-    dict[CRS, xr.Dataset]
-        One lazy, dask-backed mosaic per UTM zone spanned by `items`.
+    Yields
+    ------
+    tuple[tuple[int, int], GeoBox, dict[str, slice]]
+        `((iy, ix), patch_geobox, region)` for every patch, in row-major order.
+        `patch_geobox` is this patch's own output grid (pass to `load`/`mosaic`),
+        `region` is its pixel-space slice within `geobox` (pass to
+        `gfetch.write.write_region`/`gfetch.write.region_is_written`).
     """
-    zones = group_by_utm_zone(items, aoi_bbox)
-    log.info(f"Items span {len(zones)} UTM zone(s): {[crs.epsg for crs in zones]}")
-
-    result: dict[CRS, xr.Dataset] = {}
-    for crs, zone_items in zones.items():
-        log.debug(f"{crs}: {len(zone_items)} item(s)")
-        result[crs] = mosaic(
-            zone_items,
-            zone_geobox(crs, aoi_bbox, resolution),
-            bands,
-            mask_band=mask_band,
-            mask_out=mask_out,
-            groupby=groupby,
-            chunks=chunks,
-            method=method,
-            resampling=resampling,
-        )
-    return result
+    tiles = GeoboxTiles(geobox, patch_shape)
+    n_y, n_x = tiles.shape
+    for iy, ix in itertools.product(range(n_y), range(n_x)):
+        y_sl, x_sl = tiles.roi[iy, ix]
+        # `GeoboxTiles` is generic over `GeoBoxBase` (also covers multiscale pyramids),
+        # but tiling a plain 2D `GeoBox` always yields a `GeoBox` back.
+        patch_geobox = cast("GeoBox", tiles[iy, ix])
+        yield (iy, ix), patch_geobox, {"y": y_sl, "x": x_sl}

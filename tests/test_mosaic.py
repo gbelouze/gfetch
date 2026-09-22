@@ -11,7 +11,8 @@ from gfetch.mosaic import (
     _pin_mask_band_resampling,
     group_by_utm_zone,
     mosaic,
-    mosaic_by_zone,
+    patch_geoboxes,
+    resolve_chunks,
     zone_geobox,
 )
 from gfetch.profiles import get_profile
@@ -80,6 +81,40 @@ def test_zone_geobox_clips_aoi_to_zone_band() -> None:
     assert clipped.right < 31.0  # stayed clipped to the 35S zone, not the full AOI
 
 
+def test_resolve_chunks_defaults() -> None:
+    assert resolve_chunks(None) == {"x": 2048, "y": 2048, "time": -1}
+
+
+def test_resolve_chunks_keeps_user_overrides_and_adds_time() -> None:
+    assert resolve_chunks({"x": 512, "y": 256}) == {"x": 512, "y": 256, "time": -1}
+
+
+def test_resolve_chunks_does_not_override_explicit_time() -> None:
+    assert resolve_chunks({"x": 512, "y": 256, "time": 3}) == {"x": 512, "y": 256, "time": 3}
+
+
+def test_patch_geoboxes_tiles_in_row_major_order_with_exact_shapes() -> None:
+    geobox = GeoBox.from_bbox((0, 0, 120, 80), crs="EPSG:3857", resolution=1.0)  # shape y=80, x=120
+
+    patches = list(patch_geoboxes(geobox, (20, 40)))  # (y, x) patch shape -> 4x3 grid
+
+    assert [idx for idx, _, _ in patches] == [(iy, ix) for iy in range(4) for ix in range(3)]
+    (_, patch_gbox, region) = patches[0]
+    assert patch_gbox.shape.y == 20
+    assert patch_gbox.shape.x == 40
+    assert region == {"y": slice(0, 20), "x": slice(0, 40)}
+
+
+def test_patch_geoboxes_last_row_and_col_are_clipped_not_dropped() -> None:
+    geobox = GeoBox.from_bbox((0, 0, 100, 80), crs="EPSG:3857", resolution=1.0)
+
+    patches = {idx: region for idx, _, region in patch_geoboxes(geobox, (30, 40))}
+
+    assert set(patches) == {(iy, ix) for iy in range(3) for ix in range(3)}
+    # 80/30 -> last row is a 20px remainder, not a full 30px tile
+    assert patches[(2, 0)] == {"y": slice(60, 80), "x": slice(0, 40)}
+
+
 @pytest.mark.parametrize(
     ("resampling", "mask_band", "expected"),
     [
@@ -126,6 +161,65 @@ def test_mosaic_pins_mask_band_to_nearest_even_with_explicit_override(monkeypatc
     assert captured["resampling"] == {"*": "bilinear", "scl": "nearest"}
 
 
+def test_mosaic_overrides_non_default_time_chunk_and_warns(monkeypatch, caplog) -> None:
+    """`mosaic()` always reduces over the whole time axis - a non-full `time` chunk
+    (e.g. a leftover config value from before `_DEFAULT_TIME_CHUNK` existed) forces
+    dask to rechunk internally before reducing, which was confirmed live 2026-09-22
+    to also shrink the spatial x/y chunk size as a side effect for a large enough
+    zone. `mosaic()` must override it rather than pass it through to `load()`.
+    """
+    captured: dict = {}
+
+    def fake_load(items, geobox, bands, *, groupby, chunks, resampling):
+        captured["chunks"] = chunks
+        return xr.Dataset(
+            {"red": (("time", "y", "x"), np.array([[[1.0]]]))},
+            coords={"time": [datetime.datetime(2020, 6, 6, tzinfo=datetime.UTC)]},
+        )
+
+    monkeypatch.setattr("gfetch.mosaic.load", fake_load)
+
+    with caplog.at_level("WARNING"):
+        mosaic(
+            [],
+            GeoBox.from_bbox((0, 0, 1, 1), crs="EPSG:4326", shape=(1, 1)),
+            ["red"],
+            chunks={"x": 512, "y": 512, "time": 39},
+        )
+
+    assert captured["chunks"] == {"x": 512, "y": 512, "time": -1}
+    assert "chunks['time']" in caplog.text
+
+
+def test_mosaic_pins_output_chunks_to_requested_grid(monkeypatch) -> None:
+    """Belt-and-suspenders: even with the time-chunk override above removing the
+    known trigger, nothing guarantees `composite()`'s reduction (or any per-band
+    resampling upstream) preserves the requested x/y chunk grid for every variable.
+    `mosaic()` must pin its output back onto the requested grid regardless of what
+    `load()` happened to return.
+    """
+
+    def fake_load(items, geobox, bands, *, groupby, chunks, resampling):
+        time_coord = [datetime.datetime(2020, 6, d, tzinfo=datetime.UTC) for d in (1, 2)]
+        red = xr.DataArray(
+            np.zeros((2, 4, 4)), dims=("time", "y", "x"), coords={"time": time_coord}
+        ).chunk({"time": -1, "y": 3, "x": 3})  # deliberately misaligned vs. requested below
+        return xr.Dataset({"red": red})
+
+    monkeypatch.setattr("gfetch.mosaic.load", fake_load)
+
+    ds = mosaic(
+        [],
+        GeoBox.from_bbox((0, 0, 1, 1), crs="EPSG:4326", shape=(4, 4)),
+        ["red"],
+        chunks={"x": 2, "y": 2},
+    )
+
+    y_chunks, x_chunks = ds["red"].data.chunks
+    assert y_chunks == (2, 2)
+    assert x_chunks == (2, 2)
+
+
 @pytest.mark.slow
 def test_mosaic_against_earthsearch() -> None:
     bbox = (2.30, 48.85, 2.33, 48.87)  # small AOI, keeps the test fast
@@ -157,7 +251,7 @@ def test_mosaic_against_earthsearch() -> None:
 
 
 @pytest.mark.slow
-def test_mosaic_by_zone_against_earthsearch() -> None:
+def test_mosaic_per_zone_against_earthsearch() -> None:
     bbox = (2.30, 48.85, 2.33, 48.87)  # small, single-zone AOI, keeps the test fast
     source = get_source("earthsearch")
     profile = get_profile("sentinel-2")
@@ -171,27 +265,30 @@ def test_mosaic_by_zone_against_earthsearch() -> None:
     )
     assert items
 
-    zone_datasets = mosaic_by_zone(
-        items,
-        bbox,
+    # Composed the same way `cli/mosaic.py` does: group by zone, then mosaic each
+    # zone's own geobox independently.
+    zones = group_by_utm_zone(items, bbox)
+    assert list(zones) == [CRS("EPSG:32631")]  # Paris is in UTM zone 31N
+
+    crs, zone_items = next(iter(zones.items()))
+    ds = mosaic(
+        zone_items,
+        zone_geobox(crs, bbox, resolution=60.0),  # coarse, keeps it fast
         ["red"],
-        resolution=60.0,  # coarse, keeps it fast
         mask_band=profile.cloud_mask_band,
         mask_out=profile.cloud_mask_out,
     )
-
-    assert list(zone_datasets) == [CRS("EPSG:32631")]  # Paris is in UTM zone 31N
-    computed = next(iter(zone_datasets.values())).compute()
+    computed = ds.compute()
     assert "red" in computed.data_vars
     assert np.isfinite(computed["red"].values).any()
 
 
 @pytest.mark.slow
-def test_mosaic_by_zone_sentinel1_against_earthsearch() -> None:
+def test_mosaic_per_zone_sentinel1_against_earthsearch() -> None:
     # Wide enough AOI that real Sentinel-1 GRD scenes (delivered in EPSG:4326, often
     # spanning several degrees of longitude) plausibly straddle a UTM zone boundary -
     # exercises group_by_utm_zone's overlap-based (not one-native-zone-per-item)
-    # assignment against real data, not just synthetic bboxes.
+    # assignment against real data.
     bbox = (2.0, 48.6, 2.6, 49.0)
     source = get_source("earthsearch")
     profile = get_profile("sentinel-1")
@@ -205,17 +302,17 @@ def test_mosaic_by_zone_sentinel1_against_earthsearch() -> None:
     )
     assert items
 
-    zone_datasets = mosaic_by_zone(
-        items,
-        bbox,
-        list(profile.default_bands)[:1],
-        resolution=200.0,  # coarse, keeps it fast
-        mask_band=profile.cloud_mask_band,
-        mask_out=profile.cloud_mask_out,
-    )
+    zones = group_by_utm_zone(items, bbox)
+    assert zones
 
-    assert zone_datasets
-    for crs, ds in zone_datasets.items():
+    for crs, zone_items in zones.items():
+        ds = mosaic(
+            zone_items,
+            zone_geobox(crs, bbox, resolution=200.0),  # coarse, keeps it fast
+            list(profile.default_bands)[:1],
+            mask_band=profile.cloud_mask_band,
+            mask_out=profile.cloud_mask_out,
+        )
         computed = ds.compute()
         assert "vv" in computed.data_vars
         assert "time" not in computed.dims  # composited away
