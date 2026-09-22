@@ -106,5 +106,29 @@ def mosaic(config: Path, task_id: int = 0, n_tasks: int = 1, verbose: bool = Fal
     mosaic_cmd(config, task_id=task_id, n_tasks=n_tasks)
 
 
+@app.command
+def gedi(config: Path, verbose: bool = False) -> None:
+    """
+    Fetch GEDI L2A footprints matching a configuration's AOI/time range via
+    SlideRule and write them to GeoParquet.
+
+    Standalone command, independent of the raster search/download/mosaic pipeline
+    and its `Config` schema: SlideRule resolves matching granules and subsets them
+    server-side, so there's no separate search/download stage and no local asset
+    cache. Uses its own config schema, `gfetch.cli.gedi_config.GediConfig`.
+
+    Parameters
+    ----------
+    config : Path
+        Path to the configuration YAML file.
+    verbose : bool
+        Enable verbose (DEBUG) logging. Defaults to False.
+    """
+    _setup_logging(level=logging.DEBUG if verbose else logging.INFO)
+    from gfetch.cli.gedi import gedi as gedi_cmd
+
+    gedi_cmd(config)
+
+
 if __name__ == "__main__":
     app()
