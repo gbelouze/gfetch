@@ -3,11 +3,42 @@ from pathlib import Path
 
 import pystac
 
-from gfetch.cli.config import load
+from gfetch.cli.config import Config, load
 from gfetch.search import search as search_items
 from gfetch.sources import get_source
 
 log = logging.getLogger(__name__)
+
+_ORBIT_STATES = {"ascending", "descending"}
+
+
+def _build_query(cfg: Config) -> dict | None:
+    """
+    Translate a config's optional search filters into a STAC query-extension dict.
+
+    Parameters
+    ----------
+    cfg : Config
+        Job configuration.
+
+    Returns
+    -------
+    dict | None
+        Query-extension filters, or None if none are set.
+
+    Raises
+    ------
+    ValueError
+        If `cfg.orbit_state` is set to anything other than 'ascending'/'descending'.
+    """
+    query: dict = {}
+    if cfg.max_cloud_cover is not None:
+        query["eo:cloud_cover"] = {"lt": cfg.max_cloud_cover}
+    if cfg.orbit_state is not None:
+        if cfg.orbit_state not in _ORBIT_STATES:
+            raise ValueError(f"orbit_state must be one of {_ORBIT_STATES}, got {cfg.orbit_state!r}")
+        query["sat:orbit_state"] = {"eq": cfg.orbit_state}
+    return query or None
 
 
 def search(config_path: Path) -> None:
@@ -22,9 +53,7 @@ def search(config_path: Path) -> None:
     """
     cfg = load(config_path)
     source = get_source(cfg.source)
-    query = (
-        {"eo:cloud_cover": {"lt": cfg.max_cloud_cover}} if cfg.max_cloud_cover is not None else None
-    )
+    query = _build_query(cfg)
     log.debug(f"query={query}")
     items = search_items(source, cfg.satellite, cfg.aoi.bbox, cfg.time_range.datetime, query=query)
 

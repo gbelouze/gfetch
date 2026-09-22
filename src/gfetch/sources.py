@@ -15,8 +15,14 @@ _SENTINEL2_COLLECTIONS = {
     "planetary-computer": "sentinel-2-l2a",
 }
 
+_SENTINEL1_COLLECTIONS = {
+    "earthsearch": "sentinel-1-grd",
+    "planetary-computer": "sentinel-1-grd",
+}
+
 _COLLECTIONS: dict[str, dict[str, str]] = {
     "sentinel-2": _SENTINEL2_COLLECTIONS,
+    "sentinel-1": _SENTINEL1_COLLECTIONS,
 }
 
 

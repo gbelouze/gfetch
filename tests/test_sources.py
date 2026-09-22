@@ -21,6 +21,11 @@ def test_registered_sources_resolve_sentinel2_collection() -> None:
         assert collection
 
 
+def test_registered_sources_resolve_sentinel1_collection() -> None:
+    for source in SOURCES.values():
+        assert source.collection("sentinel-1") == "sentinel-1-grd"
+
+
 def test_collection_unknown_satellite() -> None:
     source = StacSource("earthsearch", "https://example.com")
     with pytest.raises(ValueError, match="No known collection"):

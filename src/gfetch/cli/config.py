@@ -94,7 +94,11 @@ class Config:
         profile's default bands.
     max_cloud_cover : float | None
         Maximum `eo:cloud_cover` percentage to search for. Defaults to None (no
-        filter).
+        filter). Only meaningful for optical satellites (e.g. Sentinel-2).
+    orbit_state : str | None
+        Restrict the search to one `sat:orbit_state` ('ascending' or 'descending'),
+        e.g. to avoid blending SAR backscatter from different look geometries into one
+        composite. Defaults to None (no filter, both orbit states included).
     resolution : float
         Output pixel resolution, in the target CRS's units (meters, for UTM).
         Defaults to 10.0.
@@ -109,6 +113,7 @@ class Config:
     source: str = "earthsearch"
     bands: list[str] | None = None
     max_cloud_cover: float | None = None
+    orbit_state: str | None = None
     resolution: float = 10.0
     n_workers: int = 4
 

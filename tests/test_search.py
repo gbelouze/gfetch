@@ -51,3 +51,35 @@ def test_search_earthsearch_returns_items() -> None:
     for item in items:
         assert "red" in item.assets
         assert "scl" in item.assets
+
+
+@pytest.mark.slow
+def test_search_earthsearch_sentinel1_returns_items() -> None:
+    source = get_source("earthsearch")
+    items = search(
+        source,
+        "sentinel-1",
+        bbox=(2.0, 48.6, 2.6, 49.0),
+        datetime="2026-06-01/2026-06-15",
+    )
+
+    assert items
+    for item in items:
+        assert "vv" in item.assets
+        assert "vh" in item.assets
+        assert item.properties.get("sat:orbit_state") in {"ascending", "descending"}
+
+
+@pytest.mark.slow
+def test_search_earthsearch_sentinel1_orbit_state_filter() -> None:
+    source = get_source("earthsearch")
+    items = search(
+        source,
+        "sentinel-1",
+        bbox=(2.0, 48.6, 2.6, 49.0),
+        datetime="2026-05-01/2026-06-15",
+        query={"sat:orbit_state": {"eq": "descending"}},
+    )
+
+    assert items
+    assert {item.properties.get("sat:orbit_state") for item in items} == {"descending"}

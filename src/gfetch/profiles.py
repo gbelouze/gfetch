@@ -45,6 +45,13 @@ PROFILES: dict[str, SatelliteProfile] = {
         cloud_mask_band="scl",
         cloud_mask_out=_SENTINEL2_SCL_MASK_OUT,
     ),
+    # SAR isn't affected by clouds, so there's no cloud-mask-equivalent band.
+    "sentinel-1": SatelliteProfile(
+        name="sentinel-1",
+        default_bands=("vv", "vh"),
+        cloud_mask_band=None,
+        cloud_mask_out=frozenset(),
+    ),
 }
 
 
