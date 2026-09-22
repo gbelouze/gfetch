@@ -172,7 +172,8 @@ pieces of its design are worth carrying forward rather than re-deriving:
 ### Project Pythia cookbooks (cookbooks.projectpythia.org)
 
 Added 2026-09-19, re-checked at the user's request specifically to validate/simplify the
-download-stage implementation before writing it (see the corrected POC log entry above).
+download-stage implementation before writing it (see `claude/tasks.md` for the corrected
+POC log entry).
 
 - **landsat-ml-cookbook** (`ProjectPythia/landsat-ml-cookbook`, notebook
   `1.0_Data_Ingestion-Geospatial.ipynb`, read from the actual notebook source via the
@@ -270,7 +271,7 @@ page/README) before being added here.
   - `src/lib.py`'s cloud-masking uses `odc.algo.mask_cleanup`/`erase_bad` (morphological
     closing/opening on the SCL-derived mask before compositing) rather than a bare
     boolean class-exclusion mask — more robust than gfetch's current POC-stage SCL
-    handling (a plain `{0,1,3,8,9,10}` class-set exclusion, see "POC log" below); worth
+    handling (a plain `{0,1,3,8,9,10}` class-set exclusion, see `claude/tasks.md`); worth
     adopting `odc.algo` for the real `mosaic` stage's cloud-masking instead of hand-rolling.
   - `src/storage.py::AbstractStorage` (`initialize()`/`get_zarr_store()`/`commit()`)
     cleanly abstracts a plain-Zarr/fsspec store vs. an Icechunk-backed one behind one
@@ -292,7 +293,7 @@ page/README) before being added here.
     faster path that avoids per-write xarray/dask overhead, at the cost of manually
     tracking the time index (their own comment: "not writing with xarray, so have to
     reverse engineer the time index"). An alternative worth benchmarking against
-    gfetch's current xarray-region-write pattern (POC log below) before the real
+    gfetch's current xarray-region-write pattern (`claude/tasks.md`) before the real
     `write` stage is built, not something to adopt sight-unseen.
   - Not adopted: the multi-backend serverless dispatch (Coiled/Modal/Lithops) and
     Arraylake as a storage target — both out of scope per gfetch's non-goals (no hosted
@@ -322,6 +323,26 @@ API and a static file tree:
 | USGS Landsat (LandsatLook) | requester-pays S3 for direct access | `landsat-c2-l2` | Future — in practice, free via PC/Earth Search mirrors |
 | CDSE | OAuth2 client-credentials | official Sentinel archive | Future — more friction, had a multi-day STAC outage in Mar 2026; authoritative fallback, not default |
 | Generic static S3 catalog | none / bucket policy dependent | n/a | Future — needs `StaticSource`, see above |
+
+**Sentinel-1 (added 2026-09-22)**: both Planetary Computer and Earth Search expose a
+public, anonymous `sentinel-1-grd` collection (verified via each collection's actual
+STAC metadata, not assumed) — raw detected amplitude (`vv`/`vh`/`hh`/`hv` assets),
+**not** radiometrically calibrated or terrain-corrected, natively in **EPSG:4326** (not
+UTM — unlike Sentinel-2's MGRS-tiled items, a single GRD scene routinely spans several
+UTM zones; confirmed on a real item). PC additionally has `sentinel-1-rtc`
+(radiometrically terrain-corrected, analysis-ready, float32) but it's gated behind
+`msft:requires_account: true` — the only gfetch-relevant collection anywhere that needs
+real credentials, unlike every other anonymous-SAS-signed/public-S3 source gfetch uses.
+**Decision: ship GRD only for now** (both sources registered, `median` composite kept
+as the default — not `mean`, since averaging raw uncalibrated, non-terrain-corrected
+amplitude across different orbit geometries isn't physically rigorous the way it would
+be for RTC backscatter). RTC support is a deliberately separate, larger follow-up that
+also needs gfetch's first credentialed-source mechanism (`StacSource`/`Config` have no
+notion of auth today). `sat:orbit_state` (ascending/descending) is a plain queryable
+STAC property on both sources' items (confirmed on real items) — exposed as
+`Config.orbit_state`, filtered via the existing generic `query` mechanism, no new
+source-level plumbing needed. See `claude/tasks.md`'s 2026-09-22 entry for the full
+reasoning and the `group_by_utm_zone` generalization this required.
 
 ## Chosen architecture
 
@@ -362,13 +383,17 @@ below for why that separation is load-bearing, not just a code-organization nice
 
 A **satellite profile** (e.g. `gfetch.Sentinel2`, `gfetch.Landsat`) is the good-defaults
 layer: it fixes the collection name per source (`sentinel-2-l2a` vs
-`sentinel-2-c1-l2a`; `landsat-c2-l2`, etc.), default bands, default cloud-mask band
-(Sentinel-2 SCL), default resampling, and default `groupby`/chunking — so the common case
-really is "give me an AOI," while every default stays overridable.
+`sentinel-2-c1-l2a`; `landsat-c2-l2`, etc.), default bands, and default cloud-mask band
+(Sentinel-2 SCL) — so the common case really is "give me an AOI," while every default
+stays overridable. `groupby`, chunking, and resampling are not profile fields; they're
+job-level knobs (`load()`/`mosaic()` parameters, `Config.resampling`) with library-level
+defaults (`groupby="solar_day"`, odc-stac's own chunking/`"nearest"` resampling) —
+profile-driven per-satellite defaults for these were considered but not built, see
+`claude/tasks.md`'s 2026-09-22 entry.
 
 **2026-09-21 update**: `[load/mosaic]`/`[write]` produce **one `xarray.Dataset`/Zarr
 store per UTM zone the AOI spans**, not the single dataset/store the diagram above
-shows — see the Decision log entry below for why. `mosaic_by_zone()` groups items by
+shows — see `claude/tasks.md`'s 2026-09-21 entry for why. `mosaic_by_zone()` groups items by
 their own native UTM zone (not the AOI's), builds one `GeoBox` per zone (clipped to
 that zone's natural longitude band), and mosaics each zone independently; `[write]` is
 called once per zone's dataset.
@@ -412,7 +437,7 @@ libraries gives this for free:
   content-addressed cache path with no visible temp-file+rename — completion metadata is
   written only after download, but the raw bytes may already exist at the cache path
   before that. Transparent fsspec caching would hide exactly the failure mode we need to
-  engineer around, so it's rejected as the caching mechanism (see decision log).
+  engineer around, so it's rejected as the caching mechanism (see `claude/tasks.md`).
 - **Chosen approach:** gfetch's download stage writes to a temp path and atomically
   `rename`s into place, and marks completion with one sentinel file per completed
   unit-of-work (e.g. `<item_id>/<asset_key>.complete`) rather than a central manifest
@@ -482,9 +507,80 @@ proven on S3-compatible object storage, not on the local/shared POSIX filesystem
 rewritten to local cache paths identically to the remote-href path — GDAL/rasterio-backed
 reading is indeed href-scheme-agnostic as expected. But getting there isn't code-change-free:
 `stac_asset.download_item()` has an owner-backref bug that leaves asset hrefs resolving
-against the *original remote* self href unless explicitly fixed. See "POC log" below for
+against the *original remote* self href unless explicitly fixed. See `claude/tasks.md` for
 the repro and fix — gfetch's download stage must apply this fix before handing items to
 `load`/`mosaic`.
+
+## Future: disk-bounded streaming download+mosaic (deferred, not designed for v1)
+
+Added 2026-09-22, from a user design discussion — **not built, not scheduled**; recorded
+here so the reasoning isn't lost, per the user's explicit "write it off as desirable long
+term" framing. Lower priority than current work; revisit only when actually needed.
+
+**Motivating scenario**: for a large enough job (country-scale AOI, long date range),
+every downloaded asset for the whole job cannot fit on local/cache disk at once. Today's
+`download` stage has no notion of this — it downloads everything the job needs, then
+`mosaic`/`write` runs once the whole batch is on disk (see "HPC / distributed execution"
+above and `claude/tasks.md` for why `mosaic` currently falls back to remote hrefs, not an
+error, when `download` hasn't finished). The goal would be to interleave the two stages:
+download enough to mosaic+write one spatial unit, delete that unit's cached assets, and
+move on — bounding disk usage to roughly one unit's footprint instead of the whole job's.
+
+**Feasibility verdict: yes in principle**, and it composes cleanly out of primitives
+gfetch already has, rather than needing new low-level machinery:
+- **Granularity is the native tile, not the UTM zone or the Zarr chunk.** A zone can span
+  dozens of tiles (too coarse to bound disk usage meaningfully); a Zarr chunk (~5km) is
+  too fine, because a `median`/`mean` composite needs every item covering that chunk
+  across the *whole* date range before it can be written, and that need collapses almost
+  everywhere to "every item of the one native tile the chunk sits in" (tiles are revisited
+  repeatedly over time, chunks sit inside one tile except at tile boundaries). So the
+  natural disk-bounded working set is one tile's full time series at a time. Boundary
+  chunks (shared between adjacent tiles) get a two-tile dependency instead of one.
+- **This is spatial streaming, not temporal streaming.** The composite reduction itself
+  (`mean`/`median` over `dim="time"`) still needs a tile's whole time series in memory at
+  once — nothing about it becomes incremental. Only which tiles get processed/evicted
+  when is what streams.
+- **Readiness detection**: already free, via the same per-asset `.complete` sentinel
+  files the download stage already writes for resumability (`claude/tech-stack.md`'s
+  download-durability design) — no new manifest needed, same "no central bookkeeping,
+  no locking" property gfetch already relies on elsewhere.
+- **Writing a tile's chunks in isolation**: already built and tested, just not wired into
+  the CLI yet — `gfetch.write.prepare_template()`/`write_region()`
+  (`src/gfetch/write.py`) already implement "write the full store's metadata once, then
+  write disjoint regions independently, safe on any POSIX filesystem." `cli/mosaic.py`
+  currently only calls the one-shot `write()`; switching to template-once +
+  region-write-per-ready-tile is the only change needed on the write side.
+- **New pieces actually needed**: (1) a chunk↔required-tiles dependency map, computed
+  from geometry alone at search time (no data needed); (2) reference-counted cache
+  eviction — delete a tile's cached assets only once *every* chunk it feeds has been
+  written, not just once its own interior chunks are done, because of the boundary-chunk
+  case above; (3) a disk-budget-aware loop that doesn't start downloading the next tile
+  before there's room for it.
+
+**Coordination mechanism — two options considered, filesystem-mediated preferred**:
+1. **Filesystem-mediated (preferred first cut)**: two independently-running, long-lived
+   `gfetch` processes — a download loop and a `mosaic --watch` loop — each still pinned to
+   their own node class by SLURM as today, coordinating purely by polling the same
+   sentinel files on the shared filesystem. No new dependency; stays inside gfetch's
+   existing "stage separation, not orchestration" framing (see "Goals / non-goals"
+   above) — the two stages remain independently callable/schedulable, they just now also
+   run concurrently and loop instead of running once each. Costs: gfetch has to hand-roll
+   the reference-counted eviction and disk-budget backpressure logic itself.
+2. **HyperQueue as an explicit task-DAG submitter**: gfetch submits "download tile X" /
+   "mosaic chunk Y (depends on tiles it needs)" / "delete tile X (depends on every chunk
+   that needed it)" as a real dependency graph and lets HyperQueue schedule it, including
+   placing download vs. mosaic tasks on differently-tagged workers spanning both node
+   classes within one allocation via its custom resource tags. Gets real scheduling and
+   backpressure machinery for free, at the cost of a new external dependency and pushing
+   gfetch further toward being a workflow engine than its stated non-goals currently allow
+   (see "Goals / non-goals" above: "not building a hosted service or a workflow
+   orchestration engine"). Also arguably overkill here — the actual dependency graph per
+   tile is shallow (download → mosaic → delete, longest path length 1), not enough
+   structure to clearly justify an external scheduler over a simple watch-loop.
+
+**Decision**: **not building this now** — deferred, option 1 preferred if/when it's
+picked up, since it doesn't require revisiting gfetch's "no workflow-orchestration-engine"
+non-goal. No code, no scaffolding, no `claude/tasks.md` follow-up items beyond this note.
 
 ## Explicitly rejected dependencies
 
@@ -511,18 +607,15 @@ the repro and fix — gfetch's download stage must apply this fix before handing
   near-term need, or can it stay a "designed for, not built" abstraction for longer?
 - Should `rioxarray` become a real dependency (e.g. for reading assets `stac-asset`
   downloaded locally) or stay opportunistic/optional?
-- **`SatelliteProfile`'s "default resampling" (mentioned in "Chosen architecture" above)
-  was never actually built, found 2026-09-22 answering a user question.** Neither
-  `SatelliteProfile` nor `mosaic()`/`load()`/`mosaic_by_zone()` expose a `resampling`
-  parameter at all, so every band silently gets `odc.stac.load()`'s own default,
-  confirmed to be `"nearest"` (`odc.loader.types.RasterLoadParams().resampling ==
-  "nearest"`). Defensible for the categorical cloud-mask band (`scl`), questionable
-  for continuous reflectance bands with a coarser native resolution than the output
-  grid (e.g. 60m `coastal`/`nir09` resampled to a 10m mosaic) - nearest-neighbor
-  upsampling by 6x will look visibly blocky versus bilinear/cubic. Not fixed; offered
-  to the user as a follow-up (config field + threaded through to `odc.stac.load(
-  resampling=...)`, per-band override via `odc.stac.load`'s own `dict[str, str]`
-  support), declined for now.
+- ~~`SatelliteProfile`'s "default resampling" was never actually built~~ — **resolved
+  2026-09-22**: `load()`/`mosaic()`/`mosaic_by_zone()` and `Config.resampling` now
+  expose a per-band resampling override (`dict[str, str]`, `"*"` sets the default for
+  unlisted bands), threaded through to `odc.stac.load(resampling=...)`; the satellite
+  profile's `cloud_mask_band` is always pinned to `"nearest"` inside `mosaic()`
+  regardless of what's requested for it, since it holds categorical values. No
+  per-satellite automatic default (e.g. bilinear for a coarser-resolution band like
+  60m `coastal`/`nir09`) was added — the override is manual/opt-in per job, not a new
+  profile field; still a plausible future refinement, not built. See `claude/tasks.md`.
 - **`SatelliteProfile.default_bands` for `sentinel-2` is RGB-only (`("red", "green",
   "blue")`), found 2026-09-22 answering the same user question.** Worth remembering
   when estimating job size (per-item byte volume scales directly with band count -
@@ -549,383 +642,7 @@ the repro and fix — gfetch's download stage must apply this fix before handing
   chunks into one file specifically to address this) before gfetch is used in
   production at country scale. Not blocking v1/POC work.
 - ~~Sentinel-2 `search` stage needs processing-baseline resolution~~ — **resolved
-  2026-09-21**, see Decision log.
-
-## POC log
-
-- **2026-09-19 — odc-stac local-href POC: PASSED.** Searched one Sentinel-2 item on
-  Earth Search, downloaded a band via `stac_asset.download_item()`, and compared
-  `odc.stac.load()` output between the original remote-href item and the
-  downloaded/rewritten local-href item over the same small window: identical shape,
-  dtype, and pixel values. Also confirmed a resumed/mixed download (one asset
-  pre-cached, one freshly downloaded in the same call) loads correctly and never
-  re-downloads the pre-cached asset.
-  - **First attempt hit a self-inflicted pitfall, not a library bug** — worth recording
-    since it's an easy mistake to repeat: manually filtering an item's assets before
-    calling `download_item()` (`item.assets = {key: item.assets[key]}`) breaks
-    `Asset.owner`, because pystac's `.assets` is a plain dict attribute — reassigning it
-    does **not** re-point the contained assets' `owner` backref at the item you just
-    assigned them onto. The asset object keeps pointing at whatever item it was taken
-    from. `odc.stac.load()` resolves hrefs via `Asset.get_absolute_href()`, which joins
-    a relative href against `asset.owner.get_self_href()` — so a wrongly-owned asset
-    silently resolves against the *remote* STAC endpoint instead of the local cache,
-    producing bogus URLs (404/403) instead of an obvious error.
-  - **The fix is to not do that.** `stac_asset.download_item()`'s own `Config.include`/
-    `exclude` parameters are the documented way to restrict which assets get downloaded,
-    and they don't disturb ownership — this is also exactly what's needed for resuming
-    a partial download (pass `include=<pending asset keys>`, `keep_non_downloaded=True`
-    to keep already-cached assets' entries in the returned item). Verified working
-    pattern for gfetch's download stage (atomic + resumable, per the durability design
-    above):
-    ```python
-    pending = [k for k in wanted_keys if not (item_dir / f"{k}.complete").exists()]
-    with tempfile.TemporaryDirectory(dir=item_dir) as tmp:
-        result = await download_item(
-            item, Path(tmp), config=Config(include=pending), keep_non_downloaded=True
-        )
-        for key in pending:
-            # .href is relative once a self href is set (which download_item always
-            # does) - get_absolute_href() is required to get the real temp-dir path.
-            tmp_path = Path(result.assets[key].get_absolute_href())
-            final_path = item_dir / f"{key}{tmp_path.suffix}"
-            shutil.move(tmp_path, final_path)  # atomic on the same filesystem
-            (item_dir / f"{key}.complete").touch()
-            result.assets[key].href = str(final_path)
-    # assets not in `pending` keep their original remote href here - point them at
-    # their already-downloaded local path too before handing the item off.
-    result.set_self_href(str(item_dir / f"{item.id}.json"))
-    ```
-  - **Verified independently, re-reading `stac-asset==0.4.7`'s source**: its writes
-    really are non-atomic against a killed process, confirming the concern that
-    motivated this whole design (see "Download-stage durability" above) — `Client.
-    download_href()` streams straight into the final target path via `aiofiles.open
-    (path, "wb")`; the partial file is only deleted in the `except` block, which a
-    SIGKILL/walltime-preemption never reaches. gfetch's own temp-dir + rename layer
-    (above) is genuinely necessary, not defensive overengineering.
-  - Confirmed against `stac-asset==0.4.7`, `odc-stac==0.5.3`, `pystac==1.15.2`.
-
-- **2026-09-19 — Full pipeline POC (search → load/mosaic → write, incl. disjoint-region
-  writes): PASSED end-to-end**, at the user's request to de-risk the whole pipeline
-  before writing production code, not just the download↔load handoff. Searched Earth
-  Search for a month of Sentinel-2 over a ~6.7×5.6km AOI near Paris (8 items, 2 adjacent
-  MGRS tiles, cloud cover < 40%), loaded 3 bands + SCL at native 10m resolution with
-  `odc.stac.load(items, bands=[...], geobox=geobox, groupby="solar_day", chunks={...})`
-  (6 solar-day groups), masked clouds/shadow/cirrus/no-data via the SCL band (classes
-  `{0,1,3,8,9,10}`), and took a `median(dim="time", skipna=True)` composite — the
-  recommended-stack shape from Pangeo thread 5010 ("Best practices for large-scale
-  Sentinel-2 mosaics"), now confirmed to actually run correctly end-to-end rather than
-  just cited.
-  - **Zarr write**: `computed.to_zarr(path, mode="w")` then `xr.open_zarr(path)` —
-    round-tripped values match exactly (`np.allclose(..., equal_nan=True)`, since the
-    masked composite legitimately contains NaNs where every timestep at a pixel was
-    cloud-masked).
-  - **Pre-planned disjoint-region write (the HPC write-stage pattern from "Compute-stage
-    output durability" above): PASSED**, confirming the design is actually implementable
-    with the tools we chose, not just plausible on paper. Pattern: write the store's
-    metadata/coords once with `template.to_zarr(path, compute=False, mode="w")`, then
-    have each independent "worker" write only its own non-overlapping slice with
-    `worker_slice.to_zarr(path, region={"x": slice(...), "y": slice(None)})`. One real
-    gotcha: xarray's region-write rejects the call if *any* variable being written lacks
-    a dimension in common with the region (our case: the scalar `spatial_ref` CRS
-    coordinate) — fix is `worker_slice.drop_vars([c for c in worker_slice.coords if c
-    not in worker_slice.dims])` before the per-region write (the coordinate was already
-    written once, correctly, by the metadata-only pass). Two workers writing disjoint
-    x-slices reassembled to values identical to the single in-memory mosaic.
-  - **Rough benchmark, single laptop over home/office internet (not HPC/cloud-colocated)**:
-    computing the 6-solar-day × 3-band, ~6.06M-pixel mosaic (full dask graph: remote COG
-    reads + reprojection + SCL masking + median reduction) took **~250-300s** (~0.02
-    Mpix/s) across three runs. This is not comparable to the Pangeo benchmark's cited
-    74.7 Mpix/s for odc-stac wide/mosaic workloads — that number almost certainly reflects
-    compute co-located with the data (in-region cloud) or cached reads, whereas this run
-    is dominated by real WAN download bandwidth for genuinely fresh COG reads, not CPU or
-    library overhead. Useful as gfetch's own real-world expectation-setting data point
-    (rough budget: single-machine, home-internet, full-resolution multi-band monthly
-    mosaics over a small AOI take a few minutes, dominated by network, not compute) —
-    not as a library performance verdict. Proper benchmarking (cloud-colocated, varying
-    AOI size/resolution/band count, Dask cluster vs. local threads) is future work, not
-    done here.
-  - **Dependency gap found and fixed**: `zarr` itself was missing from gfetch's chosen
-    dependency list (only `pystac-client`/`stac-asset`/`odc-stac`/`odc-geo`/`rich`/
-    `cyclopts`/`omegaconf`/`retry` had been added) despite Zarr being the v1 output
-    format since the very first architecture decision — added via `uv add zarr`
-    (`zarr==3.4.0`).
-  - Confirmed against `zarr==3.4.0`, `xarray==2026.7.0`, `odc-stac==0.5.3`, `dask==2026.8.0`.
-
-## Decision log
-
-- **2026-09-19** — Chose `odc-stac` over `stackstac` for array loading (Pangeo community
-  consensus + odc-stac's active maintenance vs. stackstac's own "don't use in production"
-  disclaimer).
-- **2026-09-19** — Chose `stac-asset` for the download layer, `pystac-client` for search,
-  `odc-geo` for AOI/CRS handling.
-- **2026-09-19** — v1 output target is analysis-ready **Zarr cubes** (not just raw asset
-  downloads) — mosaicking/compositing is in scope from the start.
-- **2026-09-19** — Icechunk noted as a promising future storage backend; **no POC now**.
-- **2026-09-19** — v1 STAC sources: **Planetary Computer + Element84 Earth Search**, built
-  against both from day one so the `StacSource` abstraction isn't accidentally PC-shaped.
-- **2026-09-19** — Added HPC as a first-class deployment target: gfetch's stages
-  (`search`, `download`, `load`/`mosaic`, `write`) must be independently callable so
-  external orchestrators (SLURM/Snakemake/Nextflow/Parsl) can pin each to the right node
-  class (internet-connected vs. compute-only). No Globus integration, no attempt to
-  abstract heterogeneous Dask clusters — both are the user's orchestration concern.
-- **2026-09-19** — Download-stage durability is gfetch's own responsibility: atomic
-  temp-write + rename, one sentinel file per completed asset (not a central manifest DB,
-  to avoid distributed-locking problems on shared HPC filesystems). Rejected relying on
-  `stac-asset`'s built-in skip-if-exists (not atomic) or transparent `fsspec` caching
-  (same non-atomicity risk) as the sole durability mechanism.
-- **2026-09-19** — Reaffirmed Icechunk as future/optional rather than default: its ACID
-  guarantees are only proven under concurrent commits on S3-compatible storage, and are
-  explicitly disclaimed on local/shared POSIX filesystems — the default HPC storage
-  shape. Default output writer is plain Zarr with pre-planned non-overlapping per-worker
-  chunk regions instead, which is safe on any POSIX filesystem.
-- **2026-09-19** — Identified `geefetch` (own prior GEE-based library) as directly
-  relevant prior art, more so than any external reference — see "Prior art" section
-  above. Of its patterns: config/`omegaconf` convention adopted; `geobbox`,
-  `Tiler`/`TileTracker`, and integrity-check-on-resume all considered and explicitly
-  rejected — not everything from a sibling project should be carried over by default,
-  and gfetch should default to designing fresh where a prior pattern isn't clearly worth
-  reusing.
-- **2026-09-19** — Confirmed the write stage's atomic-write story: zarr-python's v3
-  `LocalStore` already writes chunks atomically (temp+rename) natively, so the
-  download-stage pattern generalizes to the write stage without extra work — but the
-  pre-planned disjoint-chunk-region-per-worker plan stays required (per-chunk atomicity
-  doesn't cover two workers racing on the same chunk). Investigated virtual chunk
-  references (kerchunk/VirtualiZarr/Icechunk) as a possible alternative to materializing
-  pixel data — confirmed real, but not applicable to odc-stac's core reprojection/mosaic
-  step (which requires real pixel materialization); kept as a later, narrower
-  optimization, not part of the v1 design.
-- **2026-09-19** — Scaffolded the repo per `dev-stack.md`: `pyproject.toml` repinned to
-  Python 3.12 (was left at the `uv init` default of 3.14), chosen dependencies added via
-  `uv add`, ruff/pydoclint/pytest config blocks added, `pyrefly` config generated via
-  `pyrefly init`, `.pre-commit-config.yaml`/`.flake8` added with hooks pinned to current
-  releases, `AGENTS.md`/`README.md`/`CONTRIBUTING.md`/`CHANGELOG.md` added. `uv sync` and
-  `pre-commit run --all-files` both pass clean. Runtime deps (incl. `rasterio`) resolved
-  and installed on 3.12 with no GDAL/uv conflict — the fallback conda env wasn't needed.
-- **2026-09-19** — Ran the odc-stac local-href POC (see "POC log" above): **passed**,
-  confirming `odc.stac.load()` reads locally-rewritten STAC items identically to
-  remote-href ones.
-- **2026-09-19** — At the user's request, re-checked Project Pythia cookbooks (not
-  previously reviewed) and re-checked the Earthmover blog and Pangeo threads
-  specifically for STAC-download implementation patterns, before finalizing the
-  download-stage code — see the new "Project Pythia cookbooks" and "Earthmover blog —
-  re-checked" entries above. Net effect: found and fixed a self-inflicted pitfall in the
-  first download-stage POC attempt (manually filtering `item.assets` breaks
-  `Asset.owner`; use `stac_asset.Config.include`/`exclude` instead, which is also the
-  correct mechanism for resume) — see the corrected "POC log" entry above for the
-  working pattern. Confirmed gfetch's `download` stage design itself (separate,
-  optional, atomic, resumable) is correct and not contradicted by any external source
-  reviewed; also confirmed, by re-reading `stac-asset`'s source directly, that its
-  writes are genuinely non-atomic, so gfetch's own temp-dir+rename wrapper is
-  necessary, not defensive overengineering.
-- **2026-09-19** — At the user's request, POC'd the *whole* pipeline end-to-end
-  (search → load/mosaic → write, incl. the pre-planned disjoint-region write pattern),
-  not just the download↔load handoff, plus a rough real-world throughput benchmark —
-  see the new "Full pipeline POC" entry above. Everything passed: the Pangeo-recommended
-  `groupby="solar_day"` + SCL-cloud-mask + `median` composite shape actually runs
-  correctly against real Earth Search data, `to_zarr()` round-trips a masked
-  (NaN-containing) composite exactly, and the disjoint-region write pattern that
-  gfetch's HPC write-stage design depends on is confirmed implementable with xarray/zarr
-  as chosen (one real gotcha found and fixed: scalar coordinates like `spatial_ref` must
-  be dropped before a region-write call). Also found and fixed a real scaffolding gap:
-  `zarr` itself was missing from the dependency list despite being the v1 output format
-  since the first architecture decision.
-- **2026-09-19** — Implemented the pipeline for real: `src/gfetch/{sources,profiles,
-  search,download,mosaic,write}.py` plus a `cyclopts`/`omegaconf` CLI
-  (`gfetch init`/`search`/`download`/`mosaic`), and a real test suite (23 tests, 2
-  network-backed and marked `slow`). All the POC-verified patterns above carried over
-  directly. Two real bugs were caught by tests/a CLI smoke test that the earlier POCs
-  hadn't exercised:
-  - **Retry-across-attempts item corruption**: `download_item()` mutates its input
-    `Item` in place (sets its self href, rewrites asset hrefs). The download stage's
-    retry wrapper was reusing the *same* item object across retry attempts, so a
-    failed first attempt (e.g. a real `TimeoutError` hit during the CLI smoke test)
-    left the item in a half-mutated state that broke the next attempt (`KeyError` on
-    an asset key that should have existed). Fix: `copy.deepcopy(item)` fresh for each
-    retry attempt, inside the retried closure. A dedicated regression test
-    (`test_download_items_retry_does_not_corrupt_item`, monkeypatching `stac_asset.
-    download_item` to fail once then succeed) reproduces and confirms the fix.
-  - **Temp-dir-then-move ordering**: an earlier draft moved the downloaded file out of
-    its temp directory *after* the `with tempfile.TemporaryDirectory()` block that
-    downloaded it had already exited (and deleted the directory) — a plain
-    `FileNotFoundError`, caught immediately by the first download unit test. Fix: the
-    move must happen inside the same `with` block as the download.
-  - Neither bug was visible in the earlier hand-run POC scripts, which never happened
-    to retry or hit this exact code path — real test coverage (including a CLI smoke
-    test against live Earth Search data, not just unit tests against local files)
-    caught both before they'd have surfaced as confusing failures on an actual HPC job.
-  - **CLI stage-granularity decision**: `search` and `download` map to their own CLI
-    subcommands (matching the internet-connected-node split), but `mosaic`/`write`
-    share a single `gfetch mosaic` subcommand rather than two, since they always run
-    on the same compute-only node/job back-to-back with no natural serialization point
-    for a lazy dask-backed `xr.Dataset` between them — splitting them into separate
-    CLI invocations would only add pointless intermediate I/O. The underlying
-    `gfetch.mosaic`/`gfetch.write` *library* functions stay separate and independently
-    testable/importable either way.
-  - CLI stage hand-off between processes (`search` → `download` → `mosaic`) is done by
-    serializing/deserializing `pystac.ItemCollection` JSON files under `output_dir`
-    (`items.json`, `cached_items.json`) — confirmed round-trips absolute local hrefs
-    and self hrefs correctly before relying on it.
-- **2026-09-20** — Started a "Reference implementations (inspiration repos)" list (see
-  above) of full end-to-end pipelines worth checking against when building a gfetch
-  stage, as opposed to individual libraries. Added `ljstrnadiii/flytemosaic` (already
-  under investigation for `benchmark/`'s GDAL-config work) and
-  `earth-mover/serverless-datacube-demo` (previously only skimmed at the landing-page
-  level in "Source-by-source findings" above, now actually read source-first) as the
-  first two entries, each with concrete "worth stealing" vs. "not adopted" call-outs
-  rather than a general summary.
-- **2026-09-21** — Fed two `benchmark/`-investigation findings back into `src/gfetch/`
-  (see `benchmark/README.md` for the full investigation this drew from):
-  - `mosaic.py::load()` now calls `odc.stac.configure_s3_access(aws_unsigned=True)`
-    before `odc.stac.load()`. Without it, GDAL/rasterio falls through to botocore's
-    full credential chain (including an EC2-instance-metadata lookup that hangs until
-    TCP timeout off-EC2) on every S3 asset — this alone took the benchmark's measured
-    throughput from ~4MB/s to ~11-16MB/s. `aws_unsigned=True` is safe unconditionally:
-    both current sources (Earth Search's public S3 bucket, Planetary Computer's SAS-
-    signed Azure Blob hrefs) work fine with it, since it only affects AWS credential
-    resolution.
-  - `search()` now dedupes Sentinel-2 results to one item per (tile, date), keeping the
-    highest `s2:processing_baseline`, resolving the open question above. Confirmed via
-    the benchmark that Earth Search legitimately double-lists reprocessed
-    tiles/dates and that blending baselines in one composite is a radiometric
-    correctness risk (baseline 04.00 changed how DN values encode reflectance), not
-    just wasted bandwidth.
-  - **Not applied**: dask thread-count tuning for the compute step. The benchmark
-    found opposite-direction effects (more threads help a remote/direct load, but can
-    actively hurt a post-download local load via memory pressure) with no single good
-    default across scenarios — left as future, scenario-aware tuning rather than a
-    blanket change. GDAL config tuning (`GDAL_HTTP_MULTIPLEX`/aggressive caching) was
-    inconclusive in the benchmark (two configs pathologically hung rather than being
-    confirmed slower) and also not carried over.
-  - Added `benchmark/gfetch_pipeline.py`, a benchmark case that exercises gfetch's own
-    `search`/`download`/`mosaic` functions end-to-end against the same "wide"/"deep"
-    scenarios as the rest of `benchmark/`, to check gfetch's real throughput against
-    these reference numbers now that the fixes above are in place. **Ran it**:
-    download throughput is 80-90 MB/s (wide/deep), load throughput up to ~440 Mpix/s
-    (wide, chunk=7168) - in line with, not behind, the reference numbers; an initial
-    reading that gfetch's download was ~2x slower than `two_stage_mosaic.py`'s own
-    reimplementation turned out to be a stale-cache measurement artifact in the
-    latter's own reference CSV, not a real gap (see `benchmark/README.md` point 18).
-    Also confirmed gfetch's actual configured Earth Search collection
-    (`sentinel-2-c1-l2a`) doesn't hit the processing-baseline duplication bug the
-    dedup fix above targets - Element84's Collection 1 reprocessing already resolves
-    to one item per tile/date - so that fix is currently defensive/dormant against
-    gfetch's own default source, confirmed still worth keeping (see `benchmark/
-    README.md` point 18 for the full reasoning and the open question of whether
-    Planetary Computer's collection has the same issue).
-- **2026-09-21** — Reworked the mosaic/write stage to produce **one output per native
-  UTM zone an AOI spans**, instead of reprojecting everything into a single zone
-  auto-picked from the AOI's centroid (`GeoBox.from_bbox(bbox, crs="utm", ...)`, the
-  original v1 design). Prompted by the user asking what CRS a country-scale AOI (e.g.
-  Tanzania, spanning UTM zones 35S/36S/37S) would end up in - the honest answer was
-  "one arbitrarily-chosen zone, with real distortion growing toward the AOI's edges
-  and a needlessly huge single grid (Tanzania: ~123,873 x 120,008px at 10m in one
-  zone)." Decided **not** to keep this as the default and add a `crs` override later;
-  instead, native-per-zone is now the only mode (a `crs` override to force one from
-  the CLI/config, e.g. for users who explicitly want a single-zone output despite the
-  distortion, is a plausible small follow-up but not built).
-  - `gfetch.mosaic.group_by_utm_zone()`: groups items by their **own** footprint's
-    UTM zone (resolved via `odc.geo.crs.CRS.utm()` on each item's STAC `bbox`), not
-    the AOI as a whole - correct even if a single search AOI spans items whose tiles
-    fall in different zones near a boundary.
-  - `gfetch.mosaic.zone_geobox()`: builds each zone's output grid from the AOI bbox
-    **clipped to that zone's natural 6-degree-wide longitude band** (derived from the
-    zone number), not from the union of whichever items happened to be returned -
-    deterministic and reproducible independent of item availability/gaps near a zone
-    boundary.
-  - `gfetch.mosaic.mosaic_by_zone()`: the new top-level entry point, returns
-    `dict[CRS, xr.Dataset]`; `cli/mosaic.py` calls `write()` once per zone, to
-    `Config.zarr_path(crs)` (now a method, not a fixed property) -
-    `<output_dir>/mosaic_epsg<code>.zarr` per zone.
-  - **Real bug found while implementing this, worth recording**: `GeoBox.from_bbox()`
-    only reprojects its `bbox` argument when `crs` is literally the string `"utm"` (a
-    special-cased sentinel) - passing a concrete, already-resolved `CRS` object
-    instead makes it treat the bbox's raw numeric values as **already being in that
-    CRS's units**, with no reprojection at all (confirmed by reading
-    `GeoBox.from_bbox`'s source directly: a plain tuple or a `BoundingBox` with a
-    non-None `.crs` bypasses the "utm"-string reprojection branch entirely). This
-    silently produced a nonsensical 1x1-pixel geobox near the UTM false-origin in an
-    early version of `zone_geobox()` before being caught by a unit test. **Fix**:
-    explicitly `.to_crs(crs)` the EPSG:4326 intersection bbox before calling
-    `GeoBox.from_bbox()`, never relying on `from_bbox`'s own `crs=` kwarg to
-    reproject a resolved (non-"utm"-string) CRS.
-  - Verified end-to-end against live Earth Search data: a real AOI straddling the
-    35S/36S boundary near 30°E correctly split into two `mosaic_epsg327{35,36}.zarr`
-    stores via the full `gfetch search` → `gfetch mosaic` CLI path, both readable back
-    with `xarray.open_zarr()` and the expected CRS.
-- **2026-09-22** — Went from sparse to routine logging across every stage
-  (`search`/`download`/`mosaic`/`write`, their CLI wrappers, config loading), at the
-  user's explicit request after a large `gfetch search` (Tanzania, 10,456 matched
-  items) looked hung with zero log output between "Searching..." and "Found N items" -
-  it wasn't hung, just silent through a long STAC API pagination loop (confirmed live
-  via `lsof`/`nettop` on the running process: an active connection, steadily receiving
-  bytes). **Policy going forward: prefer adding `log.debug`/`log.info` at any
-  potentially-long or otherwise-opaque step over leaving it silent** - the user
-  explicitly said not to be shy about this. Concretely: `search()` now logs the STAC
-  API's reported match count up front (`ItemSearch.matched()`) and one `log.debug` per
-  page fetched; `download_items()` logs a start/end summary; `mosaic()`/`load()`/
-  `mosaic_by_zone()` log item/zone counts and geobox shape before the actual
-  (potentially slow, silent) `odc.stac.load()` call; `write()`/`prepare_template()`
-  log before the blocking `to_zarr()` call; `cli/config.py` gained a logger it didn't
-  have at all before.
-- **2026-09-22** — Reworked `download_items()`'s progress display from one bar for the
-  whole batch to **one bar per concurrently-downloading item, plus the existing
-  overall bar** - matching `benchmark/`'s dask-callback pattern (a single `rich.
-  Progress` instance can render multiple live bars, whether fed by dask callbacks or,
-  here, `stac_asset`'s own per-asset message stream), and confirmed the same
-  single-process precondition holds (`download_items()` is pure `asyncio.gather` +
-  a semaphore, no multiprocessing, so one shared `Progress` object works). Considered
-  and rejected building a separate message-router task: instead, each item's own
-  download coroutine (`_download_item()`) is fully self-contained - it adds its own
-  task via the existing `temporary_task()` helper (same add/cleanup pattern already
-  used for the main bar) and, if a `progress` tracker was passed, creates its own
-  local `asyncio.Queue` for `stac_asset.download_item(messages=...)`, running a small
-  helper (`_report_asset_progress()`) concurrently via `asyncio.gather()` to turn
-  `OpenUrl`/`WriteChunk` messages into real byte counts. No message queue or
-  progress-reporting task lives outside the function that owns it. Verified live
-  (`max_concurrent_items=3`, real Earth Search downloads, forced-terminal `rich`
-  output): exactly one main bar plus up to 3 simultaneous per-item bars, each with
-  independent byte counts/speed/ETA, correctly relabeling as each slot picks up its
-  next item, all bars cleanly removed on completion (asserted via a `mock.patch.
-  object` spy on `Progress.add_task` in the new `test_download_items_reports_progress`
-  test: exactly `1 + n_items` tasks created, zero left over).
-- **2026-09-22 — found and fixed a real HPC-only bug: `gfetch download` could hang
-  forever on a network requiring an HTTP(S) proxy for egress, even though `gfetch
-  search` and plain `curl` worked fine on the same node.** Reported by the user on an
-  HPC cluster; root-caused without direct access to that machine, then confirmed fixed
-  there. Diagnosis, in order:
-  - Ruled out DNS/general connectivity (curl succeeded) and ruled out `odc.stac.
-    load()`'s known S3-credential-chain hang (point 17 above - `download` never calls
-    `odc.stac.load()`, and Earth Search asset hrefs are plain `https://`, not `s3://`,
-    so `stac_asset` routes them through its `HttpClient`, not an S3 client, confirmed
-    by reading `stac_asset.client.Clients.get_client()`'s scheme-dispatch directly).
-  - Root cause: `stac_asset.HttpClient` builds a bare `aiohttp.ClientSession(timeout=
-    ..., headers=..., middlewares=...)` with no `trust_env=True` - confirmed by
-    reading `stac_asset/http_client.py` directly. Unlike `requests`/`curl` (which read
-    `HTTP_PROXY`/`HTTPS_PROXY` automatically), `aiohttp` silently ignores those env
-    vars unless `trust_env=True` is passed explicitly, and `stac_asset.Config` exposes
-    no field for it. On a network that mandates a proxy for outbound access, this
-    means `search` (via `pystac_client`/`requests`) and `curl` work while `download`
-    (via `stac_asset`/`aiohttp`) attempts a direct connection that the network drops
-    silently - explaining exactly the reported symptom (search fine, download hangs
-    at the very start, no error).
-  - Confirmed on the user's actual HPC node before writing any fix: `env | grep -i
-    proxy` showed proxy vars set, and a bare `aiohttp.ClientSession()` (no
-    `trust_env`) reproduced the hang against the same host `curl` reached fine.
-  - **Fix**: `download.py` now patches `stac_asset.http_client.ClientSession` (the
-    name that module's `from_config()` calls) with a plain factory function
-    defaulting `trust_env=True` - not a subclass, since `aiohttp` explicitly
-    discourages subclassing `ClientSession` (confirmed via a `DeprecationWarning` from
-    an earlier subclassing attempt, corrected before shipping). Applied unconditionally
-    at module import time; safe when no proxy is configured (`trust_env=True` is a
-    strict superset of default behavior).
-  - **Verified the mechanism itself**, not just "no more hang": pointed
-    `HTTP_PROXY`/`HTTPS_PROXY` at a closed local port *after* a real search had
-    already succeeded (isolating `aiohttp`'s behavior specifically), then ran a real
-    download. Before the fix this would succeed (proxy silently ignored); after the
-    fix it failed with `ClientProxyConnectionError: Cannot connect to host
-    127.0.0.1:1` - proof the patch is genuinely routing through the configured proxy,
-    not a false positive. **Confirmed on the user's HPC cluster afterward: downloads
-    now work.**
+  2026-09-21**, see `claude/tasks.md`.
 
 ## Next steps
 
@@ -940,9 +657,15 @@ a real CLI smoke test against live data) are all done. Remaining work, in rough 
    Dask cluster vs. local threads) is real future work — the POC's ~0.02 Mpix/s number is
    a home-internet/single-laptop data point, not a library performance ceiling, and
    shouldn't be used for capacity planning as-is.
-4. Start a `claude/tasks.md` (mirroring lsatfetch's) once further implementation issues
-   turn up.
-5. Optional `crs` override for `mosaic`/`mosaic_by_zone`, for users who want a single
+4. Optional `crs` override for `mosaic`/`mosaic_by_zone`, for users who want a single
    target CRS despite the per-zone default (e.g. matching an existing dataset's grid) —
    requested as a "maybe later" by the user when native-per-zone was decided
    (2026-09-21), not designed or built yet.
+5. **Long-term, explicitly deferred**: disk-bounded streaming download+mosaic (interleave
+   the two stages, tile-by-tile, deleting cached assets once a tile's dependent chunks are
+   written, instead of requiring the whole job's assets to fit on disk at once) — see the
+   dedicated "Future: disk-bounded streaming download+mosaic" section above for the full
+   design reasoning. Lower priority than everything above; not scheduled.
+
+Dated history of how the above was reached — POCs, bugs found/fixed, and individual
+decisions — lives in `claude/tasks.md`, not here.

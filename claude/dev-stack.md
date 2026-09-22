@@ -299,8 +299,10 @@ we're testing against S3-backed sources (Earth Search) or S3-based caches.
   `tech-stack.md`) rather than user-facing documentation.
 - lsatfetch keeps a `claude/tasks.md` as a running, dated log of confirmed bugs/design
   issues discovered during development (each entry: what was confirmed, why it matters,
-  candidate fixes ranked). Worth starting a similar `claude/tasks.md` for gfetch once
-  implementation begins and real issues start turning up — nothing to log yet.
+  candidate fixes ranked). gfetch has the same file, started 2026-09-22: it holds the POC
+  log and dated decision log formerly inline in `tech-stack.md` (moved out so that file
+  stays a synthesized snapshot of current architecture/decisions rather than a journal),
+  plus new bug/decision entries going forward.
 - `AGENTS.md` at the repo root, summarizing all of the above for coding-agent
   consumption (build/lint/test commands, style rules) — lsatfetch has one; gfetch should
   get an equivalent once the stack settled here is actually scaffolded, so it can name
