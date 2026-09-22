@@ -39,6 +39,26 @@ DEEP_DATETIME = "2020-06-01/2020-07-31"
 DEEP_TILE = "MGRS-35MNM"
 DEEP_CRS = "EPSG:32735"
 
+# Per-source band asset keys for the same red/green/blue bands, and the
+# (property key, expected value) identifying the "deep" scenario's single MGRS
+# tile - both confirmed to diverge live between sources 2026-09-22 (see
+# claude/tech-stack.md's "Planetary Computer" entry): Earth Search exposes
+# common-name asset keys ("red"/"green"/"blue") and the `grid` STAC extension's
+# `grid:code` ("MGRS-35MNM"); Planetary Computer's `sentinel-2-l2a` has neither -
+# only raw band ids ("B04"/"B03"/"B02") and a bare `s2:mgrs_tile` ("35MNM") with
+# no `grid:code` at all. Used only by `gfetch_pipeline.py`, which goes through
+# `gfetch.search.search()`/`gfetch.sources.get_source()` and so can target either
+# source; the other scripts in this directory are deliberately Earth-Search-only
+# probes of odc-stac/GDAL behavior, not of source differences.
+SOURCE_BANDS: dict[str, tuple[str, str, str]] = {
+    "earthsearch": ("red", "green", "blue"),
+    "planetary-computer": ("B04", "B03", "B02"),
+}
+SOURCE_DEEP_TILE_PROPERTY: dict[str, tuple[str, str]] = {
+    "earthsearch": ("grid:code", DEEP_TILE),
+    "planetary-computer": ("s2:mgrs_tile", "35MNM"),
+}
+
 Scenario = Literal["wide", "deep"]
 
 log = logging.getLogger(__name__)

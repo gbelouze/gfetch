@@ -219,7 +219,8 @@ def plot_two_stage_download_concurrency(ax: plt.Axes, results_dir: Path) -> bool
 
 
 def plot_download_full(ax: plt.Axes, results_dir: Path, filename: str, title: str) -> bool:
-    """Plot a `<scenario, n_items, n_bytes, elapsed_s, mb_s>` CSV: one bar per scenario.
+    """Plot a `<[source,] scenario, n_items, n_bytes, elapsed_s, mb_s>` CSV: one bar
+    per scenario, or per source/scenario pair if a `source` column is present.
 
     Parameters
     ----------
@@ -242,10 +243,17 @@ def plot_download_full(ax: plt.Axes, results_dir: Path, filename: str, title: st
     if df is None or df.empty:
         return False
 
-    colors = [SCENARIO_COLOR.get(s, "gray") for s in df["scenario"]]
-    ax.bar(df["scenario"], df["mb_s"], color=colors)
+    has_source = "source" in df.columns
+    labels = (
+        [f"{s}\n{sc}" for s, sc in zip(df["source"], df["scenario"], strict=True)]
+        if has_source
+        else df["scenario"]
+    )
+    colors = [SCENARIO_COLOR.get(sc, "gray") for sc in df["scenario"]]
+
+    ax.bar(labels, df["mb_s"], color=colors)
     ax.set_title(title)
-    ax.set_xlabel("scenario")
+    ax.set_xlabel("source / scenario" if has_source else "scenario")
     ax.set_ylabel("mb_s")
     return True
 
@@ -257,20 +265,21 @@ def plot_load_sweep(
     filename: str,
     title_prefix: str,
 ) -> bool:
-    """Plot a `<scenario, chunk, num_workers, ..., mb_s>` CSV: one panel per scenario.
+    """Plot a `<[source,] scenario, chunk, num_workers, ..., mb_s>` CSV: one panel
+    per scenario, or per source/scenario pair if a `source` column is present.
 
     Parameters
     ----------
     fig : plt.Figure
         Figure to add panels to.
     gridspec : matplotlib.gridspec.SubplotSpec
-        One grid cell to split into one sub-panel per scenario found.
+        One grid cell to split into one sub-panel per group found.
     results_dir : Path
         Directory to look for the CSV in.
     filename : str
         `results_dir`-relative CSV filename, e.g. `"two_stage_load.csv"`.
     title_prefix : str
-        Prefix for each sub-panel's title, before `" [<scenario>]"`.
+        Prefix for each sub-panel's title, before `" [<group>]"`.
 
     Returns
     -------
@@ -282,15 +291,34 @@ def plot_load_sweep(
     if df is None or df.empty:
         return False
 
-    scenarios = sorted(df["scenario"].unique())
+    has_source = "source" in df.columns
+    groups = (
+        [(s, sc) for s in sorted(df["source"].unique()) for sc in sorted(df["scenario"].unique())]
+        if has_source
+        else [(None, sc) for sc in sorted(df["scenario"].unique())]
+    )
     worker_colors = _color_map(df["num_workers"].unique())
-    inner = gridspec.subgridspec(1, len(scenarios))
+    # 2 rows once there are more than 2 groups (source x scenario) - a single row
+    # of 4 narrow sub-panels doesn't leave enough width for titles/legend to render
+    # without overlapping; a 2x2 grid trades some of that back for height, which
+    # these simple line plots don't need as much of.
+    inner_rows = 2 if len(groups) > 2 else 1
+    inner_cols = -(-len(groups) // inner_rows)  # ceil division
+    inner = gridspec.subgridspec(inner_rows, inner_cols, hspace=0.5)
 
-    for i, scenario in enumerate(scenarios):
-        ax = fig.add_subplot(inner[0, i])
-        scenario_df = df[df["scenario"] == scenario]
-        for num_workers in sorted(scenario_df["num_workers"].unique()):
-            group = scenario_df[scenario_df["num_workers"] == num_workers].sort_values("chunk")
+    # `title_prefix` is shown once, centered above the whole sub-panel grid, instead
+    # of repeated in every sub-panel's own title - with up to 4 sub-panels, repeating
+    # it per-panel overlapped adjacent titles.
+    bbox = gridspec.get_position(fig)
+    fig.text((bbox.x0 + bbox.x1) / 2, bbox.y1 + 0.005, title_prefix, ha="center", fontweight="bold")
+
+    for i, (source, scenario) in enumerate(groups):
+        ax = fig.add_subplot(inner[i // inner_cols, i % inner_cols])
+        group_df = df[df["scenario"] == scenario]
+        if source is not None:
+            group_df = group_df[group_df["source"] == source]
+        for num_workers in sorted(group_df["num_workers"].unique()):
+            group = group_df[group_df["num_workers"] == num_workers].sort_values("chunk")
             ax.plot(
                 group["chunk"],
                 group["mb_s"],
@@ -299,10 +327,50 @@ def plot_load_sweep(
                 label=f"workers={num_workers}",
             )
             _mark_timed_out(ax, group, "chunk", "mb_s")
-        ax.set_title(f"{title_prefix} [{scenario}]")
+        label = f"{source}/{scenario}" if source is not None else scenario
+        ax.set_title(f"[{label}]", fontsize=9)
         ax.set_xlabel("chunk")
         ax.set_ylabel("mb_s")
-        _legend_unique(ax)
+        if i == 0:
+            _legend_unique(ax)
+    return True
+
+
+def plot_simple_sweep(
+    ax: plt.Axes, results_dir: Path, filename: str, x: str, y: str, title: str
+) -> bool:
+    """Plot `y` vs `x` from a single, scenario-less CSV as one line.
+
+    Parameters
+    ----------
+    ax : plt.Axes
+        Axes to draw into.
+    results_dir : Path
+        Directory to look for the CSV in.
+    filename : str
+        `results_dir`-relative CSV filename, e.g. `"gedi_spatial_sweep.csv"`.
+    x : str
+        Column to sweep on the x-axis.
+    y : str
+        Column to plot on the y-axis.
+    title : str
+        Axes title.
+
+    Returns
+    -------
+    bool
+        True if the file was found, non-empty, and plotted.
+    """
+    path = results_dir / filename
+    df = _read_csv_safe(path) if path.exists() else None
+    if df is None or df.empty:
+        return False
+
+    df = df.sort_values(x)
+    ax.plot(df[x], df[y], marker="o", color=PALETTE[0])
+    ax.set_title(title)
+    ax.set_xlabel(x)
+    ax.set_ylabel(y)
     return True
 
 
@@ -398,6 +466,28 @@ def main(
                 results_dir,
                 "gfetch_pipeline_download.csv",
                 "gfetch pipeline: download",
+            ),
+        ),
+        (
+            "gedi_spatial_sweep",
+            lambda ax: plot_simple_sweep(
+                ax,
+                results_dir,
+                "gedi_spatial_sweep.csv",
+                "area_km2",
+                "elapsed_s",
+                "GEDI L2A: spatial AOI sweep",
+            ),
+        ),
+        (
+            "gedi_temporal_sweep",
+            lambda ax: plot_simple_sweep(
+                ax,
+                results_dir,
+                "gedi_temporal_sweep.csv",
+                "n_days",
+                "elapsed_s",
+                "GEDI L2A: temporal range sweep",
             ),
         ),
     ]

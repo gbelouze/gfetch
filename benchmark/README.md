@@ -117,6 +117,45 @@ unrelated progress indicators fighting for the terminal.
   measurement is a real cold download, not a resumed no-op against an already-warm
   cache. `visualize.py` now plots its two CSVs alongside `two_stage_*.csv`'s
   equivalents.
+
+  **2026-09-22: added `--sources` to compare Earth Search vs.
+  Planetary Computer for Sentinel-2** (`claude/tech-stack.md`'s "Planetary Computer:
+  asset-key divergence" entry has the full findings). Confirmed live: PC needs **no
+  authentication at all** for search or SAS-signed asset download (`stac_asset`'s
+  `PlanetaryComputerClient` fetches its signing token from PC's public endpoint
+  anonymously - no subscription key needed anywhere in the code path gfetch uses),
+  but PC's `sentinel-2-l2a` uses different asset keys (`B04`/`B03`/`B02`, not
+  `red`/`green`/`blue`) and a different MGRS-tile property (`s2:mgrs_tile`, bare, not
+  `grid:code` with an `"MGRS-"` prefix) than Earth Search - `common.py::SOURCE_BANDS`/
+  `SOURCE_DEEP_TILE_PROPERTY` carry the per-source mapping this script needs to target
+  either one correctly; `gfetch.profiles.PROFILES` itself is **not** fixed (would
+  silently download zero bands against PC via the real `gfetch mosaic` CLI - a real
+  open question, not this script's job to resolve). `--sources` defaults to
+  `["earthsearch"]` only (unchanged default behavior); pass `--sources earthsearch
+  --sources planetary-computer` to compare both (list-valued params need the flag
+  repeated per value, same as `gedi_aoi_sweep.py` below). Results CSVs
+  (`gfetch_pipeline_download.csv`/`gfetch_pipeline_load.csv`) gained a `source`
+  column. `visualize.py` updated to plot per-source bars/sub-panels when that column
+  is present, and its `plot_load_sweep()` now lays sub-panels out in a 2xN grid
+  (instead of 1xN) once there are more than 2 - a single row of 4 (source x scenario)
+  narrow sub-panels didn't leave enough width for titles/legend without overlapping.
+- `gedi_aoi_sweep.py` - **2026-09-22, new**: benchmarks `gfetch.gedi.fetch_gedi_l2a()`
+  (SlideRule's on-demand GEDI L2A subsetting, see `claude/tech-stack.md`'s "Vector
+  data: GEDI via SlideRule" section) as spatial AOI size and temporal range grow,
+  independently - two separate sweeps, each holding the other axis fixed, since
+  unlike the raster scripts above there's no separate search/download/load stage to
+  benchmark: one `fetch_gedi_l2a()` call does everything server-side. Spatial sweep
+  grows a square bbox (`--spatial-sides-deg`) centered on the same Fontainebleau-area
+  AOI used by `tests/test_gedi.py`, at a fixed one-year time range; temporal sweep
+  grows a time range anchored at GEDI's mission start (2019-04-17, `--temporal-days`)
+  at a fixed bbox. No timeout-enforcing subprocess per case (unlike the raster
+  sweeps) - a SlideRule request is a plain blocking HTTP call, not a dask graph with
+  no cancellation API. `cyclopts`-based CLI; list-valued params need the flag
+  repeated per value (e.g. `--spatial-sides-deg 0.1 --spatial-sides-deg 0.5`), not
+  space-separated - confirmed live, unlike `chunks.py`'s single-list-arg case where
+  space-separated works. Results go to `results/gedi_spatial_sweep.csv`/
+  `results/gedi_temporal_sweep.csv`; `visualize.py` plots both as simple line panels
+  (`elapsed_s` vs. `area_km2`/`n_days`) via the new `plot_simple_sweep()` helper.
 - `wide_mosaic_marimo.py` - the user's own marimo-notebook port of an early version of
   the wide-scenario benchmark; not kept in sync with later fixes (e.g. still has the
   `progress=tqdm.notebook.tqdm` no-op on a dask-backed load). Not touched by request.
