@@ -71,6 +71,62 @@ _RETRY_INITIAL_DELAY = 1.0
 _RETRY_BACKOFF = 1.7
 
 
+def _s3_uri_to_public_https(href: str) -> str:
+    """
+    Rewrite an `s3://bucket/key` href to its public `https://bucket.s3.amazonaws.com/key`
+    equivalent.
+
+    `stac_asset` routes `s3://` hrefs through its `S3Client`, which hardcodes its
+    default region to 'us-west-2' (`stac_asset.config.DEFAULT_S3_REGION_NAME`)
+    regardless of the bucket's actual region - every request to a bucket hosted
+    elsewhere (e.g. Sentinel-1's `sentinel-s1-l1c`, actually in `eu-central-1`) pays a
+    wrong-region redirect round trip on every single request (confirmed: ~3x slower
+    end to end for that bucket). The public virtual-hosted-style URL is served from
+    the global S3 endpoint instead, with no region to get wrong, and is routed through
+    `stac_asset`'s plain `HttpClient` - sidesteps the problem for any public bucket
+    regardless of its actual region, not just Sentinel-1's.
+
+    Parameters
+    ----------
+    href : str
+        An asset href.
+
+    Returns
+    -------
+    str
+        `href` unchanged if it isn't an `s3://` URI, otherwise its public HTTPS
+        equivalent.
+    """
+    parsed = urlsplit(href)
+    if parsed.scheme != "s3":
+        return href
+    bucket = parsed.netloc
+    key = parsed.path.lstrip("/")
+    return f"https://{bucket}.s3.amazonaws.com/{key}"
+
+
+def _rewrite_s3_hrefs(item: pystac.Item) -> pystac.Item:
+    """
+    Deep-copy an item with every `s3://` asset href rewritten to its public HTTPS
+    equivalent (see `_s3_uri_to_public_https`).
+
+    Parameters
+    ----------
+    item : pystac.Item
+        Item whose asset hrefs may include `s3://` URIs.
+
+    Returns
+    -------
+    pystac.Item
+        A deep copy of `item`, safe to pass to `download_item()` (which mutates its
+        input), with `s3://` hrefs rewritten.
+    """
+    item = copy.deepcopy(item)
+    for asset in item.assets.values():
+        asset.href = _s3_uri_to_public_https(asset.href)
+    return item
+
+
 async def _retry_async[T](
     coro_fn: Callable[[], Awaitable[T]],
     *,
@@ -207,7 +263,7 @@ async def _download_item(
             with tempfile.TemporaryDirectory(dir=item_dir) as tmp:
                 if progress is None:
                     downloaded = await download_item(
-                        copy.deepcopy(item),
+                        _rewrite_s3_hrefs(item),
                         Path(tmp),
                         config=download_config,
                         keep_non_downloaded=True,
@@ -217,7 +273,7 @@ async def _download_item(
                     with temporary_task(progress, item.id, total=None) as task:
                         downloaded, _ = await asyncio.gather(
                             download_item(
-                                copy.deepcopy(item),
+                                _rewrite_s3_hrefs(item),
                                 Path(tmp),
                                 config=download_config,
                                 keep_non_downloaded=True,

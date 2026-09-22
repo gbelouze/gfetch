@@ -7,10 +7,10 @@ import pystac
 import pytest
 from rich.progress import Progress
 
-from gfetch.download import download_items
+from gfetch.download import _s3_uri_to_public_https, download_items
 
 
-def _make_item(item_id: str, assets: dict[str, Path]) -> pystac.Item:
+def _make_item(item_id: str, assets: dict[str, Path | str]) -> pystac.Item:
     item = pystac.Item(
         id=item_id,
         geometry={"type": "Polygon", "coordinates": [[[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]]]},
@@ -168,6 +168,53 @@ def test_download_items_reports_progress(tmp_path: Path) -> None:
     # ...and every one of them was cleaned up (temporary_task's finally block) once
     # it finished; none linger after the call returns.
     assert len(progress.tasks) == 0
+
+
+@pytest.mark.parametrize(
+    ("href", "expected"),
+    [
+        (
+            "s3://sentinel-s1-l1c/GRD/2026/6/15/iw-vv.tiff",
+            "https://sentinel-s1-l1c.s3.amazonaws.com/GRD/2026/6/15/iw-vv.tiff",
+        ),
+        # already public HTTPS - stac_asset's HttpClient, not its region-guessing
+        # S3Client, so nothing to rewrite
+        (
+            "https://e84-earth-search-sentinel-data.s3.us-west-2.amazonaws.com/B04.tif",
+            "https://e84-earth-search-sentinel-data.s3.us-west-2.amazonaws.com/B04.tif",
+        ),
+        ("/local/cache/item-1/red.tif", "/local/cache/item-1/red.tif"),
+    ],
+)
+def test_s3_uri_to_public_https(href: str, expected: str) -> None:
+    assert _s3_uri_to_public_https(href) == expected
+
+
+def test_download_items_rewrites_s3_hrefs_before_downloading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """download_item() should never see a raw s3:// href - it must already be rewritten
+    to the region-agnostic public HTTPS form (see _s3_uri_to_public_https).
+    """
+    import gfetch.download as download_mod
+
+    item = _make_item("item-1", {"vv": "s3://sentinel-s1-l1c/GRD/iw-vv.tiff"})
+    cache_dir = tmp_path / "cache"
+
+    seen_hrefs: list[str] = []
+
+    async def fake_download_item(item, directory, *, config, keep_non_downloaded, **kwargs):
+        seen_hrefs.append(item.assets["vv"].href)
+        (directory / "iw-vv.tiff").write_bytes(b"VV-BYTES")
+        item.assets["vv"].href = "iw-vv.tiff"
+        item.set_self_href(str(directory / "item-1.json"))
+        return item
+
+    monkeypatch.setattr(download_mod, "download_item", fake_download_item)
+
+    asyncio.run(download_items([item], cache_dir, ["vv"]))
+
+    assert seen_hrefs == ["https://sentinel-s1-l1c.s3.amazonaws.com/GRD/iw-vv.tiff"]
 
 
 def test_download_items_multiple_items(tmp_path: Path) -> None:
