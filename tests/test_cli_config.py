@@ -6,7 +6,7 @@ import yaml
 from odc.geo.crs import CRS
 
 from gfetch import countries as countries_module
-from gfetch.cli.config import load, resolve_bands, resolve_cloud_mask
+from gfetch.cli.config import load, resolve_bands, resolve_cloud_mask, resolve_compute_workers
 
 
 def _write_config(path: Path, **overrides: object) -> Path:
@@ -32,7 +32,7 @@ def test_load_minimal_config(tmp_path: Path) -> None:
     assert cfg.resampling == {}
     assert cfg.orbit_state is None
     assert cfg.output_dir == (tmp_path / "s2").expanduser().absolute()
-    assert cfg.patch_chunks == 1
+    assert cfg.shard_factor is None
 
 
 def test_config_derived_paths(tmp_path: Path) -> None:
@@ -56,7 +56,7 @@ def test_satellite_section_overrides_generic(tmp_path: Path) -> None:
             "n_workers": 8,
             "resampling": {"*": "bilinear", "scl": "nearest"},
             "orbit_state": "ascending",
-            "patch_chunks": 10,
+            "shard_factor": 16,
         },
     )
     cfg = load(config_path, "s2")
@@ -67,7 +67,7 @@ def test_satellite_section_overrides_generic(tmp_path: Path) -> None:
     assert cfg.n_workers == 8
     assert cfg.resampling == {"*": "bilinear", "scl": "nearest"}
     assert cfg.orbit_state == "ascending"
-    assert cfg.patch_chunks == 10
+    assert cfg.shard_factor == 16
 
 
 def test_generic_fields_apply_when_section_does_not_override(tmp_path: Path) -> None:
@@ -235,3 +235,27 @@ def test_resolve_bands_and_cloud_mask_custom_satellite_has_no_profile_fallback(
 
     assert resolve_bands(cfg) == ["red", "green"]
     assert resolve_cloud_mask(cfg) == (None, frozenset())
+
+
+@pytest.mark.parametrize(("value", "expected"), [(8, (8, 8)), ([4, 16], (4, 16)), ([4, 4], (4, 4))])
+def test_resolve_compute_workers(tmp_path: Path, value: object, expected: tuple) -> None:
+    cfg = load(_write_config(tmp_path / "config.yaml", n_compute_workers=value), "s2")
+
+    assert resolve_compute_workers(cfg) == expected
+
+
+def test_resolve_compute_workers_defaults_to_available_cpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("gfetch.cli.config.available_cpus", lambda: 7)
+    cfg = load(_write_config(tmp_path / "config.yaml"), "s2")
+
+    assert resolve_compute_workers(cfg) == (7, 7)
+
+
+@pytest.mark.parametrize("value", [0, [16, 4], [1, 2, 3], "8"])
+def test_resolve_compute_workers_rejects_invalid(tmp_path: Path, value: object) -> None:
+    cfg = load(_write_config(tmp_path / "config.yaml", n_compute_workers=value), "s2")
+
+    with pytest.raises(ValueError, match="n_compute_workers"):
+        resolve_compute_workers(cfg)

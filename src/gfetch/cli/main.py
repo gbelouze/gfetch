@@ -99,7 +99,7 @@ def _register_raster_commands(sub_app: cyclopts.App, satellite_key: str) -> None
         Compute-only stage; no internet access required once `download` has been
         run (loads from remote hrefs otherwise). Safe to resume after being killed,
         and safe to split across several concurrent invocations via
-        `task_id`/`n_tasks` (e.g. a SLURM job array), each writing disjoint patches
+        `task_id`/`n_tasks` (e.g. a SLURM job array), each writing disjoint shards
         of the same output store.
 
         Parameters
@@ -110,7 +110,7 @@ def _register_raster_commands(sub_app: cyclopts.App, satellite_key: str) -> None
             This invocation's index among `n_tasks` concurrent invocations.
             Defaults to 0.
         n_tasks : int
-            Total number of concurrent invocations splitting this job's patches
+            Total number of concurrent invocations splitting this job's shards
             between them. Defaults to 1 (no splitting).
         verbose : bool
             Enable verbose (DEBUG) logging. Defaults to False.
@@ -240,7 +240,7 @@ def _custom_mosaic(
     Compute-only stage; no internet access required once `download` has been run
     (loads from remote hrefs otherwise). Safe to resume after being killed, and
     safe to split across several concurrent invocations via `task_id`/`n_tasks`
-    (e.g. a SLURM job array), each writing disjoint patches of the same output
+    (e.g. a SLURM job array), each writing disjoint shards of the same output
     store.
 
     Parameters
@@ -253,7 +253,7 @@ def _custom_mosaic(
         This invocation's index among `n_tasks` concurrent invocations. Defaults
         to 0.
     n_tasks : int
-        Total number of concurrent invocations splitting this job's patches
+        Total number of concurrent invocations splitting this job's shards
         between them. Defaults to 1 (no splitting).
     verbose : bool
         Enable verbose (DEBUG) logging. Defaults to False.

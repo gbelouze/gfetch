@@ -1,17 +1,21 @@
 import datetime
+from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
+import dask
 import numpy as np
 import pystac
 import xarray as xr
 import yaml
+import zarr
 from odc.geo.geobox import GeoBox
 
 from gfetch.cli.config import Config, load
 from gfetch.cli.mosaic import mosaic as mosaic_cmd
 from gfetch.finalize import pack_store
 from gfetch.mosaic import group_by_utm_zone
-from gfetch.write import region_is_written
+from gfetch.write import region_is_written, store_is_complete
 
 # Fixed regardless of the real AOI/CRS, so every test gets an exact, hand-picked
 # pixel grid instead of depending on real UTM reprojection arithmetic.
@@ -25,7 +29,7 @@ def _write_config(path: Path, **overrides: object) -> Path:
         "output_dir": str(path.parent),
         "bands": ["red"],
         "chunks": {"x": 4, "y": 4},
-        "patch_chunks": 2,  # patch = 8x8 pixels = 2x2 native chunks -> 2x2 = 4 patches
+        "shard_factor": 2,  # 2x2 chunks per shard -> 2x2 = 4 shards
         **overrides,
     }
     path.write_text(yaml.dump(config_dict))
@@ -54,8 +58,14 @@ def _fake_zone_geobox(crs: object, aoi_bbox: object, resolution: object) -> GeoB
     return _FIXED_GEOBOX
 
 
-def _fake_build_mosaic(calls: list[GeoBox]) -> object:
-    def build(zone_items: list[pystac.Item], geobox: GeoBox, bands: list[str], **kwargs: object):
+def _fake_build_mosaic(calls: list[GeoBox]) -> Callable[..., xr.Dataset]:
+    def build(
+        zone_items: list[pystac.Item],
+        geobox: GeoBox,
+        bands: list[str],
+        on_load: Callable[[xr.Dataset], object] | None = None,
+        **kwargs: object,
+    ):
         calls.append(geobox)
         data = {
             band: (("y", "x"), np.zeros((geobox.shape.y, geobox.shape.x), dtype="float32"))
@@ -64,7 +74,11 @@ def _fake_build_mosaic(calls: list[GeoBox]) -> object:
         # Must stay dask-backed like the real `mosaic()`'s output - otherwise
         # `prepare_template`'s `compute=False` has nothing to defer and writes real
         # (all-zero) chunk data immediately, making every patch look already-written.
-        return xr.Dataset(data).chunk({"y": 4, "x": 4})
+        chunks = cast("dict[str, int] | None", kwargs.get("chunks")) or {"y": 4, "x": 4}
+        ds = xr.Dataset(data).chunk({"y": chunks["y"], "x": chunks["x"]})
+        if on_load is not None:
+            on_load(ds)
+        return ds
 
     return build
 
@@ -148,3 +162,49 @@ def test_mosaic_skips_packed_zone_without_recreating_its_store(tmp_path: Path, m
 
     assert calls == []
     assert not cfg.zarr_path(crs).exists()
+
+
+def test_mosaic_tunes_worker_count_within_range(tmp_path: Path, monkeypatch) -> None:
+    cfg_path = _write_config(tmp_path / "config.yaml", n_compute_workers=[1, 3])
+    cfg = load(cfg_path, "s2")
+    _write_fake_items(cfg)
+    monkeypatch.setattr("gfetch.cli.mosaic.zone_geobox", _fake_zone_geobox)
+
+    workers_seen: list[int | None] = []
+    fake_build = _fake_build_mosaic([])
+
+    def recording_build(zone_items, geobox, bands, **kwargs):
+        workers_seen.append(dask.config.get("num_workers", None))
+        return fake_build(zone_items, geobox, bands, **kwargs)
+
+    monkeypatch.setattr("gfetch.cli.mosaic.build_mosaic", recording_build)
+    mosaic_cmd(cfg_path, "s2")
+
+    # Template build first (outside any shard), then min, max, middle, then a tuned pick.
+    assert workers_seen[1:4] == [1, 3, 2]
+    assert workers_seen[4] in {1, 2, 3}
+
+
+def test_mosaic_computes_in_bricks_of_several_store_chunks(tmp_path: Path, monkeypatch) -> None:
+    cfg_path = _write_config(tmp_path / "config.yaml", compute_chunk_factor=2)
+    cfg = load(cfg_path, "s2")
+    _write_fake_items(cfg)
+    monkeypatch.setattr("gfetch.cli.mosaic.zone_geobox", _fake_zone_geobox)
+
+    requested_chunks: list[dict] = []
+    fake_build = _fake_build_mosaic([])
+
+    def recording_build(zone_items, geobox, bands, **kwargs):
+        requested_chunks.append(kwargs["chunks"])
+        return fake_build(zone_items, geobox, bands, **kwargs)
+
+    monkeypatch.setattr("gfetch.cli.mosaic.build_mosaic", recording_build)
+    mosaic_cmd(cfg_path, "s2")
+
+    assert all(c["y"] == 8 and c["x"] == 8 for c in requested_chunks)
+    items = list(pystac.ItemCollection.from_file(cfg.cached_items_path))
+    (crs,) = group_by_utm_zone(items, cfg.resolved_aoi.bbox)
+    za = zarr.open_array(store=cfg.zarr_path(crs) / "red")
+    assert za.chunks == (4, 4)
+    assert za.shards == (8, 8)
+    assert store_is_complete(cfg.zarr_path(crs), ["red"])

@@ -5,16 +5,15 @@ point at a local cache (see `gfetch.download`), or directly against remote hrefs
 single-machine, internet-connected use.
 """
 
-import itertools
 import logging
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Sequence
 from typing import Literal, cast
 
 import odc.stac
 import pystac
 import xarray as xr
 from odc.geo.crs import CRS
-from odc.geo.geobox import GeoBox, GeoboxTiles
+from odc.geo.geobox import GeoBox
 from odc.geo.geom import BoundingBox, bbox_intersection
 from pyproj.database import query_utm_crs_info
 
@@ -22,7 +21,7 @@ from gfetch.utils.memory import log_chunk_footprint
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_CHUNKS: dict[str, int] = {"x": 2048, "y": 2048}
+_DEFAULT_CHUNKS: dict[str, int] = {"x": 256, "y": 256}
 
 # `composite`'s default `median` isn't chunk-wise associative, so dask must gather an
 # entire spatial chunk's `time` axis into one chunk before it can reduce. If `time`
@@ -32,6 +31,10 @@ _DEFAULT_CHUNKS: dict[str, int] = {"x": 2048, "y": 2048}
 # `time` chunk from the start avoids that rechunk entirely.
 _DEFAULT_TIME_CHUNK = -1
 
+# 32x32 chunks per shard: 8192 px shards at the default chunk size. The mosaic stage
+# writes one shard per task, so a shard's output (all bands) is held in memory at once.
+_DEFAULT_SHARD_FACTOR = 32
+
 
 __all__ = [
     "composite",
@@ -39,8 +42,9 @@ __all__ = [
     "load",
     "mask_clouds",
     "mosaic",
-    "patch_geoboxes",
     "resolve_chunks",
+    "resolve_compute_chunks",
+    "resolve_shards",
     "zone_geobox",
 ]
 
@@ -50,14 +54,14 @@ def resolve_chunks(chunks: dict[str, int] | None) -> dict[str, int]:
     Resolve a user-supplied chunk dict against gfetch's own defaults.
 
     Pulled out of `load` so callers that need the actual chunk sizes without loading
-    anything (e.g. to plan patches over a geobox) don't have to duplicate or guess at
+    anything (e.g. to plan a store's shards) don't have to duplicate or guess at
     gfetch's defaults.
 
     Parameters
     ----------
     chunks : dict[str, int] | None
         Dask chunk sizes as passed to `load`/`mosaic`. Defaults to None, which uses
-        `{"x": 2048, "y": 2048}`.
+        `{"x": 256, "y": 256}`.
 
     Returns
     -------
@@ -71,6 +75,69 @@ def resolve_chunks(chunks: dict[str, int] | None) -> dict[str, int]:
     return effective
 
 
+def resolve_shards(shard_factor: int | None, chunks: dict[str, int]) -> dict[str, int] | None:
+    """
+    Resolve a shard factor into shard sizes, against gfetch's own defaults.
+
+    Parameters
+    ----------
+    shard_factor : int | None
+        Number of chunks per shard along each spatial dimension. Defaults to None,
+        which uses `_DEFAULT_SHARD_FACTOR`.
+    chunks : dict[str, int]
+        Chunk sizes, as resolved by `resolve_chunks`.
+
+    Returns
+    -------
+    dict[str, int] | None
+        Shard size per spatial dimension, or None if `shard_factor` is 1 (no
+        sharding).
+    """
+    factor = shard_factor if shard_factor is not None else _DEFAULT_SHARD_FACTOR
+    if factor == 1:
+        return None
+    return {dim: factor * chunks[dim] for dim in ("y", "x")}
+
+
+def resolve_compute_chunks(
+    chunks: dict[str, int], compute_chunk_factor: int, shards: dict[str, int] | None
+) -> dict[str, int]:
+    """
+    Resolve the dask chunk sizes the `mosaic` stage computes with.
+
+    Parameters
+    ----------
+    chunks : dict[str, int]
+        Store chunk sizes, as resolved by `resolve_chunks`.
+    compute_chunk_factor : int
+        Number of store chunks per dask chunk along each spatial dimension.
+    shards : dict[str, int] | None
+        Shard sizes, as resolved by `resolve_shards`, or None if unsharded.
+
+    Returns
+    -------
+    dict[str, int]
+        `chunks` with its spatial sizes multiplied by `compute_chunk_factor`.
+
+    Raises
+    ------
+    ValueError
+        If a dask chunk doesn't evenly divide the unit of work (a shard, or a chunk
+        when unsharded), which would let two dask chunks share a written file.
+    """
+    compute = {**chunks, **{dim: compute_chunk_factor * chunks[dim] for dim in ("y", "x")}}
+    unit = shards if shards is not None else chunks
+    for dim in ("y", "x"):
+        if unit[dim] % compute[dim]:
+            raise ValueError(
+                f"compute_chunk_factor={compute_chunk_factor} gives {compute[dim]} px dask "
+                f"chunks along {dim!r}, which don't evenly divide the {unit[dim]} px "
+                f"{'shard' if shards is not None else 'chunk'}; use a divisor of "
+                "shard_factor"
+            )
+    return compute
+
+
 def load(
     items: Sequence[pystac.Item],
     geobox: GeoBox,
@@ -79,6 +146,7 @@ def load(
     groupby: str = "solar_day",
     chunks: dict[str, int] | None = None,
     resampling: str | dict[str, str] | None = None,
+    log_footprint: bool = True,
 ) -> xr.Dataset:
     """
     Load STAC items onto a common grid, lazily (dask-backed).
@@ -98,7 +166,7 @@ def load(
         mosaics over stacking every individual scene as a separate time step.
     chunks : dict[str, int] | None
         Dask chunk sizes, e.g. `{"time": 1, "x": 512, "y": 512}`. Defaults to None,
-        which chunks the spatial dims at `{"x": 2048, "y": 2048}`; passing `None`
+        which chunks the spatial dims at `{"x": 256, "y": 256}`; passing `None`
         through to odc-stac itself would instead load everything eagerly, without
         Dask. Regardless of this argument, `time` itself defaults to a single
         full-length chunk unless explicitly given here.
@@ -107,6 +175,9 @@ def load(
         method for every band, or a per-band `dict[str, str]` (a `"*"` key sets the
         default for bands not otherwise listed). Defaults to None, which falls back to
         odc-stac's own default ('nearest' for every band).
+    log_footprint : bool
+        Log the loaded dataset's per-chunk memory footprint, see
+        `gfetch.utils.memory.log_chunk_footprint`. Defaults to True.
 
     Returns
     -------
@@ -130,7 +201,8 @@ def load(
         resampling=resampling,
     )
     log.info(f"Loaded dataset: {dict(ds.sizes)}")
-    log_chunk_footprint(ds, log)
+    if log_footprint:
+        log_chunk_footprint(ds, log)
     return ds
 
 
@@ -228,6 +300,8 @@ def mosaic(
     chunks: dict[str, int] | None = None,
     method: str = "median",
     resampling: str | dict[str, str] | None = None,
+    log_footprint: bool = True,
+    on_load: Callable[[xr.Dataset], object] | None = None,
 ) -> xr.Dataset:
     """
     Load, cloud-mask, and composite STAC items into a single mosaic.
@@ -263,6 +337,11 @@ def mosaic(
         Resampling method for the data bands, passed to `load`. `mask_band`, if given,
         is always loaded with 'nearest' resampling regardless of this setting, since it
         holds categorical values. Defaults to None (odc-stac's own default).
+    log_footprint : bool
+        Passed to `load`. Defaults to True.
+    on_load : Callable[[xr.Dataset], object] | None
+        Called with the lazily loaded dataset, before masking and compositing (e.g.
+        to measure how many bytes the mosaic processes). Defaults to None.
 
     Returns
     -------
@@ -292,7 +371,10 @@ def mosaic(
         groupby=groupby,
         chunks=resolved_chunks,
         resampling=_pin_mask_band_resampling(resampling, mask_band),
+        log_footprint=log_footprint,
     )
+    if on_load is not None:
+        on_load(ds)
     if mask_band is not None:
         ds = mask_clouds(ds, mask_band, mask_out)
     result = composite(ds, method=method)
@@ -301,8 +383,7 @@ def mosaic(
     # composite()'s reduction disturbing the x/y chunk grid, but nothing guarantees
     # that grid is preserved exactly for every variable regardless (e.g. a band
     # needing extra resampling to reach the common geobox). write_region()'s Zarr
-    # region-write requires exact alignment for every variable, so pin it explicitly
-    # rather than relying on it holding incidentally.
+    # requires exact alignment for every variable, so we pin it explicitly.
     return result.chunk({"y": resolved_chunks["y"], "x": resolved_chunks["x"]})
 
 
@@ -462,41 +543,3 @@ def zone_geobox(crs: CRS, aoi_bbox: tuple[float, float, float, float], resolutio
     # first.
     extent = _zone_aoi_extent(crs, aoi).to_crs(crs)
     return GeoBox.from_bbox(extent, resolution=resolution)
-
-
-def patch_geoboxes(
-    geobox: GeoBox, patch_shape: tuple[int, int]
-) -> Iterator[tuple[tuple[int, int], GeoBox, dict[str, slice]]]:
-    """
-    Deterministically tile a geobox into patches, each a whole number of pixels of
-    `patch_shape`.
-
-    A patch is the unit of resumable/parallelizable work for the `mosaic` stage's
-    write step: it's sized independently of the Zarr store's own native chunk size,
-    but `patch_shape` must be an exact multiple of it in both dimensions so every
-    patch's region aligns with `gfetch.write.write_region`'s chunk-boundary
-    requirement.
-
-    Parameters
-    ----------
-    geobox : GeoBox
-        Geobox to tile, e.g. one UTM zone's full output grid.
-    patch_shape : tuple[int, int]
-        `(y, x)` patch size in pixels.
-
-    Yields
-    ------
-    tuple[tuple[int, int], GeoBox, dict[str, slice]]
-        `((iy, ix), patch_geobox, region)` for every patch, in row-major order.
-        `patch_geobox` is this patch's own output grid (pass to `load`/`mosaic`),
-        `region` is its pixel-space slice within `geobox` (pass to
-        `gfetch.write.write_region`/`gfetch.write.region_is_written`).
-    """
-    tiles = GeoboxTiles(geobox, patch_shape)
-    n_y, n_x = tiles.shape
-    for iy, ix in itertools.product(range(n_y), range(n_x)):
-        y_sl, x_sl = tiles.roi[iy, ix]
-        # `GeoboxTiles` is generic over `GeoBoxBase` (also covers multiscale pyramids),
-        # but tiling a plain 2D `GeoBox` always yields a `GeoBox` back.
-        patch_geobox = cast("GeoBox", tiles[iy, ix])
-        yield (iy, ix), patch_geobox, {"y": y_sl, "x": x_sl}

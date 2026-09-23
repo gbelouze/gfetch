@@ -679,7 +679,37 @@ core functions in `gfetch.finalize` (`pack_store`, `remove_cache`), exposed as
 `gfetch <satellite> pack [--remove-store]` / `gfetch <satellite> clean`. `mosaic`
 skips a zone whose zip exists (still listing its patches, so `task_id`/`n_tasks`
 assignment doesn't shift if packing happens between tasks). Sharding is the better long-term fix
-for the store itself and remains open. `pack_store` relies on stdlib `zipfile`
+for the store itself; **implemented 2026-09-23**: `shard_factor:` config (chunks per
+shard along each side, default 32, with default chunks now 256 px), `patch_chunks`
+removed. `mosaic`'s unit of work is one shard, listed from the
+store via zarr's public `Array.write_chunk_sizes` (shards, or chunks when unsharded)
+and keyed via `metadata.encode_chunk_key`, so gfetch doesn't compute the grid itself.
+Computation stays at `chunks` size; `write_region` merges a shard's dask blocks just
+before writing, so one shard's output (all bands) is in memory at once. A shard of
+only fill values isn't written by default either, so `write_empty_chunks=True` still
+matters.
+
+zarr-python needs a whole uncompressed shard per write call (a partial write
+reads, merges and rewrites the whole shard file), so one band's shard in memory
+is unavoidable. Writing one band at a time bounds assembly to one band's shard;
+benchmarked below, and **not adopted (2026-09-23)**: `mosaic` writes all bands of a
+shard together, and recomputes all of them if any band's shard file is missing. `benchmark/sharding_write.py` (synthetic masked median, 4096² px,
+256 px chunks, one 4096 px shard = 67 MB/band float32, 12 time steps, 4 threads),
+peak RSS above baseline / write time:
+
+| | 6 bands | 12 bands |
+|---|---|---|
+| unsharded (1 chunk per unit) | 310 MB / 34 s | 354 MB / 53 s |
+| sharded, all bands per write | 913 MB / 15 s | 939 MB / 31 s |
+| sharded, one band per write | 638 MB / 18 s | 685 MB / 37 s |
+
+All-bands memory barely grows with the band count: dask's ordering finishes band
+shards nearly in turn, so in practice about `n_threads` band shards are in flight,
+far below the all-bands worst case. Per band saves ~250 MB (about 4 band shards) for
+~15-20% more time (the shared mask is recomputed per band). Per band still peaks
+~330 MB above unsharded for a 67 MB band shard: the blocks, the merged array and the
+encoded shard coexist during the write. Unsharded is slowest because it makes one
+`to_zarr` call per chunk. `pack_store` relies on stdlib `zipfile`
 (streams file by file, handles ZIP64 transparently) plus a temp file + `os.replace`
 for atomicity; `remove_cache` refuses unless every store is packed or
 `store_is_complete`.

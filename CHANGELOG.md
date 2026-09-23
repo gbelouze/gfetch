@@ -12,6 +12,10 @@ Each release can have sections: "Added", "Changed", "Deprecated", "Removed", "Fi
 
 ### Added
 
+- Sharded Zarr output (`shard_factor:` config, chunks per shard along each side, default 32): one file per shard instead of per chunk. Each shard is also `mosaic`'s unit of work and resume, listed from the store's own shard grid (`gfetch.write.write_regions`). Reading a sharded store with GDAL/QGIS needs GDAL 3.13+.
+- `compute_chunk_factor:` config (default 1): `mosaic` computes in dask chunks of that many store chunks per side, separately from the store's own `chunks`. Must divide `shard_factor`.
+- `n_compute_workers` accepts a `[min, max]` range: `mosaic` then tunes the dask thread count per shard while it runs (`gfetch.utils.tuning.WorkerTuner`): min, max and middle first, then the best count predicted by fitting `a + b/w + c*w` to the observed seconds per byte processed, plus exploration noise.
+- `benchmark/sharding_write.py` compares unsharded, sharded all-bands and sharded per-band writes.
 - Project scaffold: `pyproject.toml` (Python 3.12, `ruff`/`pyrefly`/`pydoclint` config), `pre-commit` hooks, `AGENTS.md`.
 - `search`, `download`, `mosaic`/`write` pipeline stages, a `sentinel-2` satellite profile, and a `cyclopts`/`omegaconf`-based CLI (`init`/`search`/`download`/`mosaic`), with tests for every stage.
 - `mosaic.py::group_by_utm_zone`/`zone_geobox`: mosaic each UTM zone an AOI spans separately, instead of reprojecting everything into one zone chosen from the AOI's centroid. `gfetch mosaic` now writes one Zarr store per spanned zone (`mosaic_epsg<code>.zarr`).
@@ -36,6 +40,8 @@ Each release can have sections: "Added", "Changed", "Deprecated", "Removed", "Fi
 
 ### Changed
 
+- `patch_chunks` is removed in favour of `shard_factor`: a config still setting it fails to load. `shard_factor: 1` keeps an unsharded store, compatible with stores written before.
+- Default `chunks` is 256 px (was 2048), so the default 8192 px shard holds 32x32 chunks.
 - Sentinel-2 cloud masking also masks SCL class 7 (unclassified, in practice largely low-probability cloud).
 - `Config.zarr_path` is now a method taking a `CRS` (one output store per UTM zone) instead of a fixed property.
 - Job configs are now unified: one YAML file per job, with generic top-level defaults overridable per satellite under reserved `s1`/`s2`/`gedi`/`custom` sections, instead of one flat file per satellite. The CLI follows: `gfetch <satellite> search|download|mosaic|pack|clean <config>` (`gfetch custom <verb> <name> <config>` for a `custom:` entry), `gfetch gedi <config>` unchanged.

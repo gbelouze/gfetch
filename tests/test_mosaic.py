@@ -11,8 +11,9 @@ from gfetch.mosaic import (
     _pin_mask_band_resampling,
     group_by_utm_zone,
     mosaic,
-    patch_geoboxes,
     resolve_chunks,
+    resolve_compute_chunks,
+    resolve_shards,
     zone_geobox,
 )
 from gfetch.profiles import get_profile
@@ -82,7 +83,7 @@ def test_zone_geobox_clips_aoi_to_zone_band() -> None:
 
 
 def test_resolve_chunks_defaults() -> None:
-    assert resolve_chunks(None) == {"x": 2048, "y": 2048, "time": -1}
+    assert resolve_chunks(None) == {"x": 256, "y": 256, "time": -1}
 
 
 def test_resolve_chunks_keeps_user_overrides_and_adds_time() -> None:
@@ -93,26 +94,35 @@ def test_resolve_chunks_does_not_override_explicit_time() -> None:
     assert resolve_chunks({"x": 512, "y": 256, "time": 3}) == {"x": 512, "y": 256, "time": 3}
 
 
-def test_patch_geoboxes_tiles_in_row_major_order_with_exact_shapes() -> None:
-    geobox = GeoBox.from_bbox((0, 0, 120, 80), crs="EPSG:3857", resolution=1.0)  # shape y=80, x=120
+def test_resolve_compute_chunks_scales_spatial_chunks() -> None:
+    chunks = {"x": 256, "y": 256, "time": -1}
 
-    patches = list(patch_geoboxes(geobox, (20, 40)))  # (y, x) patch shape -> 4x3 grid
+    assert resolve_compute_chunks(chunks, 1, {"x": 8192, "y": 8192}) == chunks
+    assert resolve_compute_chunks(chunks, 4, {"x": 8192, "y": 8192}) == {
+        "x": 1024,
+        "y": 1024,
+        "time": -1,
+    }
 
-    assert [idx for idx, _, _ in patches] == [(iy, ix) for iy in range(4) for ix in range(3)]
-    (_, patch_gbox, region) = patches[0]
-    assert patch_gbox.shape.y == 20
-    assert patch_gbox.shape.x == 40
-    assert region == {"y": slice(0, 20), "x": slice(0, 40)}
+
+@pytest.mark.parametrize(("factor", "shards"), [(3, {"x": 8192, "y": 8192}), (2, None)])
+def test_resolve_compute_chunks_rejects_bricks_not_dividing_the_write_unit(
+    factor: int, shards: dict[str, int] | None
+) -> None:
+    with pytest.raises(ValueError, match="compute_chunk_factor"):
+        resolve_compute_chunks({"x": 256, "y": 256, "time": -1}, factor, shards)
 
 
-def test_patch_geoboxes_last_row_and_col_are_clipped_not_dropped() -> None:
-    geobox = GeoBox.from_bbox((0, 0, 100, 80), crs="EPSG:3857", resolution=1.0)
+def test_resolve_shards_defaults_to_32_chunks_per_side() -> None:
+    assert resolve_shards(None, {"x": 256, "y": 128, "time": -1}) == {"y": 4096, "x": 8192}
 
-    patches = {idx: region for idx, _, region in patch_geoboxes(geobox, (30, 40))}
 
-    assert set(patches) == {(iy, ix) for iy in range(3) for ix in range(3)}
-    # 80/30 -> last row is a 20px remainder, not a full 30px tile
-    assert patches[(2, 0)] == {"y": slice(60, 80), "x": slice(0, 40)}
+def test_resolve_shards_scales_chunks_by_factor() -> None:
+    assert resolve_shards(4, {"x": 256, "y": 256}) == {"y": 1024, "x": 1024}
+
+
+def test_resolve_shards_factor_one_disables_sharding() -> None:
+    assert resolve_shards(1, {"x": 256, "y": 256, "time": -1}) is None
 
 
 @pytest.mark.parametrize(
@@ -137,7 +147,7 @@ def test_pin_mask_band_resampling(
 def test_mosaic_pins_mask_band_to_nearest_even_with_explicit_override(monkeypatch) -> None:
     captured: dict = {}
 
-    def fake_load(items, geobox, bands, *, groupby, chunks, resampling):
+    def fake_load(items, geobox, bands, *, groupby, chunks, resampling, log_footprint):
         captured["resampling"] = resampling
         return xr.Dataset(
             {
@@ -170,7 +180,7 @@ def test_mosaic_overrides_non_default_time_chunk_and_warns(monkeypatch, caplog) 
     """
     captured: dict = {}
 
-    def fake_load(items, geobox, bands, *, groupby, chunks, resampling):
+    def fake_load(items, geobox, bands, *, groupby, chunks, resampling, log_footprint):
         captured["chunks"] = chunks
         return xr.Dataset(
             {"red": (("time", "y", "x"), np.array([[[1.0]]]))},
@@ -199,7 +209,7 @@ def test_mosaic_pins_output_chunks_to_requested_grid(monkeypatch) -> None:
     `load()` happened to return.
     """
 
-    def fake_load(items, geobox, bands, *, groupby, chunks, resampling):
+    def fake_load(items, geobox, bands, *, groupby, chunks, resampling, log_footprint):
         time_coord = [datetime.datetime(2020, 6, d, tzinfo=datetime.UTC) for d in (1, 2)]
         red = xr.DataArray(
             np.zeros((2, 4, 4)), dims=("time", "y", "x"), coords={"time": time_coord}

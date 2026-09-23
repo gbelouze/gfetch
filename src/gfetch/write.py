@@ -15,6 +15,7 @@ from typing import Literal
 import xarray as xr
 import zarr
 from zarr.core.metadata import ArrayV3Metadata
+from zarr.storage import StoreLike
 
 from gfetch.utils.memory import log_chunk_footprint
 
@@ -28,6 +29,7 @@ __all__ = [
     "validate_chunks",
     "write",
     "write_region",
+    "write_regions",
 ]
 
 _ZarrMode = Literal["a", "a-", "r", "r+", "w", "w-"]
@@ -119,7 +121,12 @@ def store_initialized(path: Path) -> bool:
     return (path / "zarr.json").exists()
 
 
-def validate_chunks(path: Path, variables: Sequence[str], expected_chunks: dict[str, int]) -> None:
+def validate_chunks(
+    path: Path,
+    variables: Sequence[str],
+    expected_chunks: dict[str, int],
+    expected_shards: dict[str, int] | None = None,
+) -> None:
     """
     Check that an already-initialized store's on-disk chunk grid matches what this
     run expects, failing fast and clearly instead of letting a mismatch surface deep
@@ -132,7 +139,7 @@ def validate_chunks(path: Path, variables: Sequence[str], expected_chunks: dict[
     mosaic`'s docstring), every later write against it will keep failing the same
     way until the mismatch is noticed and the store is recreated. Call this once per
     store, right after confirming it already exists (`store_initialized`), before
-    any patch is built - a cheap metadata read per variable, no chunk data touched.
+    any shard is built - a cheap metadata read per variable, no chunk data touched.
 
     Parameters
     ----------
@@ -141,34 +148,49 @@ def validate_chunks(path: Path, variables: Sequence[str], expected_chunks: dict[
     variables : Sequence[str]
         Data variables to check.
     expected_chunks : dict[str, int]
-        Expected chunk size per dimension name (e.g. `{"y": 2048, "x": 2048}`), as
-        resolved by `gfetch.mosaic.resolve_chunks`.
+        Expected chunk size per dimension name (e.g. `{"y": 256, "x": 256}`), as
+        resolved by `gfetch.mosaic.resolve_chunks`. With sharding, these are the
+        inner chunks.
+    expected_shards : dict[str, int] | None
+        Expected shard size per dimension name, as resolved by
+        `gfetch.mosaic.resolve_shards`. Defaults to None, which expects an unsharded
+        store.
 
     Raises
     ------
     ValueError
-        If any variable's actual on-disk chunk size differs from `expected_chunks`
-        for a dimension it has.
+        If any variable's actual on-disk chunk or shard size differs from
+        `expected_chunks`/`expected_shards` for a dimension it has.
     """
     for var in variables:
         za = zarr.open_array(store=path / var)
         assert isinstance(za.metadata, ArrayV3Metadata), f"{path / var} is not Zarr v3"
         dims = za.metadata.dimension_names
         assert dims is not None, f"{path / var} has no dimension names"
-        actual_chunks = dict(zip(dims, za.chunks, strict=True))
-        for dim, expected in expected_chunks.items():
-            actual = actual_chunks.get(dim)
-            if actual is not None and actual != expected:
-                raise ValueError(
-                    f"{path / var}: on-disk chunk size for dimension {dim!r} is "
-                    f"{actual}, but this run's configuration expects {expected}. The "
-                    "store was likely created by an earlier run under a different "
-                    f"configuration - delete {path} and let it be recreated, or fix "
-                    "the configuration to match the existing store."
-                )
+        # An unsharded store's write unit is its chunk.
+        expected_write = expected_shards if expected_shards is not None else expected_chunks
+        for label, actual_sizes, expected_sizes in (
+            ("chunk", za.chunks, expected_chunks),
+            ("shard", za.shards or za.chunks, expected_write),
+        ):
+            actual = dict(zip(dims, actual_sizes, strict=True))
+            for dim, expected in expected_sizes.items():
+                if actual.get(dim) is not None and actual[dim] != expected:
+                    raise ValueError(
+                        f"{path / var}: on-disk {label} size for dimension {dim!r} is "
+                        f"{actual[dim]}, but this run's configuration expects {expected}. "
+                        "The store was likely created by an earlier run under a different "
+                        f"configuration - delete {path} and let it be recreated, or fix "
+                        "the configuration to match the existing store."
+                    )
 
 
-def prepare_template(ds: xr.Dataset, path: Path) -> None:
+def prepare_template(
+    ds: xr.Dataset,
+    path: Path,
+    shards: dict[str, int] | None = None,
+    chunks: dict[str, int] | None = None,
+) -> None:
     """
     Write only a Zarr store's metadata and coordinates, without any chunk data.
 
@@ -187,10 +209,33 @@ def prepare_template(ds: xr.Dataset, path: Path) -> None:
         Dataset whose shape/coords/chunking define the store; its data isn't written.
     path : Path
         Destination Zarr store path.
+    shards : dict[str, int] | None
+        Shard size per dimension name, each a multiple of that dimension's chunk
+        size. Dimensions not listed get one chunk per shard. Defaults to None (no
+        sharding).
+    chunks : dict[str, int] | None
+        Store chunk size per dimension name (the inner chunks, when sharded).
+        Dimensions not listed keep `ds`'s dask chunking. Defaults to None, which uses
+        `ds`'s dask chunks.
     """
     ds = _restore_grid_mapping(ds)
+    if chunks is not None:
+        ds = ds.chunk({dim: size for dim, size in chunks.items() if dim in ds.dims})
+    encoding = {}
+    if shards is not None:
+        for name, var in ds.data_vars.items():
+            var_chunks = tuple(c[0] for c in var.chunks) if var.chunks is not None else var.shape
+            encoding[name] = {
+                "chunks": var_chunks,
+                "shards": tuple(
+                    shards.get(str(dim), chunk)
+                    for dim, chunk in zip(var.dims, var_chunks, strict=True)
+                ),
+            }
+        # xarray requires dask chunks aligned to shards; nothing is computed here.
+        ds = ds.chunk({dim: size for dim, size in shards.items() if dim in ds.dims})
     try:
-        ds.to_zarr(path, compute=False, mode="w-")
+        ds.to_zarr(path, compute=False, mode="w-", encoding=encoding)
     except FileExistsError:
         log.debug(f"{path} already initialized, skipping template write")
         return
@@ -211,30 +256,70 @@ def write_region(ds: xr.Dataset, path: Path, region: dict[str, slice]) -> None:
         Zarr store path, already initialized via `prepare_template`.
     region : dict[str, slice]
         Mapping from dimension name to the slice of the store this call writes,
-        e.g. `{"x": slice(0, 512), "y": slice(None)}`.
+        e.g. `{"x": slice(0, 512), "y": slice(None)}`, typically one of
+        `write_regions`.
     """
     ds = _restore_grid_mapping(ds)
+    if ds.chunks:
+        # A shard is written by a single task, so its dask chunks are merged first.
+        # Computing stays at the original, smaller chunk size.
+        ds = ds.chunk({dim: -1 for dim in region if dim in ds.dims})
     # xarray's region-write rejects any variable lacking a dimension in common with
     # `region`; scalar coordinates like a CRS grid mapping variable must be dropped,
     # since they were already written once by prepare_template.
     ds = ds.drop_vars([c for c in ds.coords if c not in ds.dims])
     # zarr-python skips writing chunks that are entirely fill value (e.g. an all-NaN
-    # nodata patch) by default, which `region_is_written` couldn't tell apart from a
+    # nodata shard) by default, which `region_is_written` couldn't tell apart from a
     # chunk that was never written.
     ds.to_zarr(path, region=region, write_empty_chunks=True)
     log.debug(f"Wrote region {region} to {path}")
 
 
+def write_regions(store: StoreLike, variable: str) -> list[dict[str, slice]]:
+    """
+    List a variable's storage units (shards, or chunks if unsharded) as regions.
+
+    Each region is one independent unit of work for `write_region`: two writers never
+    touch the same file as long as each writes whole regions from this list.
+
+    Parameters
+    ----------
+    store : StoreLike
+        Zarr store holding `variable`, e.g. a store directory `Path` or a read-only
+        `zarr.storage.ZipStore`.
+    variable : str
+        Array whose storage grid to list.
+
+    Returns
+    -------
+    list[dict[str, slice]]
+        Mapping from dimension name to slice for every unit, in row-major order,
+        edge units clipped to the array's extent.
+    """
+    za = zarr.open_group(store=store, mode="r")[variable]
+    assert isinstance(za, zarr.Array), f"{variable} is not an array"
+    assert isinstance(za.metadata, ArrayV3Metadata), f"{variable} is not Zarr v3"
+    assert za.metadata.dimension_names is not None, f"{variable} has no dimension names"
+    dims = [dim for dim in za.metadata.dimension_names if dim is not None]
+    assert len(dims) == za.ndim, f"{variable} has an unnamed dimension"
+    per_dim_slices = []
+    for sizes in za.write_chunk_sizes:
+        bounds = [0, *itertools.accumulate(sizes)]
+        per_dim_slices.append([slice(a, b) for a, b in itertools.pairwise(bounds)])
+    return [dict(zip(dims, slices, strict=True)) for slices in itertools.product(*per_dim_slices)]
+
+
 def region_is_written(path: Path, region: dict[str, slice], variables: Sequence[str]) -> bool:
     """
-    Check whether every native Zarr chunk covering `region` already exists on disk.
+    Check whether every storage unit covering `region` already exists on disk.
 
-    Reads chunk boundaries and dimension order from the store's own array metadata
-    rather than taking them as a parameter, so this can't drift from whatever
-    `prepare_template` actually wrote. A chunk file existing means it was fully
-    written, not partially: zarr-python's `LocalStore` writes every chunk file
-    atomically (temp file + rename), so there's no separate partial-write state to
-    guard against here.
+    A storage unit is a shard, or a chunk in an unsharded store. Reads their
+    boundaries and dimension order from the store's own array metadata rather than
+    taking them as a parameter, so this can't drift from whatever `prepare_template`
+    actually wrote. A unit's file existing means it was fully written: zarr-python's
+    `LocalStore` writes every file atomically (temp file + rename), and `write_region`
+    always writes whole units, so there's no separate partial-write state to guard
+    against here.
 
     Parameters
     ----------
@@ -245,13 +330,13 @@ def region_is_written(path: Path, region: dict[str, slice], variables: Sequence[
         `write_region`. A dimension missing from `region` is checked in full.
     variables : Sequence[str]
         Data variables to check; the region only counts as written once every listed
-        variable's covering chunks are all present.
+        variable's covering units are all present.
 
     Returns
     -------
     bool
-        True if every native chunk covering `region` already exists for every
-        variable in `variables`.
+        True if every unit covering `region` already exists for every variable in
+        `variables`.
     """
 
     async def _all_written() -> bool:
@@ -264,7 +349,8 @@ def region_is_written(path: Path, region: dict[str, slice], variables: Sequence[
             dims = za.metadata.dimension_names
             assert dims is not None, f"{path / var} has no dimension names"
             axis_chunk_ranges = []
-            for dim, chunk_size, size in zip(dims, za.chunks, za.shape, strict=True):
+            write_sizes = za.shards or za.chunks
+            for dim, chunk_size, size in zip(dims, write_sizes, za.shape, strict=True):
                 assert dim is not None, f"{path / var} has an unnamed dimension"
                 sl = region.get(dim, slice(None))
                 start = sl.start if sl.start is not None else 0

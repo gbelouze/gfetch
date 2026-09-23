@@ -1,11 +1,13 @@
 import logging
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from typing import Any
 
 from odc.geo.crs import CRS
 from omegaconf import DictConfig, OmegaConf
 
 from gfetch.profiles import get_profile
+from gfetch.utils.system import available_cpus
 
 log = logging.getLogger(__name__)
 
@@ -191,12 +193,14 @@ class Config:
         band, if any, is always loaded with 'nearest' resampling regardless of this
         setting. Defaults to an empty dict, which uses odc-stac's own default
         ('nearest' for every band).
-    n_compute_workers : int | None
+    n_compute_workers : Any
         Number of dask threads used to compute and write the `mosaic` stage's
-        per-zone output. Defaults to None, which uses `gfetch.utils.system.
-        available_cpus` (the CPUs actually reserved for this process, e.g. by a
-        SLURM job's `--cpus-per-task`, not the whole node). Lower this to bound how
-        many chunks compute concurrently.
+        output: an int, or a `[min, max]` range that `mosaic` tunes within as it
+        goes (see `gfetch.utils.tuning.WorkerTuner`). The range's max must be
+        memory-safe: more threads means more chunks in memory at once. Defaults to
+        None, which uses `gfetch.utils.system.available_cpus` (the CPUs actually
+        reserved for this process, e.g. by a SLURM job's `--cpus-per-task`, not the
+        whole node).
     chunks : dict[str, int] | None
         Dask chunk sizes for the `mosaic` stage's load step, e.g. `{"x": 512, "y":
         512}`. Smaller spatial chunks bound the memory a single output chunk's
@@ -204,14 +208,23 @@ class Config:
         the default 'median') must gather its whole `time` axis into memory per
         spatial chunk, so peak memory scales with spatial chunk size regardless of
         how `time` itself is chunked. Defaults to None, which uses `gfetch.mosaic.
-        load`'s own default of `{"x": 2048, "y": 2048}`.
-    patch_chunks : int
-        Size of the `mosaic` stage's resumable/parallelizable write unit, as a
-        multiple of `chunks`' native chunk size in both `x` and `y` (e.g. `10` means
-        each unit spans a 10x10 block of native chunks). A unit is skipped entirely
-        if every native chunk it covers is already written to the output Zarr store,
-        and recomputed as a whole otherwise - never partially. Defaults to 1 (one
-        native chunk per unit).
+        load`'s own default of `{"x": 256, "y": 256}`.
+    compute_chunk_factor : int
+        Number of `chunks` per dask chunk (the `mosaic` stage's processing brick)
+        along each of `x` and `y`. Must divide `shard_factor`. Larger bricks mean
+        fewer, larger dask tasks: more memory in use, less scheduling overhead.
+        Memory per brick in flight is roughly brick side² x time steps x bands x 2
+        bytes, since the median holds the brick's whole time axis. Defaults to 1
+        (dask chunks equal to `chunks`).
+    shard_factor : int | None
+        Number of `chunks` per Zarr shard of the `mosaic` output, along each of `x`
+        and `y` (e.g. `32` means 32x32 chunks per shard). A shard is one file holding
+        several chunks, and the `mosaic` stage's unit of work: each is computed and
+        written by one task, skipped if already written, and recomputed as a whole
+        otherwise. Its output (all bands) is held in memory at once. `1` disables
+        sharding (one file per chunk). Reading a sharded store with GDAL (and QGIS)
+        needs GDAL 3.13+. Defaults to None, which uses
+        `gfetch.mosaic.resolve_shards`' default of 32.
     """
 
     time_range: TimeRangeConfig
@@ -229,9 +242,10 @@ class Config:
     resolution: float = 10.0
     n_workers: int = 4
     resampling: dict[str, str] = field(default_factory=dict)
-    n_compute_workers: int | None = None
+    n_compute_workers: Any = None
     chunks: dict[str, int] | None = None
-    patch_chunks: int = 1
+    compute_chunk_factor: int = 1
+    shard_factor: int | None = None
 
     def __post_init__(self) -> None:
         self.output_dir = Path(self.output_dir).expanduser().absolute()
@@ -437,3 +451,41 @@ def resolve_cloud_mask(cfg: Config) -> tuple[str | None, frozenset[int]]:
         return profile.cloud_mask_band, profile.cloud_mask_out
     except ValueError:
         return None, frozenset()
+
+
+def resolve_compute_workers(cfg: Config) -> tuple[int, int]:
+    """
+    Resolve a config's `n_compute_workers` into a worker-count range.
+
+    Parameters
+    ----------
+    cfg : Config
+        Job configuration.
+
+    Returns
+    -------
+    tuple[int, int]
+        `(min, max)` dask thread counts, equal when the count is fixed.
+
+    Raises
+    ------
+    ValueError
+        If `n_compute_workers` is neither None, a positive int, nor a `[min, max]`
+        pair of positive ints with `min <= max`.
+    """
+    value = cfg.n_compute_workers
+    if value is None:
+        return available_cpus(), available_cpus()
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+        return value, value
+    if (
+        isinstance(value, list | tuple)
+        and len(value) == 2
+        and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
+        and 1 <= value[0] <= value[1]
+    ):
+        return value[0], value[1]
+    raise ValueError(
+        f"n_compute_workers must be a positive int or a [min, max] pair with "
+        f"1 <= min <= max, got {value!r}"
+    )

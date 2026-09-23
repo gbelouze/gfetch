@@ -13,6 +13,7 @@ from gfetch.write import (
     validate_chunks,
     write,
     write_region,
+    write_regions,
 )
 
 
@@ -212,3 +213,84 @@ def test_store_is_complete_only_once_every_chunk_is_written(
 
     write_region(dataset.isel(x=slice(8, 16)), path, {"x": slice(8, 16), "y": slice(None)})
     assert store_is_complete(path, ["red"])
+
+
+def test_write_regions_follow_shards_with_clipped_edges(tmp_path: Path) -> None:
+    ds = xr.Dataset(
+        {"red": (("y", "x"), np.zeros((20, 12), dtype="float32"))},
+        coords={"y": np.arange(20), "x": np.arange(12)},
+    )
+    path = tmp_path / "sharded.zarr"
+    prepare_template(ds.chunk({"y": 4, "x": 4}), path, shards={"y": 8, "x": 8})
+
+    za = zarr.open_array(store=path / "red")
+    assert za.chunks == (4, 4)
+    assert za.shards == (8, 8)
+    assert write_regions(path, "red") == [
+        {"y": slice(0, 8), "x": slice(0, 8)},
+        {"y": slice(0, 8), "x": slice(8, 12)},
+        {"y": slice(8, 16), "x": slice(0, 8)},
+        {"y": slice(8, 16), "x": slice(8, 12)},
+        {"y": slice(16, 20), "x": slice(0, 8)},
+        {"y": slice(16, 20), "x": slice(8, 12)},
+    ]
+
+
+def test_write_regions_fall_back_to_chunks_when_unsharded(
+    tmp_path: Path, dataset: xr.Dataset
+) -> None:
+    path = tmp_path / "plain.zarr"
+    prepare_template(dataset.chunk({"x": 8, "y": 20}), path)
+
+    assert write_regions(path, "red") == [
+        {"y": slice(0, 20), "x": slice(0, 8)},
+        {"y": slice(0, 20), "x": slice(8, 16)},
+    ]
+
+
+def test_sharded_region_writes_are_tracked_per_shard(tmp_path: Path) -> None:
+    rng = np.random.default_rng(0)
+    ds = xr.Dataset(
+        {"red": (("y", "x"), rng.random((16, 16)).astype("float32"))},
+        coords={"y": np.arange(16), "x": np.arange(16)},
+    )
+    path = tmp_path / "sharded.zarr"
+    prepare_template(ds.chunk({"y": 4, "x": 4}), path, shards={"y": 8, "x": 8})
+    first, second, *_ = write_regions(path, "red")
+
+    # Dask chunks smaller than the shard, as `mosaic` computes them.
+    write_region(ds.isel(first).chunk({"y": 4, "x": 4}), path, first)
+
+    assert region_is_written(path, first, ["red"])
+    assert not region_is_written(path, second, ["red"])
+    assert [p.relative_to(path).as_posix() for p in path.glob("red/c/*/*")] == ["red/c/0/0"]
+    for region in write_regions(path, "red")[1:]:
+        write_region(ds.isel(region), path, region)
+    assert store_is_complete(path, ["red"])
+    xr.testing.assert_equal(xr.open_zarr(path)["red"].load(), ds["red"])
+
+
+def test_validate_chunks_raises_on_shard_mismatch(tmp_path: Path, dataset: xr.Dataset) -> None:
+    path = tmp_path / "sharded.zarr"
+    prepare_template(dataset.chunk({"x": 4, "y": 20}), path, shards={"x": 8})
+
+    validate_chunks(path, ["red"], {"x": 4, "y": 20}, {"x": 8})
+    with pytest.raises(ValueError, match="shard size"):
+        validate_chunks(path, ["red"], {"x": 4, "y": 20}, {"x": 16})
+    with pytest.raises(ValueError, match="shard size"):
+        validate_chunks(path, ["red"], {"x": 4, "y": 20})
+
+
+def test_prepare_template_uses_explicit_chunks_over_dask_chunks(tmp_path: Path) -> None:
+    ds = xr.Dataset(
+        {"red": (("y", "x"), np.zeros((16, 16), dtype="float32"))},
+        coords={"y": np.arange(16), "x": np.arange(16)},
+    )
+    path = tmp_path / "sharded.zarr"
+    prepare_template(
+        ds.chunk({"y": 8, "x": 8}), path, shards={"y": 16, "x": 16}, chunks={"y": 4, "x": 4}
+    )
+
+    za = zarr.open_array(store=path / "red")
+    assert za.chunks == (4, 4)
+    assert za.shards == (16, 16)
