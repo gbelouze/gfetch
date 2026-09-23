@@ -204,7 +204,7 @@ def test_resolve_bands_and_cloud_mask_fall_back_to_profile(tmp_path: Path) -> No
     cfg = load(config_path, "s2")
 
     assert resolve_bands(cfg) == ["red", "green", "blue"]
-    assert resolve_cloud_mask(cfg) == ("scl", frozenset({0, 1, 3, 8, 9, 10}))
+    assert resolve_cloud_mask(cfg) == ("scl", frozenset({0, 1, 3, 7, 8, 9, 10}))
 
 
 def test_resolve_bands_and_cloud_mask_config_overrides_profile(tmp_path: Path) -> None:

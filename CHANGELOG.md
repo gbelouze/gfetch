@@ -35,5 +35,6 @@ Each release can have sections: "Added", "Changed", "Deprecated", "Removed", "Fi
 
 ### Changed
 
+- Sentinel-2 cloud masking also masks SCL class 7 (unclassified, in practice largely low-probability cloud).
 - `Config.zarr_path` is now a method taking a `CRS` (one output store per UTM zone) instead of a fixed property.
 - Job configs are now unified: one YAML file per job, with generic top-level defaults overridable per satellite under reserved `s1`/`s2`/`gedi`/`custom` sections, instead of one flat file per satellite. The CLI follows: `gfetch <satellite> search|download|mosaic|pack|clean <config>` (`gfetch custom <verb> <name> <config>` for a `custom:` entry), `gfetch gedi <config>` unchanged.

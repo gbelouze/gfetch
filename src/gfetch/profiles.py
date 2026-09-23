@@ -35,8 +35,9 @@ class SatelliteProfile:
 
 
 # Sentinel-2 L2A Scene Classification (SCL) values: 0 no-data, 1 saturated/defective,
-# 3 cloud shadow, 8/9 cloud medium/high probability, 10 thin cirrus.
-_SENTINEL2_SCL_MASK_OUT = frozenset({0, 1, 3, 8, 9, 10})
+# 3 cloud shadow, 7 unclassified (in practice largely low-probability cloud), 8/9 cloud
+# medium/high probability, 10 thin cirrus.
+_SENTINEL2_SCL_MASK_OUT = frozenset({0, 1, 3, 7, 8, 9, 10})
 
 PROFILES: dict[str, SatelliteProfile] = {
     "sentinel-2": SatelliteProfile(
