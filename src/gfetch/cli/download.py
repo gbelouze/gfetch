@@ -4,15 +4,14 @@ from pathlib import Path
 
 import pystac
 
-from gfetch.cli.config import load
+from gfetch.cli.config import load, resolve_bands, resolve_cloud_mask
 from gfetch.download import download_items
-from gfetch.profiles import get_profile
 from gfetch.utils.progress import default_bar
 
 log = logging.getLogger(__name__)
 
 
-def download(config_path: Path) -> None:
+def download(config_path: Path, satellite_key: str) -> None:
     """
     Download the assets of this job's searched items into the local cache, and write
     the local-href items as this job's `download` -> `mosaic` hand-off file.
@@ -21,17 +20,20 @@ def download(config_path: Path) -> None:
     ----------
     config_path : Path
         Path to the configuration YAML file.
+    satellite_key : str
+        Which satellite to load from `config_path` - `'s1'`, `'s2'`, or a name under
+        its `custom:` section. See `gfetch.cli.config.load`.
     """
-    cfg = load(config_path)
+    cfg = load(config_path, satellite_key)
     if not cfg.items_path.exists():
         log.error(f"{cfg.items_path} not found - run `gfetch search` first.")
         return
 
     items = list(pystac.ItemCollection.from_file(cfg.items_path))
-    profile = get_profile(cfg.satellite)
-    asset_keys = list(cfg.bands) if cfg.bands else list(profile.default_bands)
-    if profile.cloud_mask_band is not None and profile.cloud_mask_band not in asset_keys:
-        asset_keys.append(profile.cloud_mask_band)
+    mask_band, mask_out = resolve_cloud_mask(cfg)
+    asset_keys = resolve_bands(cfg)
+    if mask_band is not None and mask_band not in asset_keys:
+        asset_keys.append(mask_band)
     log.debug(f"Resolved asset keys: {asset_keys}")
 
     with default_bar() as progress:

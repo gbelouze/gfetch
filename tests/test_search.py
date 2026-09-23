@@ -1,6 +1,8 @@
 import datetime
+from dataclasses import dataclass
 
 import pystac
+import pystac_client
 import pytest
 
 from gfetch.search import _dedupe_sentinel2_processing_baseline, search
@@ -34,6 +36,88 @@ def test_dedupe_sentinel2_processing_baseline_keeps_distinct_tiles_and_dates() -
     deduped = _dedupe_sentinel2_processing_baseline([tile_a, tile_b, other_date])
 
     assert {item.id for item in deduped} == {"a", "b", "c"}
+
+
+@dataclass
+class _FakePage:
+    items: list[pystac.Item]
+
+
+class _FakeResult:
+    def __init__(self, items: list[pystac.Item]) -> None:
+        self._items = items
+
+    def matched(self) -> int:
+        return len(self._items)
+
+    def pages(self):
+        yield _FakePage(self._items)
+
+
+class _FakeCatalog:
+    def __init__(
+        self, requested_collections: list[list[str]], requested_kwargs: list[dict] | None = None
+    ) -> None:
+        self._requested = requested_collections
+        self._requested_kwargs = requested_kwargs
+
+    def search(self, *, collections, bbox, intersects, datetime, query, max_items):
+        self._requested.append(collections)
+        if self._requested_kwargs is not None:
+            self._requested_kwargs.append({"bbox": bbox, "intersects": intersects})
+        return _FakeResult([])
+
+
+def test_search_uses_explicit_collection_bypassing_source_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unregistered satellite name would make `source.collection()` raise - the
+    explicit `collection` must bypass that lookup entirely, never calling it.
+    """
+    requested_collections: list[list[str]] = []
+    monkeypatch.setattr(
+        pystac_client.Client,
+        "open",
+        staticmethod(lambda url: _FakeCatalog(requested_collections)),
+    )
+
+    source = get_source("earthsearch")
+    search(
+        source,
+        "not-a-registered-satellite",
+        bbox=(2.0, 48.0, 2.1, 48.1),
+        datetime="2024-01-01/2024-06-01",
+        collection="my-explicit-collection",
+    )
+
+    assert requested_collections == [["my-explicit-collection"]]
+
+
+def test_search_intersects_drops_bbox_from_the_actual_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The STAC API spec treats `bbox`/`intersects` as mutually exclusive - passing
+    `intersects` must drop `bbox` from the request `search()` actually sends, even
+    though `bbox` is still required as an argument (used for logging).
+    """
+    requested_kwargs: list[dict] = []
+    monkeypatch.setattr(
+        pystac_client.Client,
+        "open",
+        staticmethod(lambda url: _FakeCatalog([], requested_kwargs)),
+    )
+
+    source = get_source("earthsearch")
+    polygon = {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]}
+    search(
+        source,
+        "sentinel-2",
+        bbox=(2.0, 48.0, 2.1, 48.1),
+        datetime="2024-01-01/2024-06-01",
+        intersects=polygon,
+    )
+
+    assert requested_kwargs == [{"bbox": None, "intersects": polygon}]
 
 
 @pytest.mark.slow

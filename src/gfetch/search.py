@@ -52,6 +52,8 @@ def search(
     datetime: str,
     max_items: int | None = None,
     query: dict | None = None,
+    collection: str | None = None,
+    intersects: dict | None = None,
 ) -> list[pystac.Item]:
     """
     Search a STAC source for items matching an AOI and time range.
@@ -62,9 +64,10 @@ def search(
         STAC API source to search against.
     satellite : str
         Satellite/profile name (e.g. 'sentinel-2'), resolved to a collection id via
-        `source`.
+        `source` unless `collection` is given directly.
     bbox : tuple[float, float, float, float]
-        Bounding box (min_lon, min_lat, max_lon, max_lat) in EPSG:4326.
+        Bounding box (min_lon, min_lat, max_lon, max_lat) in EPSG:4326. Still used
+        for logging even when `intersects` is given.
     datetime : str
         Date/time range in STAC API format (e.g. '2024-01-01/2024-06-01').
     max_items : int | None
@@ -72,13 +75,24 @@ def search(
     query : dict | None
         Additional STAC API query-extension filters (e.g. cloud cover). Defaults to
         None.
+    collection : str | None
+        Explicit STAC collection id, used verbatim instead of resolving `satellite`
+        through `source.collection`. Defaults to None, which resolves `satellite` as
+        usual - needed for a satellite with no `gfetch.sources` registry entry.
+    intersects : dict | None
+        GeoJSON-like geometry mapping (e.g. `shapely.geometry.mapping(polygon)`),
+        used instead of `bbox` for the actual STAC query - the STAC API spec treats
+        `bbox`/`intersects` as mutually exclusive, so `bbox` is dropped from the
+        request when this is given (a `gfetch.countries`-derived AOI passes its
+        exact country polygon here rather than just its bounding box). Defaults to
+        None (search by `bbox`).
 
     Returns
     -------
     list[pystac.Item]
         Matching STAC items.
     """
-    collection = source.collection(satellite)
+    collection = collection or source.collection(satellite)
     log.info(
         f"Searching {source.name} collection {collection!r} for bbox={bbox} datetime={datetime}"
     )
@@ -86,7 +100,8 @@ def search(
     catalog = pystac_client.Client.open(source.api_url)
     result = catalog.search(
         collections=[collection],
-        bbox=bbox,
+        bbox=None if intersects is not None else bbox,
+        intersects=intersects,
         datetime=datetime,
         query=query,
         max_items=max_items,

@@ -9,8 +9,8 @@ def test_init_writes_loadable_config(tmp_path: Path) -> None:
     init(config_path)
 
     assert config_path.exists()
-    cfg = load(config_path)
-    assert cfg.aoi.bbox
+    cfg = load(config_path, "s2")
+    assert cfg.resolved_aoi.bbox
     assert cfg.time_range.datetime
     assert cfg.satellite == "sentinel-2"
 
@@ -32,5 +32,5 @@ def test_init_overwrites_with_force(tmp_path: Path) -> None:
 
     init(config_path, force=True)
 
-    cfg = load(config_path)
+    cfg = load(config_path, "s2")
     assert cfg.satellite == "sentinel-2"

@@ -24,6 +24,7 @@ __all__ = [
     "prepare_template",
     "region_is_written",
     "store_initialized",
+    "store_is_complete",
     "validate_chunks",
     "write",
     "write_region",
@@ -89,7 +90,7 @@ def write(ds: xr.Dataset, path: Path, *, mode: _ZarrMode = "w") -> None:
     ds = _restore_grid_mapping(ds)
     log.debug(f"Writing dataset {dict(ds.sizes)} to {path} (mode={mode})")
     log_chunk_footprint(ds, log)
-    ds.to_zarr(path, mode=mode)
+    ds.to_zarr(path, mode=mode, write_empty_chunks=True)
     log.info(f"Wrote dataset to {path}")
 
 
@@ -217,7 +218,10 @@ def write_region(ds: xr.Dataset, path: Path, region: dict[str, slice]) -> None:
     # `region`; scalar coordinates like a CRS grid mapping variable must be dropped,
     # since they were already written once by prepare_template.
     ds = ds.drop_vars([c for c in ds.coords if c not in ds.dims])
-    ds.to_zarr(path, region=region)
+    # zarr-python skips writing chunks that are entirely fill value (e.g. an all-NaN
+    # nodata patch) by default, which `region_is_written` couldn't tell apart from a
+    # chunk that was never written.
+    ds.to_zarr(path, region=region, write_empty_chunks=True)
     log.debug(f"Wrote region {region} to {path}")
 
 
@@ -238,7 +242,7 @@ def region_is_written(path: Path, region: dict[str, slice], variables: Sequence[
         Zarr store path, already initialized via `prepare_template`.
     region : dict[str, slice]
         Mapping from dimension name to the region to check, as passed to
-        `write_region`.
+        `write_region`. A dimension missing from `region` is checked in full.
     variables : Sequence[str]
         Data variables to check; the region only counts as written once every listed
         variable's covering chunks are all present.
@@ -262,7 +266,7 @@ def region_is_written(path: Path, region: dict[str, slice], variables: Sequence[
             axis_chunk_ranges = []
             for dim, chunk_size, size in zip(dims, za.chunks, za.shape, strict=True):
                 assert dim is not None, f"{path / var} has an unnamed dimension"
-                sl = region[dim]
+                sl = region.get(dim, slice(None))
                 start = sl.start if sl.start is not None else 0
                 stop = sl.stop if sl.stop is not None else size
                 axis_chunk_ranges.append(range(start // chunk_size, -(-stop // chunk_size)))
@@ -271,3 +275,22 @@ def region_is_written(path: Path, region: dict[str, slice], variables: Sequence[
         return all(await asyncio.gather(*checks))
 
     return asyncio.run(_all_written())
+
+
+def store_is_complete(path: Path, variables: Sequence[str]) -> bool:
+    """
+    Check whether every chunk of every variable in `variables` has been written.
+
+    Parameters
+    ----------
+    path : Path
+        Zarr store path.
+    variables : Sequence[str]
+        Data variables to check (e.g. the mosaic's bands).
+
+    Returns
+    -------
+    bool
+        True if `path` is an initialized store whose `variables` are fully written.
+    """
+    return store_initialized(path) and region_is_written(path, {}, variables)

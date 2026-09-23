@@ -9,6 +9,7 @@ from odc.geo.geobox import GeoBox
 
 from gfetch.cli.config import Config, load
 from gfetch.cli.mosaic import mosaic as mosaic_cmd
+from gfetch.finalize import pack_store
 from gfetch.mosaic import group_by_utm_zone
 from gfetch.write import region_is_written
 
@@ -36,13 +37,13 @@ def _write_fake_items(cfg: Config) -> None:
     # (pystac drops bbox along with it), so this needs a real matching polygon -
     # unlike test_mosaic.py's in-memory-only `_item` helper, this item is read back
     # from disk exactly like `gfetch mosaic` reads real ones.
-    left, bottom, right, top = cfg.aoi.bbox
+    left, bottom, right, top = cfg.resolved_aoi.bbox
     corners = [[left, bottom], [right, bottom], [right, top], [left, top], [left, bottom]]
     geometry = {"type": "Polygon", "coordinates": [corners]}
     item = pystac.Item(
         id="fake",
         geometry=geometry,
-        bbox=list(cfg.aoi.bbox),
+        bbox=list(cfg.resolved_aoi.bbox),
         datetime=datetime.datetime(2024, 3, 1, tzinfo=datetime.UTC),
         properties={},
     )
@@ -70,14 +71,14 @@ def _fake_build_mosaic(calls: list[GeoBox]) -> object:
 
 def test_mosaic_computes_every_patch_on_a_fresh_store(tmp_path: Path, monkeypatch) -> None:
     cfg_path = _write_config(tmp_path / "config.yaml")
-    cfg = load(cfg_path)
+    cfg = load(cfg_path, "s2")
     _write_fake_items(cfg)
 
     calls: list[GeoBox] = []
     monkeypatch.setattr("gfetch.cli.mosaic.zone_geobox", _fake_zone_geobox)
     monkeypatch.setattr("gfetch.cli.mosaic.build_mosaic", _fake_build_mosaic(calls))
 
-    mosaic_cmd(cfg_path)
+    mosaic_cmd(cfg_path, "s2")
 
     # 1 call to build the lazy template + 4 patches (2x2 native chunks per patch over
     # a 16x16 grid with 4x4 native chunks).
@@ -86,18 +87,18 @@ def test_mosaic_computes_every_patch_on_a_fresh_store(tmp_path: Path, monkeypatc
 
 def test_mosaic_resumes_by_skipping_already_written_patches(tmp_path: Path, monkeypatch) -> None:
     cfg_path = _write_config(tmp_path / "config.yaml")
-    cfg = load(cfg_path)
+    cfg = load(cfg_path, "s2")
     _write_fake_items(cfg)
 
     monkeypatch.setattr("gfetch.cli.mosaic.zone_geobox", _fake_zone_geobox)
 
     calls: list[GeoBox] = []
     monkeypatch.setattr("gfetch.cli.mosaic.build_mosaic", _fake_build_mosaic(calls))
-    mosaic_cmd(cfg_path)
+    mosaic_cmd(cfg_path, "s2")
     assert len(calls) == 5
 
     calls.clear()
-    mosaic_cmd(cfg_path)
+    mosaic_cmd(cfg_path, "s2")
     # Store already initialized (skipped before ever building the template dataset)
     # and every patch already written - nothing left to call build_mosaic for at all.
     assert len(calls) == 0
@@ -105,24 +106,45 @@ def test_mosaic_resumes_by_skipping_already_written_patches(tmp_path: Path, monk
 
 def test_mosaic_splits_disjoint_patches_across_tasks(tmp_path: Path, monkeypatch) -> None:
     cfg_path = _write_config(tmp_path / "config.yaml")
-    cfg = load(cfg_path)
+    cfg = load(cfg_path, "s2")
     _write_fake_items(cfg)
 
     monkeypatch.setattr("gfetch.cli.mosaic.zone_geobox", _fake_zone_geobox)
 
     calls_0: list[GeoBox] = []
     monkeypatch.setattr("gfetch.cli.mosaic.build_mosaic", _fake_build_mosaic(calls_0))
-    mosaic_cmd(cfg_path, task_id=0, n_tasks=2)
+    mosaic_cmd(cfg_path, "s2", task_id=0, n_tasks=2)
     assert len(calls_0) == 1 + 2  # template + this task's half of the 4 patches
 
     calls_1: list[GeoBox] = []
     monkeypatch.setattr("gfetch.cli.mosaic.build_mosaic", _fake_build_mosaic(calls_1))
-    mosaic_cmd(cfg_path, task_id=1, n_tasks=2)
+    mosaic_cmd(cfg_path, "s2", task_id=1, n_tasks=2)
     # Store already initialized by task 0 - just this task's half of the 4 patches,
     # disjoint from task 0's, nothing skipped.
     assert len(calls_1) == 2
 
     items = list(pystac.ItemCollection.from_file(cfg.cached_items_path))
-    (crs,) = group_by_utm_zone(items, cfg.aoi.bbox)
+    (crs,) = group_by_utm_zone(items, cfg.resolved_aoi.bbox)
     path = cfg.zarr_path(crs)
     assert region_is_written(path, {"y": slice(0, 16), "x": slice(0, 16)}, ["red"])
+
+
+def test_mosaic_skips_packed_zone_without_recreating_its_store(tmp_path: Path, monkeypatch) -> None:
+    cfg_path = _write_config(tmp_path / "config.yaml")
+    cfg = load(cfg_path, "s2")
+    _write_fake_items(cfg)
+
+    monkeypatch.setattr("gfetch.cli.mosaic.zone_geobox", _fake_zone_geobox)
+    calls: list[GeoBox] = []
+    monkeypatch.setattr("gfetch.cli.mosaic.build_mosaic", _fake_build_mosaic(calls))
+    mosaic_cmd(cfg_path, "s2")
+
+    items = list(pystac.ItemCollection.from_file(cfg.cached_items_path))
+    (crs,) = group_by_utm_zone(items, cfg.resolved_aoi.bbox)
+    pack_store(cfg.zarr_path(crs), ["red"], remove_source=True)
+
+    calls.clear()
+    mosaic_cmd(cfg_path, "s2")
+
+    assert calls == []
+    assert not cfg.zarr_path(crs).exists()

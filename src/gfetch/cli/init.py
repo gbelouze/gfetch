@@ -34,8 +34,10 @@ def init(output: Path | None = None, force: bool = False) -> None:
         "aoi": {"left": 2.2, "bottom": 48.7, "right": 2.5, "top": 49.0},
         "time_range": {"start": "2024-01-01", "end": "2024-06-01"},
         "output_dir": str(output_path.parent),
-        "satellite": "sentinel-2",
-        "source": "earthsearch",
+        # Per-satellite sections override the generic fields above for their own
+        # `gfetch <key> <verb>` run - see `gfetch.cli.config.load`. `s1`/`gedi`/
+        # `custom` sections are also available; add whichever you need.
+        "s2": {"source": "earthsearch", "bands": ["red", "green", "blue"]},
     }
 
     with output_path.open("w") as f:

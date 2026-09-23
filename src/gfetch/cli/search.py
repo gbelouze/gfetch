@@ -41,7 +41,7 @@ def _build_query(cfg: Config) -> dict | None:
     return query or None
 
 
-def search(config_path: Path) -> None:
+def search(config_path: Path, satellite_key: str) -> None:
     """
     Search a STAC source for items matching a configuration's AOI/time range, and
     write the results as this job's `search` -> `download` hand-off file.
@@ -50,12 +50,32 @@ def search(config_path: Path) -> None:
     ----------
     config_path : Path
         Path to the configuration YAML file.
+    satellite_key : str
+        Which satellite to load from `config_path` - `'s1'`, `'s2'`, or a name under
+        its `custom:` section. See `gfetch.cli.config.load`.
     """
-    cfg = load(config_path)
+    cfg = load(config_path, satellite_key)
     source = get_source(cfg.source)
     query = _build_query(cfg)
     log.debug(f"query={query}")
-    items = search_items(source, cfg.satellite, cfg.aoi.bbox, cfg.time_range.datetime, query=query)
+
+    intersects = None
+    if cfg.countries is not None:
+        import shapely
+
+        from gfetch.countries import resolve_country_polygon
+
+        intersects = shapely.geometry.mapping(resolve_country_polygon(cfg.countries))
+
+    items = search_items(
+        source,
+        cfg.satellite,
+        cfg.resolved_aoi.bbox,
+        cfg.time_range.datetime,
+        query=query,
+        collection=cfg.collection,
+        intersects=intersects,
+    )
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     pystac.ItemCollection(items).save_object(str(cfg.items_path))

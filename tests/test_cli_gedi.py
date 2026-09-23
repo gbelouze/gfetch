@@ -32,7 +32,7 @@ def test_gedi_cmd_resolves_rh_into_named_columns(
 ) -> None:
     captured = {}
 
-    def fake_fetch(bbox, time_range=None, fields=None, anc_fields=None):
+    def fake_fetch(bbox, time_range=None, fields=None, anc_fields=None, progress=None):
         captured["bbox"] = bbox
         captured["time_range"] = time_range
         captured["fields"] = fields
@@ -67,7 +67,7 @@ def test_gedi_cmd_defaults_to_no_time_range_or_anc_fields(
 ) -> None:
     captured = {}
 
-    def fake_fetch(bbox, time_range=None, fields=None, anc_fields=None):
+    def fake_fetch(bbox, time_range=None, fields=None, anc_fields=None, progress=None):
         captured["time_range"] = time_range
         captured["anc_fields"] = anc_fields
         return _fake_gdf(anc_fields)

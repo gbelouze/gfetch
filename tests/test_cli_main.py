@@ -1,0 +1,108 @@
+from pathlib import Path
+
+import pytest
+
+from gfetch.cli.main import app
+
+
+def test_builtin_satellite_commands_dispatch_with_correct_satellite_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple] = []
+
+    def fake_search(config_path: Path, satellite_key: str) -> None:
+        calls.append(("search", config_path, satellite_key))
+
+    def fake_download(config_path: Path, satellite_key: str) -> None:
+        calls.append(("download", config_path, satellite_key))
+
+    def fake_mosaic(
+        config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: int = 1
+    ) -> None:
+        calls.append(("mosaic", config_path, satellite_key, task_id, n_tasks))
+
+    monkeypatch.setattr("gfetch.cli.search.search", fake_search)
+    monkeypatch.setattr("gfetch.cli.download.download", fake_download)
+    monkeypatch.setattr("gfetch.cli.mosaic.mosaic", fake_mosaic)
+
+    app(["s1", "search", "config.yaml"], result_action="return_value")
+    app(["s2", "download", "config.yaml"], result_action="return_value")
+    app(
+        ["s2", "mosaic", "config.yaml", "--task-id", "1", "--n-tasks", "2"],
+        result_action="return_value",
+    )
+
+    assert calls == [
+        ("search", Path("config.yaml"), "s1"),
+        ("download", Path("config.yaml"), "s2"),
+        ("mosaic", Path("config.yaml"), "s2", 1, 2),
+    ]
+
+
+def test_custom_satellite_commands_pass_through_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple] = []
+
+    def fake_search(config_path: Path, satellite_key: str) -> None:
+        calls.append(("search", config_path, satellite_key))
+
+    def fake_download(config_path: Path, satellite_key: str) -> None:
+        calls.append(("download", config_path, satellite_key))
+
+    def fake_mosaic(
+        config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: int = 1
+    ) -> None:
+        calls.append(("mosaic", config_path, satellite_key, task_id, n_tasks))
+
+    monkeypatch.setattr("gfetch.cli.search.search", fake_search)
+    monkeypatch.setattr("gfetch.cli.download.download", fake_download)
+    monkeypatch.setattr("gfetch.cli.mosaic.mosaic", fake_mosaic)
+
+    app(["custom", "search", "landsat8", "config.yaml"], result_action="return_value")
+    app(["custom", "download", "landsat8", "config.yaml"], result_action="return_value")
+    app(["custom", "mosaic", "landsat8", "config.yaml"], result_action="return_value")
+
+    assert calls == [
+        ("search", Path("config.yaml"), "landsat8"),
+        ("download", Path("config.yaml"), "landsat8"),
+        ("mosaic", Path("config.yaml"), "landsat8", 0, 1),
+    ]
+
+
+def test_gedi_command_stays_bare(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[Path] = []
+
+    def fake_gedi(config_path: Path) -> None:
+        calls.append(config_path)
+
+    monkeypatch.setattr("gfetch.cli.gedi.gedi", fake_gedi)
+
+    app(["gedi", "config.yaml"], result_action="return_value")
+
+    assert calls == [Path("config.yaml")]
+
+
+def test_pack_and_clean_dispatch_with_correct_satellite_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple] = []
+
+    def fake_pack(config_path: Path, satellite_key: str, *, remove_store: bool = False) -> None:
+        calls.append(("pack", config_path, satellite_key, remove_store))
+
+    def fake_clean(config_path: Path, satellite_key: str) -> None:
+        calls.append(("clean", config_path, satellite_key))
+
+    monkeypatch.setattr("gfetch.cli.finalize.pack", fake_pack)
+    monkeypatch.setattr("gfetch.cli.finalize.clean", fake_clean)
+
+    app(["s2", "pack", "config.yaml", "--remove-store"], result_action="return_value")
+    app(["s1", "clean", "config.yaml"], result_action="return_value")
+    app(["custom", "pack", "landsat8", "config.yaml"], result_action="return_value")
+    app(["custom", "clean", "landsat8", "config.yaml"], result_action="return_value")
+
+    assert calls == [
+        ("pack", Path("config.yaml"), "s2", True),
+        ("clean", Path("config.yaml"), "s1"),
+        ("pack", Path("config.yaml"), "landsat8", False),
+        ("clean", Path("config.yaml"), "landsat8"),
+    ]

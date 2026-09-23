@@ -9,6 +9,7 @@ from gfetch.write import (
     prepare_template,
     region_is_written,
     store_initialized,
+    store_is_complete,
     validate_chunks,
     write,
     write_region,
@@ -184,3 +185,30 @@ def test_disjoint_region_write_workers_do_not_overlap(tmp_path: Path, dataset: x
     partial = xr.open_zarr(template_path)
     assert np.array_equal(partial["red"].values[:, :mid], dataset["red"].values[:, :mid])
     assert not np.array_equal(partial["red"].values[:, mid:], dataset["red"].values[:, mid:])
+
+
+def test_region_is_written_true_for_all_nodata_region(tmp_path: Path) -> None:
+    ds = xr.Dataset(
+        {"red": (("y", "x"), np.full((20, 16), np.nan, dtype="float32"))},
+        coords={"y": np.arange(20), "x": np.arange(16)},
+    )
+    path = tmp_path / "regions.zarr"
+    prepare_template(ds.chunk({"x": 8, "y": 20}), path)
+
+    write_region(ds.isel(x=slice(0, 8)), path, {"x": slice(0, 8), "y": slice(None)})
+
+    assert region_is_written(path, {"x": slice(0, 8), "y": slice(0, 20)}, ["red"])
+
+
+def test_store_is_complete_only_once_every_chunk_is_written(
+    tmp_path: Path, dataset: xr.Dataset
+) -> None:
+    path = tmp_path / "regions.zarr"
+    assert not store_is_complete(path, ["red"])
+
+    prepare_template(dataset.chunk({"x": 8, "y": 20}), path)
+    write_region(dataset.isel(x=slice(0, 8)), path, {"x": slice(0, 8), "y": slice(None)})
+    assert not store_is_complete(path, ["red"])
+
+    write_region(dataset.isel(x=slice(8, 16)), path, {"x": slice(8, 16), "y": slice(None)})
+    assert store_is_complete(path, ["red"])

@@ -1,13 +1,33 @@
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 from odc.geo.crs import CRS
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
+
+from gfetch.profiles import get_profile
 
 log = logging.getLogger(__name__)
 
-__all__ = ["AOIConfig", "Config", "TimeRangeConfig", "load"]
+__all__ = [
+    "AOIConfig",
+    "BUILTIN_SATELLITES",
+    "Config",
+    "TimeRangeConfig",
+    "load",
+    "resolve_aoi",
+    "resolve_bands",
+    "resolve_cloud_mask",
+]
+
+# Section keys reserved in a unified job config file (see `load`'s docstring) - not
+# valid `Config` field names, so they're stripped out of the "generic" dict before
+# merging a satellite's section over it.
+RESERVED_SECTION_KEYS = frozenset({"s1", "s2", "gedi", "custom"})
+
+# CLI satellite key -> canonical `gfetch.profiles`/`gfetch.sources` satellite name,
+# force-set by `load` regardless of what a config's section itself contains.
+BUILTIN_SATELLITES: dict[str, str] = {"s1": "sentinel-1", "s2": "sentinel-2"}
 
 
 @dataclass
@@ -41,6 +61,46 @@ class AOIConfig:
             The AOI as (min_lon, min_lat, max_lon, max_lat).
         """
         return (self.left, self.bottom, self.right, self.top)
+
+
+def resolve_aoi(aoi: AOIConfig | None, countries: list[str] | None, *, context: str) -> AOIConfig:
+    """
+    Resolve a job's effective AOI: either `aoi` as given, or the bounding box of
+    the union of `countries`' boundaries (via `gfetch.countries.
+    resolve_country_polygon`) - mirrors geefetch's `aoi.country` field, which is
+    likewise resolved to a bounding box for the actual data request (its own use of
+    the exact polygon shape is a coarse, tile-level filter downstream, never a
+    per-pixel clip). Exactly one of `aoi`/`countries` must be given.
+
+    Parameters
+    ----------
+    aoi : AOIConfig | None
+        Explicit AOI, if given directly.
+    countries : list[str] | None
+        Country names to derive the AOI from, if `aoi` wasn't given directly.
+    context : str
+        Description of what's being resolved (e.g. the config path), used only to
+        make the "exactly one of" error message identify which load failed.
+
+    Returns
+    -------
+    AOIConfig
+        `aoi` unchanged, or the bounding box of `countries`' union.
+
+    Raises
+    ------
+    ValueError
+        If both or neither of `aoi`/`countries` are given.
+    """
+    if (aoi is None) == (countries is None):
+        raise ValueError(f"{context}: exactly one of `aoi` or `countries` must be given.")
+    if aoi is not None:
+        return aoi
+    assert countries is not None
+    from gfetch.countries import resolve_country_polygon
+
+    min_lon, min_lat, max_lon, max_lat = resolve_country_polygon(countries).bounds
+    return AOIConfig(left=min_lon, bottom=min_lat, right=max_lon, top=max_lat)
 
 
 @dataclass
@@ -77,13 +137,18 @@ class Config:
 
     Attributes
     ----------
-    aoi : AOIConfig
-        Area of interest.
     time_range : TimeRangeConfig
         Time range to search.
     output_dir : Path
         Directory holding the search/download hand-off files, the downloaded asset
         cache, and the output Zarr store.
+    aoi : AOIConfig | None
+        Area of interest. Exactly one of `aoi`/`countries` must be given.
+    countries : list[str] | None
+        Country names to derive the AOI from instead of giving `aoi` directly - the
+        AOI becomes the bounding box of their union (see `gfetch.countries.
+        resolve_country_polygon` for name matching). Exactly one of `aoi`/
+        `countries` must be given.
     satellite : str
         Satellite/profile name (e.g. 'sentinel-2'). Defaults to 'sentinel-2'.
     source : str
@@ -99,6 +164,22 @@ class Config:
         Restrict the search to one `sat:orbit_state` ('ascending' or 'descending'),
         e.g. to avoid blending SAR backscatter from different look geometries into one
         composite. Defaults to None (no filter, both orbit states included).
+    collection : str | None
+        Explicit STAC collection id, used verbatim instead of resolving `satellite`
+        through `gfetch.sources.StacSource.collection`. Required for a `custom`
+        satellite section (there's no registry entry to resolve from); ignored for a
+        built-in (`s1`/`s2`) satellite. Defaults to None.
+    cloud_mask_band : str | None
+        Asset key of the cloud-mask classification band, overriding
+        `gfetch.profiles.SatelliteProfile.cloud_mask_band`. Required for a `custom`
+        satellite that wants cloud masking (there's no profile to default from);
+        optional for a built-in satellite, where it overrides the profile's own
+        band. Defaults to None (no override - built-ins keep their profile's band,
+        custom satellites get no masking).
+    cloud_mask_out : list[int]
+        Classification values to mask out, overriding
+        `gfetch.profiles.SatelliteProfile.cloud_mask_out`. Only meaningful together
+        with `cloud_mask_band`. Defaults to an empty list (no override).
     resolution : float
         Output pixel resolution, in the target CRS's units (meters, for UTM).
         Defaults to 10.0.
@@ -133,14 +214,18 @@ class Config:
         native chunk per unit).
     """
 
-    aoi: AOIConfig
     time_range: TimeRangeConfig
     output_dir: Path
+    aoi: AOIConfig | None = None
+    countries: list[str] | None = None
     satellite: str = "sentinel-2"
     source: str = "earthsearch"
     bands: list[str] | None = None
     max_cloud_cover: float | None = None
     orbit_state: str | None = None
+    collection: str | None = None
+    cloud_mask_band: str | None = None
+    cloud_mask_out: list[int] = field(default_factory=list)
     resolution: float = 10.0
     n_workers: int = 4
     resampling: dict[str, str] = field(default_factory=dict)
@@ -150,6 +235,20 @@ class Config:
 
     def __post_init__(self) -> None:
         self.output_dir = Path(self.output_dir).expanduser().absolute()
+
+    @property
+    def resolved_aoi(self) -> AOIConfig:
+        """
+        Returns
+        -------
+        AOIConfig
+            `aoi`, resolved by `load()` (from `countries`, if `aoi` wasn't given
+            directly) - never None on a `Config` returned by `load()`. `aoi` itself
+            stays `AOIConfig | None` at the schema level so OmegaConf accepts a
+            config that gives `countries` instead.
+        """
+        assert self.aoi is not None, "aoi not yet resolved - build this Config via load()"
+        return self.aoi
 
     @property
     def cache_dir(self) -> Path:
@@ -203,25 +302,138 @@ class Config:
         return self.output_dir / f"mosaic_epsg{crs.epsg}.zarr"
 
 
-def load(path: Path) -> Config:
+def load(path: Path, satellite_key: str) -> Config:
     """
-    Load and validate a configuration from a YAML file.
+    Load and validate one satellite's job configuration from a unified YAML file.
+
+    The file's top level holds generic defaults; only the ones that are also
+    `Config` fields apply here (a generic field that's only meaningful elsewhere,
+    e.g. GEDI's `fields`, is ignored, not an error). The reserved section keys
+    `s1`/`s2`/`gedi`/`custom` override those defaults for that satellite only
+    (`gedi` is irrelevant here - `gfetch.cli.gedi_config.load` reads it), and the
+    selected section *is* validated strictly (an unknown key there raises). A
+    built-in (`s1`/`s2`) section's `satellite` is force-set from `BUILTIN_SATELLITES`
+    regardless of what the section itself contains; a `custom.<name>` section must
+    supply `collection` and `bands` explicitly (there's no `gfetch.profiles`/
+    `gfetch.sources` registry entry for an arbitrary satellite name), and defaults
+    `satellite` to `<name>` if not given. Either way, `output_dir` defaults to
+    `<generic output_dir>/<satellite_key>` unless the section sets its own.
 
     Parameters
     ----------
     path : Path
         Path to the configuration YAML file.
+    satellite_key : str
+        Which satellite to load: `'s1'`, `'s2'`, or a name under the file's
+        `custom:` section.
 
     Returns
     -------
     Config
         Fully validated configuration object.
+
+    Raises
+    ------
+    ValueError
+        If `satellite_key` is neither a built-in nor a key under `custom:`, a
+        `custom` section is missing `collection`/`bands`, or neither/both of
+        `aoi`/`countries` are given (see `resolve_aoi`).
     """
-    log.debug(f"Loading config from {path}")
-    from_yaml = OmegaConf.load(path)
+    log.debug(f"Loading config from {path} (satellite={satellite_key!r})")
+    raw = OmegaConf.load(path)
+    assert isinstance(raw, DictConfig), f"{path} must be a YAML mapping, not a list"
+    config_field_names = {f.name for f in fields(Config)}
+    generic = OmegaConf.create(
+        {k: v for k, v in raw.items() if k in config_field_names and k not in RESERVED_SECTION_KEYS}
+    )
+
+    is_builtin = satellite_key in BUILTIN_SATELLITES
+    if is_builtin:
+        section = raw.get(satellite_key, OmegaConf.create({}))
+        assert isinstance(section, DictConfig)
+    else:
+        custom = raw.get("custom", OmegaConf.create({}))
+        assert isinstance(custom, DictConfig)
+        if satellite_key not in custom:
+            raise ValueError(
+                f"Unknown satellite {satellite_key!r} in {path}; known: "
+                f"{sorted(BUILTIN_SATELLITES)}, custom: {sorted(str(k) for k in custom)}"
+            )
+        section = custom[satellite_key]
+        assert isinstance(section, DictConfig)
+        missing = [f for f in ("collection", "bands") if f not in section]
+        if missing:
+            raise ValueError(
+                f"custom satellite {satellite_key!r} in {path} is missing required "
+                f"field(s) {missing}"
+            )
+
+    overrides = OmegaConf.merge(generic, section)
+    assert isinstance(overrides, DictConfig)
+    if is_builtin:
+        # Force-set regardless of what the section/generic dict contains.
+        overrides["satellite"] = BUILTIN_SATELLITES[satellite_key]
+    elif overrides.get("satellite") is None:
+        overrides["satellite"] = satellite_key
+
+    if "output_dir" not in section and "output_dir" in overrides:
+        overrides["output_dir"] = str(Path(str(overrides["output_dir"])) / satellite_key)
+
     structured = OmegaConf.structured(Config)
-    merged = OmegaConf.merge(structured, from_yaml)
+    merged = OmegaConf.merge(structured, overrides)
     OmegaConf.resolve(merged)
     cfg: Config = OmegaConf.to_object(merged)  # type: ignore[assignment]
+    cfg.aoi = resolve_aoi(cfg.aoi, cfg.countries, context=f"{path} (satellite={satellite_key!r})")
     log.debug(f"Resolved output_dir={cfg.output_dir}")
     return cfg
+
+
+def resolve_bands(cfg: Config) -> list[str]:
+    """
+    Resolve the asset keys to download/load for a config.
+
+    Parameters
+    ----------
+    cfg : Config
+        Job configuration.
+
+    Returns
+    -------
+    list[str]
+        `cfg.bands` if set, else `cfg.satellite`'s `gfetch.profiles.SatelliteProfile.
+        default_bands` if it has one, else an empty list (a `custom` satellite with
+        no `bands` override and no profile).
+    """
+    if cfg.bands:
+        return list(cfg.bands)
+    try:
+        return list(get_profile(cfg.satellite).default_bands)
+    except ValueError:
+        return []
+
+
+def resolve_cloud_mask(cfg: Config) -> tuple[str | None, frozenset[int]]:
+    """
+    Resolve the cloud-mask band/classification-values-to-exclude for a config.
+
+    Parameters
+    ----------
+    cfg : Config
+        Job configuration.
+
+    Returns
+    -------
+    tuple[str | None, frozenset[int]]
+        `(cfg.cloud_mask_band, cfg.cloud_mask_out)` if `cloud_mask_band` is set, else
+        `cfg.satellite`'s `gfetch.profiles.SatelliteProfile` mask if it has one, else
+        `(None, frozenset())` (no masking - e.g. a `custom` satellite with no
+        override and no profile, or a profile with no cloud-mask band like
+        Sentinel-1).
+    """
+    if cfg.cloud_mask_band is not None:
+        return cfg.cloud_mask_band, frozenset(cfg.cloud_mask_out)
+    try:
+        profile = get_profile(cfg.satellite)
+        return profile.cloud_mask_band, profile.cloud_mask_out
+    except ValueError:
+        return None, frozenset()

@@ -3,6 +3,7 @@ from pathlib import Path
 
 from gfetch.cli.gedi_config import load
 from gfetch.gedi import GEDI_L2A_DEFAULT_FIELDS, expand_rh, fetch_gedi_l2a
+from gfetch.utils.progress import count_bar
 
 log = logging.getLogger(__name__)
 
@@ -51,12 +52,14 @@ def gedi(config_path: Path) -> None:
     start = cfg.time_range.start if cfg.time_range is not None else None
     end = cfg.time_range.end if cfg.time_range is not None else None
     time_range = _to_time_range(start, end)
-    gdf = fetch_gedi_l2a(
-        cfg.aoi.bbox,
-        time_range=time_range,
-        fields=cfg.fields if cfg.fields is not None else GEDI_L2A_DEFAULT_FIELDS,
-        anc_fields=anc_fields or None,
-    )
+    with count_bar() as progress:
+        gdf = fetch_gedi_l2a(
+            cfg.resolved_aoi.bbox,
+            time_range=time_range,
+            fields=cfg.fields if cfg.fields is not None else GEDI_L2A_DEFAULT_FIELDS,
+            anc_fields=anc_fields or None,
+            progress=progress,
+        )
     if cfg.rh_percentiles is not None:
         gdf = expand_rh(gdf, cfg.rh_percentiles)
 

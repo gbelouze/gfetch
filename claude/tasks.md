@@ -1109,3 +1109,109 @@ that state was reached, and should be read chronologically, not as reference mat
     32735's clean result - a reminder to reproduce against the *exact* failing
     input before trusting a theory that only explains a *similar* one.
 
+- **2026-09-22** — Unified `s1.yaml`/`s2.yaml`/`gedi.yaml` into one per-job config
+  file plus a `gfetch <satellite> <verb>` CLI, at the user's explicit request after
+  the GEDI HPC investigation above surfaced the friction directly: "The
+  configuration is either generic or specific to a certain satellite. I would like,
+  as in geefetch, satellite specific configuration and generic configuration, all
+  in the same config file." Full design writeup in `tech-stack.md`'s new "Unified
+  per-job config" section - this entry covers the process, not the design itself.
+  - **Planned via `EnterPlanMode` before writing code**, per the usual practice for
+    a change this size - two open questions resolved with the user first
+    (`AskUserQuestion`) rather than guessed: `gfetch gedi` stays bare (no verb,
+    confirmed over adding one for symmetry), and `custom:` is a dict of *several*
+    named entries (the user's own correction to my first proposal of a single
+    `custom:` block - "I would put it all under a 'custom' section in the config,
+    which actually may hold config for several customs", directly mirroring
+    geefetch's `customs_vector:` pattern I hadn't originally matched).
+  - **Two real issues found only by actually running the new CLI, not by the type
+    checker or the test suite**: (1) `GediConfig`'s strict structured-merge schema
+    raised `ConfigKeyError` on a raster-only generic field (`n_workers`) the very
+    first live end-to-end test (`gfetch gedi` against a config with an `s2:`
+    section too) - neither loader's unit tests had exercised a *shared* file with
+    fields belonging to the *other* pipeline, since every test config up to that
+    point was single-purpose. Fixed by filtering each loader's "generic" dict to
+    only the keys its own target dataclass declares, applied symmetrically to both
+    `cli/config.py::load()` and `cli/gedi_config.py::load()`, with regression tests
+    added for both directions this time. (2) The plan's own proposed CLI shape for
+    custom satellites (`gfetch custom <name> <verb> <config>`) doesn't parse under
+    cyclopts - a sub-app routes its *next* token to one of its own registered
+    commands, so the verb has to come immediately after `custom`
+    (`gfetch custom <verb> <name> <config>`). Caught by a minimal cyclopts repro
+    before committing it to the real CLI, not discovered via a failing test after
+    the fact.
+  - **Migration**: replaced the mozambania job's 3 files with one
+    `~/Documents/jz/src/configs/mozambania/v6/2020/download_gfetch/config.yaml` -
+    verified it resolves to identical `Config`/`GediConfig` values as the 3
+    originals (bands, output paths, chunks, `n_compute_workers`, etc.) via a real
+    load against the actual file, not just against synthetic test fixtures, before
+    deleting the old files.
+  - **Live end-to-end verification**, not just the test suite: `gfetch s2 search`
+    -> `download` -> `mosaic` and `gfetch gedi`, both through the new unified-config
+    CLI path, against a small real AOI; `gfetch custom search <name> <config>`
+    against a deliberately-unregistered satellite name with an explicit
+    `collection:` override, confirming it genuinely bypasses `gfetch.sources`'s
+    registry lookup rather than accidentally still routing through it. (Also hit,
+    and worked around, an unrelated pre-existing `validate_chunks` false positive
+    on a tiny test AOI whose native array is smaller than the default 2048px
+    chunk size - not this session's bug, from the concurrent mosaic-chunk-
+    validation work logged elsewhere in this file; sidestepped with an explicit
+    small `chunks:` override for the live test rather than investigated further,
+    since it's out of scope here.)
+  - Tests: new `tests/test_cli_main.py` (CLI dispatch/routing); substantial
+    additions to `tests/test_cli_config.py` (section merging, force-set
+    `satellite`, `output_dir` defaulting, `custom` required-field errors, the
+    cross-pipeline field-filtering regression) and `tests/test_gedi_config.py`
+    (same shape, GEDI side); one new test in `tests/test_search.py` for the
+    explicit `collection` passthrough. Full fast suite (107 tests) and
+    `pre-commit run --all-files` (ruff, pyrefly, pydoclint) pass.
+
+- **2026-09-23** — Added `countries:` as an alternative to `aoi:` in the unified job
+  config, at the user's request to mirror geefetch's own `aoi.country` field
+  (`geefetch/cli/download_implementation.py::load_country_filter_polygon`).
+  - **Researched geefetch's actual behavior before copying it**, via a forked
+    subagent trace rather than assuming: `filter_polygon` is a coarse, tile-level
+    `shapely.intersects()` check in `Tiler.split` - whole tiles are kept or skipped,
+    never per-pixel clipped, and it never reaches GEE (`.filterBounds()`/`.clip()`
+    use each tile's own bbox, not the polygon) or the GEDI vector path at all. This
+    directly shaped the scope decision: gfetch resolves `countries` to a bounding
+    box everywhere (matching geefetch's own real behavior, not an idealized "clips
+    to the exact country shape" reading of it), plus one deliberate improvement
+    beyond geefetch - `search()` passes the exact polygon to STAC's `intersects=`
+    for genuine server-side filtering, which geefetch's GEE-based search has no
+    equivalent of.
+  - **New `gfetch/countries.py`**: `resolve_country_polygon(countries)` against the
+    same public `world-administrative-boundaries` GeoJSON geefetch uses, with no new
+    dependencies (`requests`+a local `XDG_CACHE_HOME` cache instead of `pooch`,
+    stdlib `difflib` instead of `thefuzz` - all three of `requests`/`geopandas`/
+    `shapely` were already transitively available). The typo-suggestion needed a
+    substring-match pass before falling back to `difflib.get_close_matches`: a
+    naive `difflib`-only attempt failed the realistic case (`'Tanzania'` found no
+    match against `'United Republic of Tanzania'` - too large a length gap for
+    ratio-based matching alone), confirmed both broken and then fixed live rather
+    than assumed.
+  - **Config**: `Config`/`GediConfig` both gained `aoi: AOIConfig | None = None` +
+    `countries: list[str] | None = None` (reordering each dataclass's fields, since
+    a formerly-required `aoi` can no longer precede other required fields);
+    `gfetch.cli.config.resolve_aoi()` centralizes the "exactly one of `aoi`/
+    `countries`" validation and country-to-bbox resolution, called from both
+    loaders. This reopened the type-safety gap `resolve_bands`/`resolve_cloud_mask`
+    had already established a pattern for: code written against `cfg.aoi.bbox`
+    assuming non-None broke under pyrefly now that the field is legitimately
+    `AOIConfig | None` at the schema level. Fixed the same way - a `resolved_aoi`
+    property (assert-non-None) on both dataclasses, `load()` guarantees it's
+    populated, every consumer (`cli/search.py`, `cli/gedi.py`, `cli/mosaic.py`,
+    `cli/finalize.py`) switched to it instead of the raw optional field.
+  - **`gfetch/search.py`**: gained `intersects: dict | None`, dropping `bbox` from
+    the actual STAC request when given (the API spec treats them as mutually
+    exclusive) while still keeping `bbox` for logging.
+  - Tests: new `tests/test_countries.py` (union/typo-hint/substring-match behavior,
+    fast + one live `@pytest.mark.slow` sanity check against the real dataset),
+    `countries`/both-or-neither coverage added to `tests/test_cli_config.py` and
+    `tests/test_gedi_config.py`, `intersects`-drops-`bbox` coverage added to
+    `tests/test_search.py`. Full fast suite (127 tests) and
+    `pre-commit run --all-files` pass. Live-verified end to end against the real
+    mozambania AOI (`gfetch s2 search` with `countries: [Mozambique, United
+    Republic of Tanzania]` in place of `aoi:`, 648 items found via a real
+    `intersects=`-filtered STAC query) - not just the test suite.
+

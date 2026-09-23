@@ -618,6 +618,49 @@ against the *original remote* self href unless explicitly fixed. See `claude/tas
 the repro and fix — gfetch's download stage must apply this fix before handing items to
 `load`/`mosaic`.
 
+## Inode usage (added 2026-09-22)
+
+HPC filesystems (Lustre/GPFS) typically cap inodes per user/project, so file *count*
+matters as much as bytes. Two sources in gfetch:
+
+- **Download cache**: per item, 1 directory + 1 item JSON + 2 inodes per asset (the
+  asset and its `.complete` sentinel).
+- **Zarr mosaic**: 1 file per chunk per variable. At the default 2048 px chunk (about
+  20 km at 10 m), a 1000 x 1000 km AOI is about 2,400 files per band per UTM zone.
+
+Options assessed (zarr-python 3.4, xarray 2026.7, GDAL 3.11 as installed):
+
+| Option | Inodes | Write / parallelism | Read | Notes |
+|---|---|---|---|---|
+| Compression | no change | - | - | Shrinks bytes only; a chunk is one file however well it compresses. |
+| Bigger chunks | / chunk area | unchanged | coarser: a small window reads a whole chunk | Compute chunk = Zarr chunk in gfetch, so memory per task grows too (median holds the full time axis per chunk). |
+| Zarr v3 sharding | / chunks per shard | shard is the write unit: patches must be shard-aligned. xarray rejects a write covering part of a shard (`ValueError`, verified) | fine-grained: inner chunk read by byte range | Measured 200 -> 20 files (3 bands, 4096², 512 px chunks in 2048 px shards). Only saves inodes with shards bigger than today's 2048 chunk; compute at 2048 and rechunk the 2D output before writing to keep memory flat. GDAL reads it only from 3.13 (3.11 fails with `Unsupported codec: sharding_indexed`). |
+| Zip store, post-hoc | 1 per store | not writable concurrently (single central directory, no entry overwrite), so only after `mosaic` finishes; needs space for 2 copies while packing | `zarr.storage.ZipStore(path, mode="r")`; GDAL `/vsizip/` | Verified: an uncompressed (`ZIP_STORED`) zip of a finished store round-trips identically via `xr.open_zarr(ZipStore(...))`. |
+| SquashFS image | 1 per image | read-only, post-hoc | zarr sees a normal directory via squashfuse/Apptainer mount | Depends on the cluster providing the tools; unverified on Jean Zay. |
+| HDF5/NetCDF single file | 1 | parallel writes need MPI parallel HDF5 | fine | Doesn't fit independent SLURM tasks; ruled out. |
+| Icechunk | no gain on POSIX | - | - | Still stores chunks as separate objects, plus version metadata. |
+
+Download-cache-specific: the `.complete` sentinels are redundant with the atomic
+temp-file rename (the final file existing already proves completion) and double the
+per-asset cost - a candidate for removal, not done yet since AGENTS.md prescribes them.
+
+**Decision (2026-09-22)**: implement the post-hoc zip store and cache removal now, as
+core functions in `gfetch.finalize` (`pack_store`, `remove_cache`), exposed as
+`gfetch <satellite> pack [--remove-store]` / `gfetch <satellite> clean`. `mosaic`
+skips a zone whose zip exists (still listing its patches, so `task_id`/`n_tasks`
+assignment doesn't shift if packing happens between tasks). Sharding is the better long-term fix
+for the store itself and remains open. `pack_store` relies on stdlib `zipfile`
+(streams file by file, handles ZIP64 transparently) plus a temp file + `os.replace`
+for atomicity; `remove_cache` refuses unless every store is packed or
+`store_is_complete`.
+
+Found while building the completeness check: zarr-python 3 defaults to
+`write_empty_chunks=False`, so an all-nodata patch (e.g. outside the data footprint)
+wrote no chunk files and `region_is_written` reported it unwritten forever - `mosaic`
+recomputed it on every resume and a store could never count as complete.
+`write`/`write_region` now pass `write_empty_chunks=True`. Costs one small (compressed)
+file per empty chunk.
+
 ## Future: disk-bounded streaming download+mosaic (deferred, not designed for v1)
 
 Added 2026-09-22, from a user design discussion — **not built, not scheduled**; recorded
@@ -785,19 +828,23 @@ it: this is a second, independent pipeline, not a new stage bolted onto the firs
   SlideRule already does both server-side in one call.
 - **CLI command `gfetch gedi CONFIG`**, writing a GeoParquet file, backed by its own
   `gfetch.cli.gedi_config.GediConfig`/`load()` (added 2026-09-22) - **deliberately
-  not wired through the raster pipeline's `cli/config.py::Config`** (which carries
-  `satellite`/`source`/`bands`/`resolution`/`n_workers`/`chunks`/`patch_chunks` - all
-  raster/Zarr-specific, none applicable here). Forcing GEDI through that shared
-  config would be exactly the coupling the user's "orthogonal" framing was warning
-  against; a self-contained config schema (reusing only the generic
-  `AOIConfig`/`TimeRangeConfig` the two pipelines actually share) keeps the two
-  pipelines independent while still giving `gfetch gedi` the same
-  config-file-driven shape as `search`/`download`/`mosaic`, instead of the sprawling
-  CLI-flag set the pass-everything-as-flags design (the initial POC) grew into once
-  `anc_fields`/`rh_percentiles` were added. If/when other SlideRule-backed sources
-  are added (ICESat-2 was explicitly named as a future "potentially others"), revisit
-  whether a shared *vector*-side config/CLI convention is worth factoring out then -
-  not designed for now, per "don't design for hypothetical future requirements."
+  not wired through the raster pipeline's `cli/config.py::Config` dataclass** (which
+  carries `satellite`/`source`/`bands`/`resolution`/`n_workers`/`chunks`/
+  `patch_chunks` - all raster/Zarr-specific, none applicable here). Forcing GEDI
+  through that shared *dataclass* would be exactly the coupling the user's
+  "orthogonal" framing was warning against; a self-contained config schema (reusing
+  only the generic `AOIConfig`/`TimeRangeConfig` the two pipelines actually share)
+  keeps the two pipelines' *schemas* independent while still giving `gfetch gedi`
+  the same config-file-driven shape as `search`/`download`/`mosaic`, instead of the
+  sprawling CLI-flag set the pass-everything-as-flags design (the initial POC) grew
+  into once `anc_fields`/`rh_percentiles` were added. (Superseded in one respect
+  the same day: `gfetch gedi` now reads its `GediConfig` from a `gedi:` section of
+  the same *file* raster jobs use, via the unified-config redesign below - the
+  dataclass schemas stayed separate, only the file got unified.) If/when other
+  SlideRule-backed sources are added (ICESat-2 was explicitly named as a future
+  "potentially others"), revisit whether a shared *vector*-side config/CLI
+  convention is worth factoring out then - not designed for now, per "don't design
+  for hypothetical future requirements."
 - **Output format: GeoParquet** (`GeoDataFrame.to_parquet()`), not Zarr - vector
   footprint data (one row per shot, heterogeneous per-footprint scalar fields) has
   no natural gridded-array representation the way raster mosaics do; GeoParquet is
@@ -865,6 +912,85 @@ requesting all fourteen working `anc_fields` at once.
   not yet tried - resource/granule count and request duration at that scale are
   unknown.
 
+## Unified per-job config + `gfetch <satellite> <verb>` CLI (added 2026-09-22)
+
+Requested by the user at the same real-world friction point the mozambania GEDI work
+surfaced: three separate flat config files (`s1.yaml`/`s2.yaml`/`gedi.yaml`), each
+repeating `aoi`/`time_range`, and three different `gfetch <verb> <config>` invocations
+to remember. Explicitly modeled on geefetch's own `download.yaml` convention
+(`satellite_default:` + per-satellite override sections, `customs_vector:` as a
+dict of named entries) - full design discussion (including the two confirmed
+decisions below) captured in `claude/tasks.md`'s dated entry, not repeated here.
+
+- **One YAML file, section-keyed by satellite.** Top level = generic defaults, any
+  `Config`/`GediConfig` field; reserved section keys `s1`/`s2`/`gedi`/`custom`
+  override those defaults for that satellite only, section wins on conflict.
+  `gfetch.cli.config.load(path, satellite_key)` and `gfetch.cli.gedi_config.
+  load(path)` each build a "generic" dict **filtered to only the keys their own
+  target dataclass actually declares** before merging - found live, not designed
+  up front: `GediConfig`'s structured merge is strict and raised `ConfigKeyError`
+  on an unrelated raster-only generic field (`n_workers`) the very first real
+  end-to-end CLI test hit, since `GediConfig` doesn't have that field at all. Both
+  loaders filter symmetrically now (regression tests cover both directions), so a
+  generic field meaningful only to the other pipeline is silently ignored rather
+  than a hard crash - the *selected section itself* still validates strictly
+  (a typo inside `s2:`/`gedi:` still raises, as before).
+- **`s1`/`s2` force-set `satellite`** to the canonical `gfetch.profiles`/
+  `gfetch.sources` name (`BUILTIN_SATELLITES` in `cli/config.py`) regardless of
+  what the section/generic dict contains - not user-overridable for a built-in.
+- **`custom:` is a dict of named entries** (confirmed with the user before
+  building, mirroring geefetch's `customs_vector:`), each requiring an explicit
+  `collection` (STAC collection id) and `bands` - both `gfetch.profiles.
+  get_profile()` (bands/cloud-mask defaults) and `gfetch.sources.StacSource.
+  collection()` (satellite->collection lookup) are closed registries with no entry
+  for an arbitrary name, so a custom section bypasses them entirely rather than
+  requiring a code change to add a new registry entry. `gfetch.cli.config.
+  resolve_bands()`/`resolve_cloud_mask()` centralize the "config override, else
+  profile default, else nothing" fallback so `cli/download.py`/`cli/mosaic.py`
+  don't each reimplement it - the profile lookup itself is wrapped in a
+  `try/except ValueError` per call, not a satellite allow-list, so it's cheap for
+  future built-ins to add without touching this logic. `Config` gained
+  `collection`/`cloud_mask_band`/`cloud_mask_out` fields to carry these overrides;
+  they're optional and inert for `s1`/`s2` (profile still wins there unless
+  explicitly overridden).
+- **`output_dir`/`output` default to `<generic output_dir>/<satellite_key>`**
+  (e.g. `.../gfetch/s2`, `.../gfetch/gedi/l2a.parquet`) unless a section sets its
+  own - matches the directory layout the 3 old files already used by hand, without
+  requiring it be spelled out per satellite. `gedi_config.load()` computes this
+  from a generic `output_dir` it doesn't itself declare as a field (popped out
+  before the strict per-dataclass filtering above, used only for the computation).
+- **CLI restructured** (`cli/main.py`) around `BUILTIN_SATELLITES` + a
+  `_register_raster_commands(sub_app, satellite_key)` helper mounting
+  `search`/`download`/`mosaic` on a `cyclopts.App` sub-app per built-in, plus a
+  `custom` sub-app whose three commands take an extra `name: str` first
+  positional. **CLI shape constraint discovered, not designed**: cyclopts routes
+  a sub-app's next token to one of *its own* registered commands, so
+  `gfetch custom <name> <verb> <config>` (the shape floated during planning)
+  doesn't parse - the verb must come first (`gfetch custom search <name>
+  <config>`), confirmed with a minimal cyclopts repro before committing to it in
+  the real CLI. `gfetch gedi CONFIG` stayed bare per the user's explicit call
+  (confirmed before building, not assumed) - no `fetch` verb added for symmetry.
+- **Migration**: the mozambania job's 3 files replaced with one
+  `~/Documents/jz/src/configs/mozambania/v6/2020/download_gfetch/config.yaml`,
+  verified to resolve to byte-identical `Config`/`GediConfig` values (bands,
+  output paths, chunks, etc.) as the 3 originals before the old files were
+  deleted - not just schema-level tests, an actual load against the real file.
+- **Verified live end to end**, not just via the test suite: `gfetch s2 search`
+  -> `download` -> `mosaic` and `gfetch gedi`, all against the new unified-config
+  CLI path, on a small real AOI (Fontainebleau-area bbox, matching the convention
+  used throughout this project's other live smoke tests) - and `gfetch custom
+  search <name> <config>` against a deliberately-unregistered satellite name,
+  confirming the explicit `collection` override genuinely bypasses `gfetch.
+  sources`'s registry rather than accidentally still routing through it.
+- Tests: `tests/test_cli_main.py` (new - CLI dispatch/routing, including the
+  `custom` name passthrough), extensive additions to `tests/test_cli_config.py`
+  (section merging, force-set `satellite`, `output_dir` defaulting, `custom`
+  required-field errors, the cross-pipeline generic-field-filtering regression),
+  `tests/test_gedi_config.py` (the `gedi:`-section shape, its own
+  filtering/defaulting regressions), `tests/test_search.py` (explicit `collection`
+  bypassing `source.collection()`). Full fast suite (107 tests) and
+  `pre-commit run --all-files` pass.
+
 ## Explicitly rejected dependencies
 
 | Library/service | Reason |
@@ -923,7 +1049,8 @@ requesting all fourteen working `anc_fields` at once.
   inode quotas, metadata-server overhead), not just a performance nicety. Needs a
   deliberate chunk-size sizing pass (and/or Zarr v3 sharding, which packs multiple
   chunks into one file specifically to address this) before gfetch is used in
-  production at country scale. Not blocking v1/POC work.
+  production at country scale. Not blocking v1/POC work. **Assessed 2026-09-22**, see
+  "Inode usage" above.
 - ~~Sentinel-2 `search` stage needs processing-baseline resolution~~ — **resolved
   2026-09-21**, see `claude/tasks.md`.
 - **Per-source band-naming, unresolved (found 2026-09-22)**: `SatelliteProfile.

@@ -6,10 +6,10 @@ import pystac
 import xarray as xr
 from odc.geo.geobox import GeoBox
 
-from gfetch.cli.config import load
+from gfetch.cli.config import load, resolve_bands, resolve_cloud_mask
+from gfetch.finalize import packed_store_path
 from gfetch.mosaic import group_by_utm_zone, patch_geoboxes, resolve_chunks, zone_geobox
 from gfetch.mosaic import mosaic as build_mosaic
-from gfetch.profiles import get_profile
 from gfetch.utils.progress import count_bar, dask_progress, temporary_task
 from gfetch.utils.system import available_cpus
 from gfetch.write import (
@@ -23,7 +23,7 @@ from gfetch.write import (
 log = logging.getLogger(__name__)
 
 
-def mosaic(config_path: Path, *, task_id: int = 0, n_tasks: int = 1) -> None:
+def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: int = 1) -> None:
     """
     Load, cloud-mask, composite, and write this job's items to a Zarr mosaic, one
     patch of native Zarr chunks at a time.
@@ -41,6 +41,9 @@ def mosaic(config_path: Path, *, task_id: int = 0, n_tasks: int = 1) -> None:
     ----------
     config_path : Path
         Path to the configuration YAML file.
+    satellite_key : str
+        Which satellite to load from `config_path` - `'s1'`, `'s2'`, or a name under
+        its `custom:` section. See `gfetch.cli.config.load`.
     task_id : int
         This invocation's index among `n_tasks` concurrent invocations (e.g. a SLURM
         job array's `$SLURM_ARRAY_TASK_ID`). Defaults to 0.
@@ -49,7 +52,7 @@ def mosaic(config_path: Path, *, task_id: int = 0, n_tasks: int = 1) -> None:
         them (e.g. a SLURM job array's `$SLURM_ARRAY_TASK_COUNT`). Defaults to 1: no
         splitting, this invocation does everything.
     """
-    cfg = load(config_path)
+    cfg = load(config_path, satellite_key)
 
     if cfg.cached_items_path.exists():
         items_path = cfg.cached_items_path
@@ -62,10 +65,10 @@ def mosaic(config_path: Path, *, task_id: int = 0, n_tasks: int = 1) -> None:
 
     items = list(pystac.ItemCollection.from_file(items_path))
     log.debug(f"Loaded {len(items)} item(s) from {items_path}")
-    profile = get_profile(cfg.satellite)
-    bands = list(cfg.bands) if cfg.bands else list(profile.default_bands)
+    bands = resolve_bands(cfg)
+    mask_band, mask_out = resolve_cloud_mask(cfg)
 
-    zones = group_by_utm_zone(items, cfg.aoi.bbox)
+    zones = group_by_utm_zone(items, cfg.resolved_aoi.bbox)
     log.info(f"Items span {len(zones)} UTM zone(s): {[crs.epsg for crs in zones]}")
 
     chunks = resolve_chunks(cfg.chunks)
@@ -76,32 +79,39 @@ def mosaic(config_path: Path, *, task_id: int = 0, n_tasks: int = 1) -> None:
             zone_items,
             geobox,
             bands,
-            mask_band=profile.cloud_mask_band,
-            mask_out=profile.cloud_mask_out,
+            mask_band=mask_band,
+            mask_out=mask_out,
             resampling=cfg.resampling,
             chunks=cfg.chunks,
         )
 
     patches: list[tuple[str, Path, list[pystac.Item], GeoBox, dict[str, slice]]] = []
     for crs, zone_items in zones.items():
-        geobox = zone_geobox(crs, cfg.aoi.bbox, cfg.resolution)
+        geobox = zone_geobox(crs, cfg.resolved_aoi.bbox, cfg.resolution)
         path = cfg.zarr_path(crs)
-        # Building the template dataset means running the full mosaic() pipeline over
-        # the whole zone's item list and geobox (odc-stac has to bin every item
-        # against the zone's full tile grid to construct the graph) just to read off
-        # its post-composite shape/dtype/coords: real, non-trivial work even though
-        # `prepare_template`'s `compute=False` never reads or writes any pixel data.
-        # Checking first avoids paying for that on every invocation once the template
-        # already exists (the common case once a job is past its first run). Every
-        # task still calls `prepare_template` independently and idempotently when it
-        # does need to, so there's no ordering dependency between tasks.
-        if not store_initialized(path):
-            prepare_template(build(zone_items, geobox), path)
-        # Fails fast, before any patch is built, if this store's on-disk chunk grid
-        # doesn't match what this run's config expects - a store built by an earlier
-        # run under different settings would otherwise only surface as a confusing
-        # low-level error deep inside `write_region`, after paying for a patch build.
-        validate_chunks(path, bands, {"y": chunks["y"], "x": chunks["x"]})
+        # A packed zone is complete (`pack_store` only packs complete stores) and its
+        # directory may be gone; its patches are still listed so that every task
+        # assigns the same patches regardless of when packing happened.
+        if packed_store_path(path).exists():
+            log.info(f"EPSG:{crs.epsg}: already packed into {packed_store_path(path)}, skipping")
+        else:
+            # Building the template dataset means running the full mosaic() pipeline over
+            # the whole zone's item list and geobox (odc-stac has to bin every item
+            # against the zone's full tile grid to construct the graph) just to read off
+            # its post-composite shape/dtype/coords: real, non-trivial work even though
+            # `prepare_template`'s `compute=False` never reads or writes any pixel data.
+            # Checking first avoids paying for that on every invocation once the template
+            # already exists (the common case once a job is past its first run). Every
+            # task still calls `prepare_template` independently and idempotently when it
+            # does need to, so there's no ordering dependency between tasks.
+            if not store_initialized(path):
+                prepare_template(build(zone_items, geobox), path)
+            # Fails fast, before any patch is built, if this store's on-disk chunk
+            # grid doesn't match what this run's config expects - a store built by an
+            # earlier run under different settings would otherwise only surface as a
+            # confusing low-level error deep inside `write_region`, after paying for a
+            # patch build.
+            validate_chunks(path, bands, {"y": chunks["y"], "x": chunks["x"]})
         for (iy, ix), patch_geobox, region in patch_geoboxes(geobox, patch_shape):
             label = f"EPSG:{crs.epsg} patch ({iy}, {ix})"
             patches.append((label, path, zone_items, patch_geobox, region))
@@ -118,7 +128,7 @@ def mosaic(config_path: Path, *, task_id: int = 0, n_tasks: int = 1) -> None:
         dask.config.set(num_workers=n_compute_workers),
     ):
         for label, path, zone_items, patch_geobox, region in my_patches:
-            if region_is_written(path, region, bands):
+            if packed_store_path(path).exists() or region_is_written(path, region, bands):
                 log.debug(f"{label}: already written, skipping")
             else:
                 ds = build(zone_items, patch_geobox)

@@ -10,6 +10,7 @@ from gfetch.gedi import (
     _bbox_to_poly,
     expand_rh,
     fetch_gedi_l2a,
+    split_bbox,
 )
 
 
@@ -31,6 +32,75 @@ def test_bbox_to_poly_is_closed_ccw_ring() -> None:
     assert poly[0] == poly[-1]
     assert [p["lon"] for p in poly] == [2.0, 3.0, 3.0, 2.0, 2.0]
     assert [p["lat"] for p in poly] == [48.0, 48.0, 49.0, 49.0, 48.0]
+
+
+def test_split_bbox_small_bbox_is_single_tile() -> None:
+    bbox = (2.0, 48.0, 2.05, 48.05)
+
+    assert split_bbox(bbox) == [bbox]
+
+
+@pytest.mark.parametrize("bbox", [(2.0, 48.0, 3.0, 49.0), (30.0, -12.0, 32.0, 2.0)])
+def test_split_bbox_tiles_cover_bbox_within_max_size(
+    bbox: tuple[float, float, float, float],
+) -> None:
+    from pyproj import Geod
+
+    geod = Geod(ellps="WGS84")
+    tiles = split_bbox(bbox, max_size_m=10_000)
+
+    assert min(t[0] for t in tiles) == bbox[0]
+    assert min(t[1] for t in tiles) == bbox[1]
+    assert max(t[2] for t in tiles) == bbox[2]
+    assert max(t[3] for t in tiles) == bbox[3]
+    total_area = sum((t[2] - t[0]) * (t[3] - t[1]) for t in tiles)
+    assert total_area == pytest.approx((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+    for min_lon, min_lat, max_lon, max_lat in tiles:
+        widest_lat = 0.0 if min_lat <= 0.0 <= max_lat else min(min_lat, max_lat, key=abs)
+        assert geod.line_length([min_lon, max_lon], [widest_lat, widest_lat]) <= 10_000
+        assert geod.line_length([min_lon, min_lon], [min_lat, max_lat]) <= 10_000
+
+
+def test_fetch_gedi_l2a_splits_into_tiles_without_duplicates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Footprints on an edge shared by two tiles are returned by both SlideRule
+    requests, but must appear only once in the result.
+    """
+    bbox = (2.0, 48.0, 2.2, 48.2)
+    lons = [2.0, 2.1, 2.2, 2.05]
+    lats = [48.0, 48.1, 48.2, 48.15]
+    requested_polys = []
+
+    def fake_gedi02ap(parms: dict) -> gpd.GeoDataFrame:
+        poly = parms["poly"]
+        requested_polys.append(poly)
+        min_lon, max_lon = poly[0]["lon"], poly[2]["lon"]
+        min_lat, max_lat = poly[0]["lat"], poly[2]["lat"]
+        inside = [
+            (lon, lat)
+            for lon, lat in zip(lons, lats, strict=True)
+            if min_lon <= lon <= max_lon and min_lat <= lat <= max_lat
+        ]
+        if not inside:
+            return sliderule_core.emptyframe(crs="EPSG:7912")
+        xs, ys = zip(*inside, strict=True)
+        return gpd.GeoDataFrame(
+            {"elevation_lm": list(xs), "elevation_hr": list(ys)},
+            geometry=gpd.points_from_xy(xs, ys),
+            crs="EPSG:7912",
+        )
+
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gedi_module.gedi, "gedi02ap", fake_gedi02ap)
+
+    gdf = fetch_gedi_l2a(bbox, max_size_m=10_000)
+
+    assert len(requested_polys) == len(split_bbox(bbox, 10_000)) > 1
+    assert sorted(zip(gdf.geometry.x, gdf.geometry.y, strict=True)) == sorted(
+        zip(lons, lats, strict=True)
+    )
+    assert gdf["elevation_lm"].dtype == float
 
 
 def test_fetch_gedi_l2a_handles_empty_or_failed_response(monkeypatch: pytest.MonkeyPatch) -> None:
