@@ -1,0 +1,4 @@
+size,chunk,shard_factor,n_bands,n_time,n_threads,strategy,n_units,write_seconds,peak_rss_mb,peak_above_baseline_mb,n_files
+4096,256,16,12,12,4,unsharded,256,52.67,485,354,3074
+4096,256,16,12,12,4,sharded,1,30.61,1071,939,14
+4096,256,16,12,12,4,sharded-per-band,1,37.32,818,685,14
