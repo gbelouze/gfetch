@@ -1,11 +1,12 @@
 """STAC search stage: given an AOI/time range/satellite, find matching STAC items."""
 
+import datetime as _dt
 import logging
 
 import pystac
 import pystac_client
 
-from gfetch.sources import StacSource
+from gfetch.sources import StacSource, check_collection_coverage
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +44,31 @@ def _dedupe_sentinel2_processing_baseline(items: list[pystac.Item]) -> list[pyst
         if key not in best or baseline > best[key].properties.get("s2:processing_baseline", "0"):
             best[key] = item
     return list(best.values())
+
+
+def _parse_date_range(
+    datetime: str,
+) -> tuple[_dt.date | None, _dt.date | None]:
+    """
+    Parse a STAC API datetime or datetime interval into its first and last days.
+
+    Parameters
+    ----------
+    datetime : str
+        A single datetime, or an interval `start/end` whose open ends are `..` or
+        empty (e.g. '2024-01-01/2024-06-01', '2024-01-01T00:00:00Z/..').
+
+    Returns
+    -------
+    tuple[datetime.date | None, datetime.date | None]
+        First and last day, None for an open end.
+    """
+    start, _, end = datetime.partition("/") if "/" in datetime else (datetime, "", datetime)
+
+    def _day(value: str) -> _dt.date | None:
+        return None if value in ("", "..") else _dt.date.fromisoformat(value[:10])
+
+    return _day(start), _day(end)
 
 
 def search(
@@ -93,6 +119,11 @@ def search(
         Matching STAC items.
     """
     collection = collection or source.collection(satellite)
+    try:
+        check_collection_coverage(source, collection, *_parse_date_range(datetime))
+    except ValueError as e:
+        log.error(e)
+        raise
     log.info(
         f"Searching {source.name} collection {collection!r} for bbox={bbox} datetime={datetime}"
     )

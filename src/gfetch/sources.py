@@ -6,9 +6,10 @@ Computer SAS-signing, ...) per asset href, so a source here needs nothing beyond
 search endpoint and collection-id mapping.
 """
 
+import datetime
 from dataclasses import dataclass
 
-__all__ = ["SOURCES", "StacSource", "get_source"]
+__all__ = ["SOURCES", "StacSource", "check_collection_coverage", "get_source"]
 
 _SENTINEL2_COLLECTIONS = {
     "earthsearch": "sentinel-2-c1-l2a",
@@ -18,6 +19,19 @@ _SENTINEL2_COLLECTIONS = {
 _SENTINEL1_COLLECTIONS = {
     "earthsearch": "sentinel-1-grd",
     "planetary-computer": "sentinel-1-grd",
+}
+
+# Periods a collection is known to be missing, as (first day, last day) inclusive, keyed
+# by (source name, collection id). Earth Search's Collection 1 only holds data
+# reprocessed by ESA to baseline 05.00+, and per Earth Search's own documentation (as of
+# April 2024) that reprocessing hasn't reached Nov 2016 - Nov 2019 or 2022. Confirmed
+# live 2026-09-23: 45 items for Jan-Sep 2022 over a 230 km box in France, against 1,372
+# in `sentinel-2-l2a`.
+_COLLECTION_GAPS: dict[tuple[str, str], list[tuple[datetime.date, datetime.date]]] = {
+    ("earthsearch", "sentinel-2-c1-l2a"): [
+        (datetime.date(2016, 11, 1), datetime.date(2019, 11, 30)),
+        (datetime.date(2022, 1, 1), datetime.date(2022, 12, 31)),
+    ],
 }
 
 _COLLECTIONS: dict[str, dict[str, str]] = {
@@ -90,3 +104,37 @@ def get_source(name: str) -> StacSource:
         return SOURCES[name]
     except KeyError as e:
         raise ValueError(f"Unknown source {name!r}; known sources: {sorted(SOURCES)}") from e
+
+
+def check_collection_coverage(
+    source: StacSource,
+    collection: str,
+    start: datetime.date | None,
+    end: datetime.date | None,
+) -> None:
+    """
+    Check a time range against the periods a collection is known to be missing.
+
+    Parameters
+    ----------
+    source : StacSource
+        STAC API source the collection is searched on.
+    collection : str
+        Collection id.
+    start : datetime.date | None
+        First day of the time range, or None if open-ended.
+    end : datetime.date | None
+        Last day of the time range, or None if open-ended.
+
+    Raises
+    ------
+    ValueError
+        If the time range overlaps a known gap of `collection` on `source`.
+    """
+    for gap_start, gap_end in _COLLECTION_GAPS.get((source.name, collection), []):
+        if (start is None or start <= gap_end) and (end is None or end >= gap_start):
+            raise ValueError(
+                f"{source.name} collection {collection!r} is missing data from {gap_start} "
+                f"to {gap_end}, which overlaps the requested time range {start}/{end}. "
+                "Choose a time range outside that period, or another source."
+            )

@@ -167,3 +167,48 @@ def test_search_earthsearch_sentinel1_orbit_state_filter() -> None:
 
     assert items
     assert {item.properties.get("sat:orbit_state") for item in items} == {"descending"}
+
+
+@pytest.mark.parametrize(
+    "datetime_range",
+    [
+        "2022-01-01/2022-09-30",
+        "2021-12-15/2022-01-10",
+        "2019-06-01/2020-06-01",
+        "2021-01-01/..",
+    ],
+)
+def test_search_refuses_known_earthsearch_c1_gaps(
+    datetime_range: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_network(*args: object, **kwargs: object) -> None:
+        raise AssertionError("searched despite a known coverage gap")
+
+    monkeypatch.setattr(pystac_client.Client, "open", no_network)
+
+    with pytest.raises(ValueError, match="sentinel-2-c1-l2a"):
+        search(get_source("earthsearch"), "sentinel-2", (-1.0, 45.6, 2.0, 47.7), datetime_range)
+
+
+@pytest.mark.parametrize(
+    ("source", "datetime_range"),
+    [
+        ("earthsearch", "2021-01-01/2021-12-31"),
+        ("earthsearch", "2019-12-01/2021-12-31"),
+        ("earthsearch", "2023-01-01T00:00:00Z/2023-06-01T00:00:00Z"),
+        ("planetary-computer", "2022-01-01/2022-09-30"),
+    ],
+)
+def test_search_allows_time_ranges_outside_known_gaps(
+    source: str, datetime_range: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _Searched(Exception):
+        pass
+
+    def fake_open(*args: object, **kwargs: object) -> None:
+        raise _Searched
+
+    monkeypatch.setattr(pystac_client.Client, "open", fake_open)
+
+    with pytest.raises(_Searched):
+        search(get_source(source), "sentinel-2", (-1.0, 45.6, 2.0, 47.7), datetime_range)

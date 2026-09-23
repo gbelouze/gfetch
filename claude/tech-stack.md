@@ -618,6 +618,36 @@ against the *original remote* self href unless explicitly fixed. See `claude/tas
 the repro and fix — gfetch's download stage must apply this fix before handing items to
 `load`/`mosaic`.
 
+## Sentinel-2 archive coverage and processing baselines (added 2026-09-23)
+
+Earth Search's `sentinel-2-c1-l2a` only holds scenes reprocessed by ESA to baseline
+05.00+, and that reprocessing hasn't reached Nov 2016 - Nov 2019 or 2022 (Earth Search
+docs, as of April 2024). Measured over a 230 km box in France (-1..2°E, 45.6..47.7°N),
+Jan-Sep, distinct (tile, date) pairs:
+
+| Year | `c1-l2a` | Earth Search `sentinel-2-l2a` |
+|---|---|---|
+| 2017 | 0 | 392 |
+| 2018 | 485 | 1,438 items (duplicates not counted out) |
+| 2020 | 1,320 | 1,320 |
+| 2021 | 1,310 | 1,310 |
+| 2022 | 45 items | 1,372 items |
+| 2023-2025 | matches | matches |
+
+`search()` now refuses a time range overlapping either gap (`gfetch.sources.
+_COLLECTION_GAPS`).
+
+Planetary Computer's `sentinel-2-l2a` is complete but not equivalent: it serves ESA's
+products as produced at the time, so baselines are mixed. 2019: 02.12 almost
+throughout. 2022 over the same box, keeping the highest baseline per (tile, date):
+03.00 110, 04.00 381, 05.10 809. Assets carry no `raster:bands` scale/offset metadata
+(Earth Search's C1 does: scale 1e-4, offset -0.1), so the +1000 DN offset introduced
+by baseline 04.00 (25 Jan 2022) would have to be harmonized by gfetch itself before
+compositing across it. Band names differ too (`B04` vs `red`, see the per-source
+band-naming open question). `_dedupe_sentinel2_processing_baseline` keys on
+`grid:code`, which PC items lack (`s2:mgrs_tile` there), so on PC it falls back to the
+item id and removes no duplicates.
+
 ## Inode usage (added 2026-09-22)
 
 HPC filesystems (Lustre/GPFS) typically cap inodes per user/project, so file *count*
