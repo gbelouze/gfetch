@@ -1,3 +1,7 @@
+# Disclaimer
+
+We are in an exploratory phase for this tool's development, with heavy use of AI assistance for fast iteration and many (in fact mostly) breaking changes. This is not ready for public usage yet.
+
 # gfetch
 
 A library for downloading large-scale Earth observation datasets (Sentinel, Landsat) as
