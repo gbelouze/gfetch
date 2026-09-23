@@ -36,19 +36,38 @@ def log_chunk_footprint(ds: xr.Dataset, log: logging.Logger) -> None:
     log.info(f"Dask worker threads: {n_workers} (available CPUs={available_cpus()})")
 
     total_chunk_bytes = 0
+    shapes: list[tuple[int, ...]] = []
+    chunk_shapes: list[tuple[int, ...]] = []
+    footprints: dict[str, str] = {}
     for name, var in ds.data_vars.items():
         data = var.data
-        if not hasattr(data, "chunksize"):
-            log.debug(f"{name}: not dask-backed (already in memory), shape={var.shape}")
-            continue
-        chunk_bytes = math.prod(data.chunksize) * data.dtype.itemsize
-        total_chunk_bytes += chunk_bytes
-        log.debug(
-            f"{name}: dtype={data.dtype}, shape={var.shape}, chunks={data.chunksize} "
-            f"({data.npartitions} chunk(s) total, {chunk_bytes / 1e6:.1f} MB/chunk), "
-            f"total={data.nbytes / 1e9:.2f} GB"
-        )
+        shapes.append(var.shape)
+        footprints[str(name)] = f"{var.nbytes / 1e9:.2f} GB"
+        if hasattr(data, "chunksize"):
+            chunk_shapes.append(data.chunksize)
+            total_chunk_bytes += math.prod(data.chunksize) * data.dtype.itemsize
+    log.debug(f"shape {_largest(shapes)}, chunks {_largest(chunk_shapes)}, footprint {footprints}")
     log.info(
         f"Estimated peak memory ({n_workers} concurrent chunk(s) across all "
         f"variables): {total_chunk_bytes * n_workers / 1e9:.2f} GB"
     )
+
+
+def _largest(shapes: list[tuple[int, ...]]) -> str:
+    """
+    Describe the largest of several shapes and how many share it.
+
+    Parameters
+    ----------
+    shapes : list[tuple[int, ...]]
+        One shape per variable.
+
+    Returns
+    -------
+    str
+        E.g. `(23, 256, 256) x12/13`, or `none` if `shapes` is empty.
+    """
+    if not shapes:
+        return "none"
+    largest = max(shapes, key=math.prod)
+    return f"{largest} x{shapes.count(largest)}/{len(shapes)}"
