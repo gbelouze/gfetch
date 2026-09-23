@@ -7,10 +7,15 @@ cluster (the default) - NASA Earthdata authentication against the source DAAC is
 server-side; it's only needed for a self-hosted SlideRule deployment.
 """
 
+import hashlib
+import json
 import logging
 import math
+import os
+import tempfile
 from collections.abc import Sequence
 from contextlib import nullcontext
+from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
@@ -50,6 +55,7 @@ __all__ = [
     "expand_rh",
     "fetch_gedi_l2a",
     "split_bbox",
+    "write_geoparquet",
 ]
 
 # gedi02ap already returns a fixed, reduced set of L2A fields (not the full ~100
@@ -207,13 +213,18 @@ def fetch_gedi_l2a(
     fields: Sequence[str] | None = GEDI_L2A_DEFAULT_FIELDS,
     anc_fields: Sequence[str] | None = None,
     max_size_m: float = GEDI_MAX_TILE_SIZE_M,
+    tile_dir: Path | None = None,
     progress: Progress | None = None,
 ) -> gpd.GeoDataFrame:
     """
     Fetch GEDI L2A footprints over an AOI via SlideRule's on-demand subsetting.
 
     The AOI is split into tiles of at most `max_size_m` on each side (see
-    `split_bbox`), fetched one request at a time.
+    `split_bbox`), fetched one request at a time. With `tile_dir` set, each tile's
+    result is saved there as soon as it's fetched and reused by a later call, so an
+    interrupted run resumes where it stopped. A tile whose request failed
+    server-side comes back empty (see `_fetch_tile`) and is saved like a genuinely
+    empty one, so a resumed run doesn't retry it.
 
     No filtering is applied beyond the AOI/time range: SlideRule's `degrade_filter`,
     `l2_quality_filter`, and `surface_filter` all default to off, so degraded/low-
@@ -250,6 +261,11 @@ def fetch_gedi_l2a(
     max_size_m : float
         Maximum tile width and height, in meters. Defaults to
         `GEDI_MAX_TILE_SIZE_M`.
+    tile_dir : Path | None
+        Directory holding one GeoParquet file per completed tile, plus the request
+        parameters they were fetched with. Raises `ValueError` if called with
+        different parameters. Defaults to None (nothing saved, an interrupted run
+        starts over).
     progress : Progress | None
         Rich progress tracker, advanced once per fetched tile. Defaults to None (no
         progress bar).
@@ -260,8 +276,18 @@ def fetch_gedi_l2a(
         One row per footprint, indexed by acquisition time, geometry in EPSG:7912
         (GEDI's standard CRS, ITRF2014).
     """
-    sliderule.init(verbose=False)
     tiles = split_bbox(bbox, max_size_m)
+    if tile_dir is not None:
+        _check_tile_params(
+            tile_dir,
+            {
+                "bbox": bbox,
+                "time_range": time_range,
+                "fields": fields,
+                "anc_fields": anc_fields,
+                "max_size_m": max_size_m,
+            },
+        )
     log.info(
         f"Requesting GEDI L2A footprints over bbox={bbox}, time_range={time_range} "
         f"in {len(tiles)} tile(s)"
@@ -273,10 +299,25 @@ def fetch_gedi_l2a(
         if progress is not None
         else nullcontext(None)
     ) as task:
+        n_reused = 0
+        sliderule_ready = False
         for tile in tiles:
-            gdfs.append(_fetch_tile(tile, bbox, time_range, fields, anc_fields))
+            path = _tile_path(tile_dir, tile) if tile_dir is not None else None
+            if path is not None and path.exists():
+                tile_gdf = gpd.read_parquet(path)
+                n_reused += 1
+            else:
+                if not sliderule_ready:
+                    sliderule.init(verbose=False)
+                    sliderule_ready = True
+                tile_gdf = _fetch_tile(tile, bbox, time_range, fields, anc_fields)
+                if path is not None:
+                    write_geoparquet(tile_gdf, path)
+            gdfs.append(tile_gdf)
             if progress is not None and task is not None:
                 progress.advance(task)
+    if n_reused:
+        log.info(f"Reused {n_reused}/{len(tiles)} tile(s) already saved in {tile_dir}")
 
     # Concatenating an empty, possibly column-less tile frame would otherwise
     # degrade the other tiles' column dtypes to object.
@@ -287,6 +328,88 @@ def fetch_gedi_l2a(
         gdf = gpd.GeoDataFrame(pd.concat(non_empty), crs=non_empty[0].crs).sort_index()
     log.info(f"Received {len(gdf)} footprint(s)")
     return gdf
+
+
+def write_geoparquet(gdf: gpd.GeoDataFrame, path: Path) -> None:
+    """
+    Write a GeoDataFrame to GeoParquet atomically.
+
+    Written under a hidden temporary name in the same directory, then renamed into
+    place, so `path` existing means the write completed.
+
+    Parameters
+    ----------
+    gdf : gpd.GeoDataFrame
+        Data to write.
+    path : Path
+        Destination file, overwritten if present.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        gdf.to_parquet(tmp)
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _tile_path(tile_dir: Path, tile: tuple[float, float, float, float]) -> Path:
+    """
+    Path of the file holding one tile's saved footprints.
+
+    Parameters
+    ----------
+    tile_dir : Path
+        See `fetch_gedi_l2a`.
+    tile : tuple[float, float, float, float]
+        Tile (min_lon, min_lat, max_lon, max_lat), as returned by `split_bbox`.
+
+    Returns
+    -------
+    Path
+        `tile_dir/<hash>.parquet`, `<hash>` being a short digest of `tile`'s bounds
+        rounded to 1e-6 degrees.
+    """
+    key = "_".join(f"{v:.6f}" for v in tile)
+    return tile_dir / f"{hashlib.sha1(key.encode()).hexdigest()[:12]}.parquet"
+
+
+def _check_tile_params(tile_dir: Path, params: dict) -> None:
+    """
+    Record the request parameters in `tile_dir`, or check they match those recorded.
+
+    Parameters
+    ----------
+    tile_dir : Path
+        See `fetch_gedi_l2a`.
+    params : dict
+        JSON-serializable request parameters.
+
+    Raises
+    ------
+    ValueError
+        If `tile_dir` already records different parameters.
+    """
+    path = tile_dir / "params.json"
+    params = json.loads(json.dumps(params))
+    if path.exists():
+        saved = json.loads(path.read_text())
+        if saved != params:
+            msg = (
+                f"{tile_dir} holds tiles fetched with {saved}, not {params}; delete it to "
+                "start over with the new parameters"
+            )
+            log.error(msg)
+            raise ValueError(msg)
+        return
+    tile_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=tile_dir, prefix=".params.json.", suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        json.dump(params, f)
+    Path(tmp_name).replace(path)
 
 
 def expand_rh(

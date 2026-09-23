@@ -1,3 +1,6 @@
+from collections.abc import Callable
+from pathlib import Path
+
 import geopandas as gpd
 import numpy as np
 import pytest
@@ -101,6 +104,85 @@ def test_fetch_gedi_l2a_splits_into_tiles_without_duplicates(
         zip(lons, lats, strict=True)
     )
     assert gdf["elevation_lm"].dtype == float
+
+
+def _fake_gedi02ap_over(
+    points: list[tuple[float, float]], calls: list[dict]
+) -> Callable[[dict], gpd.GeoDataFrame]:
+    """A `gedi02ap` stand-in returning whichever of `points` fall in the request's
+    polygon, as an empty frame (like SlideRule's) when none do.
+    """
+
+    def fake_gedi02ap(parms: dict) -> gpd.GeoDataFrame:
+        calls.append(parms)
+        poly = parms["poly"]
+        min_lon, max_lon = poly[0]["lon"], poly[2]["lon"]
+        min_lat, max_lat = poly[0]["lat"], poly[2]["lat"]
+        inside = [
+            (lon, lat)
+            for lon, lat in points
+            if min_lon <= lon <= max_lon and min_lat <= lat <= max_lat
+        ]
+        if not inside:
+            return sliderule_core.emptyframe(crs="EPSG:7912")
+        xs, ys = zip(*inside, strict=True)
+        return gpd.GeoDataFrame(
+            {"elevation_lm": list(xs), "elevation_hr": list(ys)},
+            geometry=gpd.points_from_xy(xs, ys),
+            crs="EPSG:7912",
+        )
+
+    return fake_gedi02ap
+
+
+def test_fetch_gedi_l2a_resumes_from_saved_tiles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bbox = (2.0, 48.0, 2.2, 48.2)
+    n_tiles = len(split_bbox(bbox, 10_000))
+    points = [(2.01, 48.01), (2.19, 48.19)]
+    tile_dir = tmp_path / "l2a.parquet.tiles"
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
+
+    calls: list[dict] = []
+    fake = _fake_gedi02ap_over(points, calls)
+
+    def interrupted(parms: dict) -> gpd.GeoDataFrame:
+        if len(calls) == 2:
+            raise KeyboardInterrupt
+        return fake(parms)
+
+    monkeypatch.setattr(gedi_module.gedi, "gedi02ap", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        fetch_gedi_l2a(bbox, max_size_m=10_000, tile_dir=tile_dir)
+    assert len(list(tile_dir.glob("[!.]*.parquet"))) == 2
+
+    calls.clear()
+    monkeypatch.setattr(gedi_module.gedi, "gedi02ap", fake)
+    resumed = fetch_gedi_l2a(bbox, max_size_m=10_000, tile_dir=tile_dir)
+
+    assert len(calls) == n_tiles - 2
+    expected = fetch_gedi_l2a(bbox, max_size_m=10_000)
+    assert sorted(zip(resumed.geometry.x, resumed.geometry.y, strict=True)) == sorted(points)
+    assert list(resumed.columns) == list(expected.columns)
+    assert resumed["elevation_lm"].dtype == expected["elevation_lm"].dtype
+
+
+def test_fetch_gedi_l2a_refuses_tiles_from_other_parameters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bbox = (2.0, 48.0, 2.05, 48.05)
+    tile_dir = tmp_path / "tiles"
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gedi_module.gedi, "gedi02ap", _fake_gedi02ap_over([], []))
+    fetch_gedi_l2a(
+        bbox, time_range=("2020-01-01T00:00:00Z", "2020-12-31T23:59:59Z"), tile_dir=tile_dir
+    )
+
+    with pytest.raises(ValueError, match="delete it"):
+        fetch_gedi_l2a(
+            bbox, time_range=("2021-01-01T00:00:00Z", "2021-12-31T23:59:59Z"), tile_dir=tile_dir
+        )
 
 
 def test_fetch_gedi_l2a_handles_empty_or_failed_response(monkeypatch: pytest.MonkeyPatch) -> None:

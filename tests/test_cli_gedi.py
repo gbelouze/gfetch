@@ -32,11 +32,17 @@ def test_gedi_cmd_resolves_rh_into_named_columns(
 ) -> None:
     captured = {}
 
-    def fake_fetch(bbox, time_range=None, fields=None, anc_fields=None, progress=None):
+    def fake_fetch(
+        bbox, time_range=None, fields=None, anc_fields=None, tile_dir=None, progress=None
+    ):
         captured["bbox"] = bbox
         captured["time_range"] = time_range
         captured["fields"] = fields
         captured["anc_fields"] = anc_fields
+        captured["tile_dir"] = tile_dir
+        assert tile_dir is not None
+        tile_dir.mkdir(parents=True)
+        (tile_dir / "tile.parquet").touch()
         return _fake_gdf(anc_fields)
 
     monkeypatch.setattr(gedi_module, "fetch_gedi_l2a", fake_fetch)
@@ -55,6 +61,8 @@ def test_gedi_cmd_resolves_rh_into_named_columns(
     assert captured["time_range"] == ("2020-01-01T00:00:00Z", "2020-06-01T23:59:59Z")
     assert captured["fields"] == GEDI_L2A_DEFAULT_FIELDS
     assert captured["anc_fields"] == ["quality_flag", "rh"]
+    assert captured["tile_dir"] == tmp_path / "l2a.parquet.tiles"
+    assert not captured["tile_dir"].exists()
 
     gdf = gpd.read_parquet(output)
     assert list(gdf[["rh0", "rh50", "rh100"]].iloc[0]) == [0.0, 50.0, 100.0]
@@ -67,7 +75,9 @@ def test_gedi_cmd_defaults_to_no_time_range_or_anc_fields(
 ) -> None:
     captured = {}
 
-    def fake_fetch(bbox, time_range=None, fields=None, anc_fields=None, progress=None):
+    def fake_fetch(
+        bbox, time_range=None, fields=None, anc_fields=None, tile_dir=None, progress=None
+    ):
         captured["time_range"] = time_range
         captured["anc_fields"] = anc_fields
         return _fake_gdf(anc_fields)

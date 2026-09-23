@@ -1,8 +1,9 @@
 import logging
+import shutil
 from pathlib import Path
 
 from gfetch.cli.gedi_config import load
-from gfetch.gedi import GEDI_L2A_DEFAULT_FIELDS, expand_rh, fetch_gedi_l2a
+from gfetch.gedi import GEDI_L2A_DEFAULT_FIELDS, expand_rh, fetch_gedi_l2a, write_geoparquet
 from gfetch.utils.progress import count_bar
 
 log = logging.getLogger(__name__)
@@ -38,6 +39,10 @@ def gedi(config_path: Path) -> None:
     Fetch GEDI L2A footprints matching a configuration's AOI/time range and write
     them to GeoParquet.
 
+    Resumable: each tile's footprints are saved under `<output>.tiles/` as soon as
+    they're fetched, and a rerun reuses them. That directory is removed once the
+    output is written.
+
     Parameters
     ----------
     config_path : Path
@@ -52,17 +57,21 @@ def gedi(config_path: Path) -> None:
     start = cfg.time_range.start if cfg.time_range is not None else None
     end = cfg.time_range.end if cfg.time_range is not None else None
     time_range = _to_time_range(start, end)
+    tile_dir = cfg.output.with_name(f"{cfg.output.name}.tiles")
     with count_bar() as progress:
         gdf = fetch_gedi_l2a(
             cfg.resolved_aoi.bbox,
             time_range=time_range,
             fields=cfg.fields if cfg.fields is not None else GEDI_L2A_DEFAULT_FIELDS,
             anc_fields=anc_fields or None,
+            tile_dir=tile_dir,
             progress=progress,
         )
     if cfg.rh_percentiles is not None:
         gdf = expand_rh(gdf, cfg.rh_percentiles)
 
-    cfg.output.parent.mkdir(parents=True, exist_ok=True)
-    gdf.to_parquet(cfg.output)
+    write_geoparquet(gdf, cfg.output)
     log.info(f"Wrote {len(gdf)} footprint(s) to {cfg.output}")
+    if tile_dir.exists():
+        shutil.rmtree(tile_dir)
+    log.debug(f"Removed per-tile results in {tile_dir}")
