@@ -1246,6 +1246,32 @@ that state was reached, and should be read chronologically, not as reference mat
     longer carry the 101-element array either. The raw array is only returned when
     `'rh'` is in `anc_fields` and `rh_percentiles` isn't set.
 
+- **2026-09-24** — GEDI L4A, at the user's request, filtered like geefetch's
+  `l4AQualityFilter` (`geefetch/data/satellites/gedi.py`).
+  - **CLI/config shape (user's choice among three)**: `gfetch gedi l2a|l4a CONFIG`,
+    each reading its own reserved section `gedi_l2a:`/`gedi_l4a:` (default output
+    `<output_dir>/gedi/<product>.parquet`). Alternatives rejected: a `products:`
+    list in one `gedi:` section (one run, but `output` stops being a single file),
+    or a scalar `product:` (two config files for both). The bare `gedi:` section is
+    gone; `gedi_config.load` raises on one rather than silently ignoring it.
+    `GediL2AConfig(GediConfig)` adds `rh_percentiles`, so a top-level
+    `rh_percentiles` is ignored for L4A like any other foreign generic field, and
+    one inside `gedi_l4a:` raises.
+  - Library: `fetch_gedi_l4a` shares the tiling/polygon/resume loop
+    (`_fetch_tiles`), request+edge dedup (`_request_tile`) and column selection
+    (`_select_columns`) with `fetch_gedi_l2a`; only the per-tile filtering differs.
+    Default fields `agbd`/`elevation`.
+  - Filter: `l4_quality_flag == 1`, `degrade_flag == 0` server-side
+    (`l4_quality_filter`/`degrade_filter`, documented in SlideRule's
+    `docs/user_guide/gedi.md`), `sensitivity >= 0.9` locally (`sensitivity` is in
+    `gedi04ap`'s fixed schema, no `anc_fields` needed).
+  - **Live-verified**: Fontainebleau AOI, 2020 full year - 63,496 raw L4A shots,
+    6,622 passing all three conditions counted locally on the unfiltered response,
+    exactly 6,622 returned by the server-filtered request (all of which already
+    have `sensitivity >= 0.9`), and 6,622 written by `gfetch gedi l4a`. `agbd_se`
+    works as an `anc_fields` name. `gedi04ap`'s fixed schema is `sensitivity`,
+    `beam`, `agbd`, `elevation`, `track`, `solar_elevation`, `flags`, `orbit`.
+
 - **2026-09-24** — `orbit_state: as_bands`, at the user's request: both orbit
   directions searched, each composited separately into `{band}_{orbit_state}`
   variables (`vv_ascending`, `vv_descending`, `vh_ascending`, `vh_descending`).

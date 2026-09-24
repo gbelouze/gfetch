@@ -8,13 +8,14 @@ from gfetch.cli.config import RESERVED_SECTION_KEYS, AOIConfig, TimeRangeConfig,
 
 log = logging.getLogger(__name__)
 
-__all__ = ["GediConfig", "load"]
+__all__ = ["GEDI_PRODUCTS", "GediConfig", "GediL2AConfig", "load"]
 
 
 @dataclass
 class GediConfig:
     """
-    GEDI L2A vector-fetch job configuration.
+    GEDI vector-fetch job configuration, as used for L4A (see `GediL2AConfig` for
+    L2A's extra fields).
 
     Its own schema, separate from the raster pipeline's `gfetch.cli.config.Config`
     (see `gfetch gedi`'s standalone-command design in `claude/tech-stack.md`) -
@@ -24,8 +25,9 @@ class GediConfig:
     Attributes
     ----------
     output : Path
-        Output GeoParquet file path. In a unified job config's `gedi:` section, this
-        defaults to `<generic output_dir>/gedi/l2a.parquet` if not set explicitly.
+        Output GeoParquet file path. In a unified job config's `gedi_<product>:`
+        section, this defaults to `<generic output_dir>/gedi/<product>.parquet` if
+        not set explicitly.
     aoi : AOIConfig | None
         Area of interest. Exactly one of `aoi`/`countries` must be given.
     countries : list[str] | None
@@ -33,23 +35,20 @@ class GediConfig:
         `gfetch.cli.config.resolve_aoi`. Exactly one of `aoi`/`countries` must be
         given.
     time_range : TimeRangeConfig | None
-        Time range to fetch. Defaults to None, which processes every GEDI L2A
+        Time range to fetch. Defaults to None, which processes every GEDI
         granule intersecting `aoi` across the whole mission archive
         (2019-present).
     fields : list[str] | None
-        Footprint columns to keep from SlideRule's fixed `gedi02ap` schema.
-        Defaults to None, which uses `gfetch.gedi.GEDI_L2A_DEFAULT_FIELDS`.
+        Footprint columns to keep from SlideRule's fixed response schema. Defaults
+        to None, which uses the product's default (e.g.
+        `gfetch.gedi.GEDI_L4A_DEFAULT_FIELDS`).
     anc_fields : list[str] | None
         Extra per-shot fields to read directly out of the source granule, via
-        `gfetch.gedi.fetch_gedi_l2a`'s `anc_fields`. Defaults to None (none
+        `gfetch.gedi.fetch_gedi_l4a`'s `anc_fields`. Defaults to None (none
         requested).
-    rh_percentiles : list[int] | None
-        Relative-height percentiles to return as named `rh{p}` columns, via
-        `gfetch.gedi.fetch_gedi_l2a`'s `rh_percentiles`. Defaults to None (no
-        `rh{p}` columns).
     quality_filter : bool
         Drop low-quality footprints like geefetch does, via
-        `gfetch.gedi.fetch_gedi_l2a`'s `quality_filter`. Defaults to True.
+        `gfetch.gedi.fetch_gedi_l4a`'s `quality_filter`. Defaults to True.
     """
 
     output: Path
@@ -58,7 +57,6 @@ class GediConfig:
     time_range: TimeRangeConfig | None = None
     fields: list[str] | None = None
     anc_fields: list[str] | None = None
-    rh_percentiles: list[int] | None = None
     quality_filter: bool = True
 
     def __post_init__(self) -> None:
@@ -79,49 +77,75 @@ class GediConfig:
         return self.aoi
 
 
-def load(path: Path) -> GediConfig:
+@dataclass
+class GediL2AConfig(GediConfig):
     """
-    Load and validate a GEDI job configuration from a unified YAML file's `gedi:`
-    section.
+    GEDI L2A vector-fetch job configuration.
 
-    The file's top level holds generic defaults; only the ones that are also
-    `GediConfig` fields apply here (plus `output_dir` - a raster-pipeline-style base
-    directory `output` defaults from) - a generic field that's only meaningful for
-    the raster pipeline (e.g. `n_workers`) is ignored, not an error. The reserved
-    `gedi` section key overrides those defaults, and *is* validated strictly (an
-    unknown key there raises). See `gfetch.cli.config.load`'s docstring for the full
-    unified-file convention (other reserved sections - `s1`/`s2`/`custom` - are
-    irrelevant here).
+    Attributes
+    ----------
+    rh_percentiles : list[int] | None
+        Relative-height percentiles to return as named `rh{p}` columns, via
+        `gfetch.gedi.fetch_gedi_l2a`'s `rh_percentiles`. Defaults to None (no
+        `rh{p}` columns).
+    """
+
+    rh_percentiles: list[int] | None = None
+
+
+GEDI_PRODUCTS: dict[str, type[GediConfig]] = {"l2a": GediL2AConfig, "l4a": GediConfig}
+
+
+def load(path: Path, product: str) -> GediConfig:
+    """
+    Load and validate one GEDI product's job configuration from a unified YAML
+    file's `gedi_<product>:` section.
+
+    The file's top level holds generic defaults; only the ones that are also fields
+    of the product's config class apply here (plus `output_dir` - a
+    raster-pipeline-style base directory `output` defaults from) - a generic field
+    that's only meaningful elsewhere (e.g. `n_workers`, or `rh_percentiles` for L4A)
+    is ignored, not an error. The reserved `gedi_<product>` section key overrides
+    those defaults, and *is* validated strictly (an unknown key there raises). See
+    `gfetch.cli.config.load`'s docstring for the full unified-file convention.
 
     Parameters
     ----------
     path : Path
         Path to the configuration YAML file.
+    product : str
+        Which GEDI product to load, a key of `GEDI_PRODUCTS`.
 
     Returns
     -------
     GediConfig
-        Fully validated configuration object. Raises `ValueError` (from
+        Fully validated configuration object, a `GediL2AConfig` for `'l2a'`.
+        Raises `ValueError` if the file has a bare `gedi:` section, or (from
         `gfetch.cli.config.resolve_aoi`) if neither/both of `aoi`/`countries` are
         given.
     """
-    log.debug(f"Loading GEDI config from {path}")
+    log.debug(f"Loading GEDI {product} config from {path}")
+    config_cls = GEDI_PRODUCTS[product]
     raw = OmegaConf.load(path)
     assert isinstance(raw, DictConfig), f"{path} must be a YAML mapping, not a list"
-    gedi_field_names = {f.name for f in fields(GediConfig)}
+    if "gedi" in raw:
+        msg = f"{path}: unknown section `gedi:`, use `gedi_l2a:`/`gedi_l4a:`"
+        log.error(msg)
+        raise ValueError(msg)
+    gedi_field_names = {f.name for f in fields(config_cls)}
     output_dir = raw.get("output_dir")
     generic = OmegaConf.create(
         {k: v for k, v in raw.items() if k in gedi_field_names and k not in RESERVED_SECTION_KEYS}
     )
-    section = raw.get("gedi", OmegaConf.create({}))
+    section = raw.get(f"gedi_{product}", OmegaConf.create({}))
     assert isinstance(section, DictConfig)
 
     overrides = OmegaConf.merge(generic, section)
     assert isinstance(overrides, DictConfig)
     if "output" not in section and output_dir is not None:
-        overrides["output"] = str(Path(str(output_dir)) / "gedi" / "l2a.parquet")
+        overrides["output"] = str(Path(str(output_dir)) / "gedi" / f"{product}.parquet")
 
-    structured = OmegaConf.structured(GediConfig)
+    structured = OmegaConf.structured(config_cls)
     merged = OmegaConf.merge(structured, overrides)
     OmegaConf.resolve(merged)
     cfg: GediConfig = OmegaConf.to_object(merged)  # type: ignore[assignment]

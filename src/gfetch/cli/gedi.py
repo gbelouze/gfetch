@@ -2,8 +2,14 @@ import logging
 import shutil
 from pathlib import Path
 
-from gfetch.cli.gedi_config import load
-from gfetch.gedi import GEDI_L2A_DEFAULT_FIELDS, fetch_gedi_l2a, write_geoparquet
+from gfetch.cli.gedi_config import GediL2AConfig, load
+from gfetch.gedi import (
+    GEDI_L2A_DEFAULT_FIELDS,
+    GEDI_L4A_DEFAULT_FIELDS,
+    fetch_gedi_l2a,
+    fetch_gedi_l4a,
+    write_geoparquet,
+)
 from gfetch.utils.progress import count_bar
 
 log = logging.getLogger(__name__)
@@ -34,10 +40,10 @@ def _to_time_range(start: str | None, end: str | None) -> tuple[str, str] | None
     return (t0, t1)
 
 
-def gedi(config_path: Path) -> None:
+def gedi(config_path: Path, product: str) -> None:
     """
-    Fetch GEDI L2A footprints matching a configuration's AOI/time range and write
-    them to GeoParquet.
+    Fetch one GEDI product's footprints matching a configuration's AOI/time range
+    and write them to GeoParquet.
 
     Resumable: each tile's footprints are saved under `<output>.tiles/` as soon as
     they're fetched, and a rerun reuses them. That directory is removed once the
@@ -47,8 +53,10 @@ def gedi(config_path: Path) -> None:
     ----------
     config_path : Path
         Path to the configuration YAML file.
+    product : str
+        `'l2a'` or `'l4a'`, read from the config's `gedi_<product>:` section.
     """
-    cfg = load(config_path)
+    cfg = load(config_path, product)
 
     start = cfg.time_range.start if cfg.time_range is not None else None
     end = cfg.time_range.end if cfg.time_range is not None else None
@@ -61,18 +69,29 @@ def gedi(config_path: Path) -> None:
 
         polygon = resolve_country_polygon(cfg.countries)
 
+    common = {
+        "time_range": time_range,
+        "anc_fields": cfg.anc_fields,
+        "polygon": polygon,
+        "quality_filter": cfg.quality_filter,
+        "tile_dir": tile_dir,
+    }
     with count_bar() as progress:
-        gdf = fetch_gedi_l2a(
-            cfg.resolved_aoi.bbox,
-            time_range=time_range,
-            fields=cfg.fields if cfg.fields is not None else GEDI_L2A_DEFAULT_FIELDS,
-            anc_fields=cfg.anc_fields,
-            polygon=polygon,
-            rh_percentiles=cfg.rh_percentiles,
-            quality_filter=cfg.quality_filter,
-            tile_dir=tile_dir,
-            progress=progress,
-        )
+        if isinstance(cfg, GediL2AConfig):
+            gdf = fetch_gedi_l2a(
+                cfg.resolved_aoi.bbox,
+                fields=cfg.fields if cfg.fields is not None else GEDI_L2A_DEFAULT_FIELDS,
+                rh_percentiles=cfg.rh_percentiles,
+                progress=progress,
+                **common,
+            )
+        else:
+            gdf = fetch_gedi_l4a(
+                cfg.resolved_aoi.bbox,
+                fields=cfg.fields if cfg.fields is not None else GEDI_L4A_DEFAULT_FIELDS,
+                progress=progress,
+                **common,
+            )
     write_geoparquet(gdf, cfg.output)
     log.info(f"Wrote {len(gdf)} footprint(s) to {cfg.output}")
     if tile_dir.exists():

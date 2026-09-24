@@ -8,7 +8,7 @@ import yaml
 from gfetch import countries as countries_module
 from gfetch.cli import gedi as gedi_module
 from gfetch.cli.gedi import gedi as gedi_cmd
-from gfetch.gedi import GEDI_L2A_DEFAULT_FIELDS
+from gfetch.gedi import GEDI_L2A_DEFAULT_FIELDS, GEDI_L4A_DEFAULT_FIELDS
 
 
 def _write_config(path: Path, **overrides: object) -> Path:
@@ -48,7 +48,7 @@ def test_gedi_cmd_passes_config_to_fetch(tmp_path: Path, monkeypatch: pytest.Mon
         anc_fields=["quality_flag"],
         rh_percentiles=[0, 50, 100],
     )
-    gedi_cmd(config_path)
+    gedi_cmd(config_path, "l2a")
 
     assert (tmp_path / "l2a.parquet").exists()
     assert captured["bbox"] == (2.2, 48.7, 2.5, 49.0)
@@ -71,7 +71,7 @@ def test_gedi_cmd_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
 
     monkeypatch.setattr(gedi_module, "fetch_gedi_l2a", fake_fetch)
 
-    gedi_cmd(_write_config(tmp_path / "config.yaml"))
+    gedi_cmd(_write_config(tmp_path / "config.yaml"), "l2a")
 
     assert captured["time_range"] is None
     assert captured["anc_fields"] is None
@@ -89,7 +89,7 @@ def test_gedi_cmd_quality_filter_can_be_disabled(
 
     monkeypatch.setattr(gedi_module, "fetch_gedi_l2a", fake_fetch)
 
-    gedi_cmd(_write_config(tmp_path / "config.yaml", quality_filter=False))
+    gedi_cmd(_write_config(tmp_path / "config.yaml", quality_filter=False), "l2a")
 
     assert captured["quality_filter"] is False
 
@@ -106,7 +106,40 @@ def test_gedi_cmd_passes_country_polygon(tmp_path: Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(gedi_module, "fetch_gedi_l2a", fake_fetch)
 
     config_path = _write_config(tmp_path / "config.yaml", aoi=None, countries=["Mozambique"])
-    gedi_cmd(config_path)
+    gedi_cmd(config_path, "l2a")
 
     assert captured["bbox"] == (29.0, -27.0, 41.0, -1.0)
     assert captured["polygon"] is polygon
+
+
+def test_gedi_cmd_l4a_fetches_l4a(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    def fake_fetch(bbox: tuple, **kwargs: object) -> gpd.GeoDataFrame:
+        captured.update(kwargs)
+        return _fake_gdf()
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise AssertionError("L2A fetched for an L4A job")
+
+    monkeypatch.setattr(gedi_module, "fetch_gedi_l4a", fake_fetch)
+    monkeypatch.setattr(gedi_module, "fetch_gedi_l2a", fail)
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.dump(
+            {
+                "aoi": {"left": 2.2, "bottom": 48.7, "right": 2.5, "top": 49.0},
+                "output_dir": str(tmp_path),
+                "rh_percentiles": [98],
+                "gedi_l4a": {"anc_fields": ["agbd_se"]},
+            }
+        )
+    )
+    gedi_cmd(config_path, "l4a")
+
+    assert (tmp_path / "gedi" / "l4a.parquet").exists()
+    assert captured["fields"] == GEDI_L4A_DEFAULT_FIELDS
+    assert captured["anc_fields"] == ["agbd_se"]
+    assert captured["quality_filter"] is True
+    assert "rh_percentiles" not in captured

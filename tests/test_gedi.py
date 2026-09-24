@@ -11,9 +11,11 @@ from gfetch import gedi as gedi_module
 from gfetch.gedi import (
     GEDI_L2A_DEFAULT_FIELDS,
     GEDI_L2A_RH_PERCENTILES,
+    GEDI_L4A_DEFAULT_FIELDS,
     _bbox_to_poly,
     expand_rh,
     fetch_gedi_l2a,
+    fetch_gedi_l4a,
     split_bbox,
 )
 
@@ -390,6 +392,59 @@ def test_expand_rh_splits_percentile_array_into_named_columns() -> None:
     assert expanded["rh100"].tolist() == [100.0]
 
 
+def test_fetch_gedi_l4a_quality_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_parms = {}
+
+    def fake_gedi04ap(parms: dict) -> gpd.GeoDataFrame:
+        captured_parms.update(parms)
+        return gpd.GeoDataFrame(
+            {
+                "agbd": [10.0, 20.0],
+                "elevation": [100.0, 110.0],
+                "sensitivity": [0.95, 0.5],
+                "agbd_se": [1.0, 2.0],
+            },
+            geometry=gpd.points_from_xy([2.01, 2.02], [48.01, 48.02]),
+            crs="EPSG:7912",
+        )
+
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gedi_module.gedi, "gedi04ap", fake_gedi04ap)
+
+    gdf = fetch_gedi_l4a((2.0, 48.0, 2.1, 48.1), anc_fields=["agbd_se"])
+
+    assert gdf.geometry.x.tolist() == [2.01]
+    assert list(gdf.columns) == [*GEDI_L4A_DEFAULT_FIELDS, "agbd_se", gdf.geometry.name]
+    assert captured_parms["l4_quality_filter"] is True
+    assert captured_parms["degrade_filter"] is True
+    assert "l2_quality_filter" not in captured_parms
+    assert captured_parms["anc_fields"] == ["agbd_se"]
+
+
+def test_fetch_gedi_l4a_without_quality_filter_requests_no_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_parms = {}
+
+    def fake_gedi04ap(parms: dict) -> gpd.GeoDataFrame:
+        captured_parms.update(parms)
+        return gpd.GeoDataFrame(
+            {"agbd": [10.0], "elevation": [100.0], "sensitivity": [0.5]},
+            geometry=gpd.points_from_xy([2.01], [48.01]),
+            crs="EPSG:7912",
+        )
+
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gedi_module.gedi, "gedi04ap", fake_gedi04ap)
+
+    gdf = fetch_gedi_l4a((2.0, 48.0, 2.1, 48.1), quality_filter=False)
+
+    assert len(gdf) == 1
+    assert "l4_quality_filter" not in captured_parms
+    assert "degrade_filter" not in captured_parms
+    assert "anc_fields" not in captured_parms
+
+
 @pytest.mark.slow
 def test_fetch_gedi_l2a_returns_footprints_over_france() -> None:
     bbox = (2.55, 48.35, 2.75, 48.50)
@@ -453,3 +508,27 @@ def test_fetch_gedi_l2a_anc_fields_and_rh_percentiles_over_france() -> None:
     assert (gdf["solar_elevation"] <= 0).all()
     assert (gdf["sensitivity"] >= 0.9).all()
     assert gdf["rh98"].between(0, 80).all()
+
+
+@pytest.mark.slow
+def test_fetch_gedi_l4a_returns_filtered_footprints_over_france() -> None:
+    bbox = (2.55, 48.35, 2.75, 48.50)
+
+    gdf = fetch_gedi_l4a(
+        bbox,
+        time_range=("2020-01-01T00:00:00Z", "2020-12-31T23:59:59Z"),
+        fields=None,
+        anc_fields=["l4_quality_flag", "degrade_flag", "agbd_se"],
+    )
+
+    assert len(gdf) > 0
+    for field in (*GEDI_L4A_DEFAULT_FIELDS, "sensitivity", "agbd_se"):
+        assert field in gdf.columns
+    assert (gdf["l4_quality_flag"] == 1).all()
+    assert (gdf["degrade_flag"] == 0).all()
+    assert (gdf["sensitivity"] >= 0.9).all()
+    minx, miny, maxx, maxy = gdf.total_bounds
+    assert bbox[0] <= minx
+    assert maxx <= bbox[2]
+    assert bbox[1] <= miny
+    assert maxy <= bbox[3]

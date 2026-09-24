@@ -68,17 +68,18 @@ def test_custom_satellite_commands_pass_through_name(monkeypatch: pytest.MonkeyP
     ]
 
 
-def test_gedi_command_stays_bare(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[Path] = []
+def test_gedi_commands_dispatch_with_correct_product(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[Path, str]] = []
 
-    def fake_gedi(config_path: Path) -> None:
-        calls.append(config_path)
+    def fake_gedi(config_path: Path, product: str) -> None:
+        calls.append((config_path, product))
 
     monkeypatch.setattr("gfetch.cli.gedi.gedi", fake_gedi)
 
-    app(["gedi", "config.yaml"], result_action="return_value")
+    app(["gedi", "l2a", "config.yaml"], result_action="return_value")
+    app(["gedi", "l4a", "config.yaml"], result_action="return_value")
 
-    assert calls == [Path("config.yaml")]
+    assert calls == [(Path("config.yaml"), "l2a"), (Path("config.yaml"), "l4a")]
 
 
 def test_pack_and_clean_dispatch_with_correct_satellite_key(

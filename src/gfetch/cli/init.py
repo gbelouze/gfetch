@@ -35,8 +35,8 @@ def init(output: Path | None = None, force: bool = False) -> None:
         "time_range": {"start": "2024-01-01", "end": "2024-06-01"},
         "output_dir": str(output_path.parent),
         # Per-satellite sections override the generic fields above for their own
-        # `gfetch <key> <verb>` run - see `gfetch.cli.config.load`. `s1`/`gedi`/
-        # `custom` sections are also available; add whichever you need.
+        # `gfetch <key> <verb>` run - see `gfetch.cli.config.load`. `s1`/`gedi_l2a`/
+        # `gedi_l4a`/`custom` sections are also available; add whichever you need.
         "s2": {"source": "earthsearch", "bands": ["red", "green", "blue"]},
     }
 

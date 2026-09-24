@@ -974,10 +974,10 @@ requesting all fourteen working `anc_fields` at once.
   archive (2019-present) for every granule intersecting the bbox - fine for a small
   POC AOI (164 granules/183k footprints for a ~20x15km box), but worth a sane default
   or an explicit warning before this is used at country scale.
-- L1B (waveforms) and L4A (biomass) follow the exact same `gedi01bp`/`gedi04ap`
-  pattern as L2A (same `parms` shape, same `__processing_request` plumbing in
-  `gedi.py`) - not built, but should be a small, mechanical addition to
-  `gfetch/gedi.py` given the shared client code, if/when needed.
+- L1B (waveforms) follows the exact same `gedi01bp` pattern as L2A (same `parms`
+  shape, same `__processing_request` plumbing in `gedi.py`) - not built.
+  **L4A built 2026-09-24** (`fetch_gedi_l4a`, `gfetch gedi l4a`, see
+  `claude/tasks.md`).
 - Full-France-scale GEDI request (as opposed to the small POC AOI actually exercised)
   not yet tried - resource/granule count and request duration at that scale are
   unknown.

@@ -29,7 +29,7 @@ ORBIT_STATE_AS_BANDS = "as_bands"
 # Section keys reserved in a unified job config file (see `load`'s docstring) - not
 # valid `Config` field names, so they're stripped out of the "generic" dict before
 # merging a satellite's section over it.
-RESERVED_SECTION_KEYS = frozenset({"s1", "s2", "gedi", "custom"})
+RESERVED_SECTION_KEYS = frozenset({"s1", "s2", "gedi_l2a", "gedi_l4a", "custom"})
 
 # CLI satellite key -> canonical `gfetch.profiles`/`gfetch.sources` satellite name,
 # force-set by `load` regardless of what a config's section itself contains.
@@ -330,14 +330,14 @@ def load(path: Path, satellite_key: str) -> Config:
     The file's top level holds generic defaults; only the ones that are also
     `Config` fields apply here (a generic field that's only meaningful elsewhere,
     e.g. GEDI's `fields`, is ignored, not an error). The reserved section keys
-    `s1`/`s2`/`gedi`/`custom` override those defaults for that satellite only
-    (`gedi` is irrelevant here - `gfetch.cli.gedi_config.load` reads it), and the
-    selected section *is* validated strictly (an unknown key there raises). A
-    built-in (`s1`/`s2`) section's `satellite` is force-set from `BUILTIN_SATELLITES`
-    regardless of what the section itself contains; a `custom.<name>` section must
-    supply `collection` and `bands` explicitly (there's no `gfetch.profiles`/
-    `gfetch.sources` registry entry for an arbitrary satellite name), and defaults
-    `satellite` to `<name>` if not given. Either way, `output_dir` defaults to
+    `s1`/`s2`/`gedi_l2a`/`gedi_l4a`/`custom` override those defaults for that
+    satellite only (`gedi_*` are irrelevant here - `gfetch.cli.gedi_config.load`
+    reads them), and the selected section *is* validated strictly (an unknown key
+    there raises). A built-in (`s1`/`s2`) section's `satellite` is force-set from
+    `BUILTIN_SATELLITES` regardless of what the section itself contains; a
+    `custom.<name>` section must supply `collection` and `bands` explicitly (there's
+    no `gfetch.profiles`/`gfetch.sources` registry entry for an arbitrary satellite
+    name), and defaults `satellite` to `<name>` if not given. Either way, `output_dir` defaults to
     `<generic output_dir>/<satellite_key>` unless the section sets its own.
 
     Parameters

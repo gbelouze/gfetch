@@ -320,17 +320,22 @@ def _custom_clean(name: str, config: Path, verbose: bool = False) -> None:
 app.command(custom_app)
 
 
-@app.command
-def gedi(config: Path, verbose: bool = False) -> None:
-    """
-    Fetch GEDI L2A footprints matching a configuration's AOI/time range via
-    SlideRule and write them to GeoParquet.
+gedi_app = cyclopts.App(
+    name="gedi",
+    help=(
+        "GEDI footprints via SlideRule, written to GeoParquet. Standalone, independent "
+        "of the raster search/download/mosaic pipeline: SlideRule resolves matching "
+        "granules and subsets them server-side, so there's no separate search/download "
+        "stage and no local asset cache."
+    ),
+)
 
-    Standalone command, independent of the raster search/download/mosaic pipeline
-    and its `Config` schema: SlideRule resolves matching granules and subsets them
-    server-side, so there's no separate search/download stage and no local asset
-    cache. Uses its own config schema, `gfetch.cli.gedi_config.GediConfig`, read
-    from the same job config's `gedi:` section.
+
+@gedi_app.command(name="l2a")
+def _gedi_l2a(config: Path, verbose: bool = False) -> None:
+    """
+    Fetch GEDI L2A (elevation, relative height) footprints matching a
+    configuration's AOI/time range, from its `gedi_l2a:` section.
 
     Parameters
     ----------
@@ -342,7 +347,29 @@ def gedi(config: Path, verbose: bool = False) -> None:
     _setup_logging(level=logging.DEBUG if verbose else logging.INFO)
     from gfetch.cli.gedi import gedi as gedi_cmd
 
-    gedi_cmd(config)
+    gedi_cmd(config, "l2a")
+
+
+@gedi_app.command(name="l4a")
+def _gedi_l4a(config: Path, verbose: bool = False) -> None:
+    """
+    Fetch GEDI L4A (aboveground biomass density) footprints matching a
+    configuration's AOI/time range, from its `gedi_l4a:` section.
+
+    Parameters
+    ----------
+    config : Path
+        Path to the configuration YAML file.
+    verbose : bool
+        Enable verbose (DEBUG) logging. Defaults to False.
+    """
+    _setup_logging(level=logging.DEBUG if verbose else logging.INFO)
+    from gfetch.cli.gedi import gedi as gedi_cmd
+
+    gedi_cmd(config, "l4a")
+
+
+app.command(gedi_app)
 
 
 if __name__ == "__main__":
