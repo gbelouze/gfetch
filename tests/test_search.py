@@ -172,10 +172,12 @@ def test_search_earthsearch_sentinel1_orbit_state_filter() -> None:
 @pytest.mark.parametrize(
     "datetime_range",
     [
-        "2022-01-01/2022-09-30",
         "2021-12-15/2022-01-10",
+        "2022-12-01/2023-02-01",
+        "2021-01-01/2023-12-31",
         "2019-06-01/2020-06-01",
         "2021-01-01/..",
+        "../2022-03-01",
     ],
 )
 def test_search_refuses_known_earthsearch_c1_gaps(
@@ -212,3 +214,26 @@ def test_search_allows_time_ranges_outside_known_gaps(
 
     with pytest.raises(_Searched):
         search(get_source(source), "sentinel-2", (-1.0, 45.6, 2.0, 47.7), datetime_range)
+
+
+@pytest.mark.parametrize(
+    "datetime_range",
+    ["2022-01-01/2022-12-31", "2022-02-01T00:00:00Z/2022-05-01T00:00:00Z"],
+)
+def test_search_falls_back_within_earthsearch_c1_2022_gap(
+    datetime_range: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    requested_collections: list[list[str]] = []
+    monkeypatch.setattr(
+        pystac_client.Client,
+        "open",
+        staticmethod(lambda url: _FakeCatalog(requested_collections)),
+    )
+
+    with caplog.at_level("WARNING"):
+        search(get_source("earthsearch"), "sentinel-2", (-1.0, 45.6, 2.0, 47.7), datetime_range)
+
+    assert requested_collections == [["sentinel-2-l2a"]]
+    assert any(
+        r.levelname == "WARNING" and "sentinel-2-l2a" in r.getMessage() for r in caplog.records
+    )

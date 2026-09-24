@@ -634,8 +634,15 @@ Jan-Sep, distinct (tile, date) pairs:
 | 2022 | 45 items | 1,372 items |
 | 2023-2025 | matches | matches |
 
-`search()` now refuses a time range overlapping either gap (`gfetch.sources.
-_COLLECTION_GAPS`).
+`search()` refuses a time range overlapping either gap (`gfetch.sources.
+_COLLECTION_GAPS`), except one lying entirely within 2022: that is searched against
+Earth Search's `sentinel-2-l2a` instead, with a warning. Checked live 2026-09-23 over
+Mozambique (tile 36LYJ): same asset keys, `grid:code` and `raster:bands` scale 1e-4 /
+offset -0.1 as C1, `earthsearch:boa_offset_applied: true` from baseline 04.00 on. Its
+items before 25 Jan 2022 are baseline 03.01 (offset 0, `boa_offset_applied: false`), and
+`mosaic` stores raw DNs, so a composite reaching into 1-24 Jan 2022 mixes DN encodings.
+A time range straddling 2022 and another year still raises, since it would composite C0
+and C1 items together.
 
 Planetary Computer's `sentinel-2-l2a` is complete but not equivalent: it serves ESA's
 products as produced at the time, so baselines are mixed. 2019: 02.12 almost

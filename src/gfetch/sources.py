@@ -7,9 +7,12 @@ search endpoint and collection-id mapping.
 """
 
 import datetime
+import logging
 from dataclasses import dataclass
 
-__all__ = ["SOURCES", "StacSource", "check_collection_coverage", "get_source"]
+__all__ = ["SOURCES", "StacSource", "get_source", "resolve_collection"]
+
+log = logging.getLogger(__name__)
 
 _SENTINEL2_COLLECTIONS = {
     "earthsearch": "sentinel-2-c1-l2a",
@@ -21,16 +24,51 @@ _SENTINEL1_COLLECTIONS = {
     "planetary-computer": "sentinel-1-grd",
 }
 
-# Periods a collection is known to be missing, as (first day, last day) inclusive, keyed
-# by (source name, collection id). Earth Search's Collection 1 only holds data
+
+@dataclass(frozen=True)
+class _CollectionGap:
+    """
+    A period a collection is known to be missing.
+
+    Attributes
+    ----------
+    start : datetime.date
+        First missing day.
+    end : datetime.date
+        Last missing day.
+    fallback : str | None
+        Collection on the same source to search instead when a time range falls
+        entirely within the gap, or None to refuse such time ranges.
+    fallback_caveat : str
+        Appended to the warning logged when `fallback` is used. Defaults to ''.
+    """
+
+    start: datetime.date
+    end: datetime.date
+    fallback: str | None = None
+    fallback_caveat: str = ""
+
+
+# Keyed by (source name, collection id). Earth Search's Collection 1 only holds data
 # reprocessed by ESA to baseline 05.00+, and per Earth Search's own documentation (as of
 # April 2024) that reprocessing hasn't reached Nov 2016 - Nov 2019 or 2022. Confirmed
 # live 2026-09-23: 45 items for Jan-Sep 2022 over a 230 km box in France, against 1,372
-# in `sentinel-2-l2a`.
-_COLLECTION_GAPS: dict[tuple[str, str], list[tuple[datetime.date, datetime.date]]] = {
+# in `sentinel-2-l2a`. That older collection has the same asset keys, `grid:code` and
+# `raster:bands` scale/offset as Collection 1, but its items before 25 Jan 2022 are
+# baseline 03.01, whose DNs lack the +1000 offset every later baseline carries.
+_COLLECTION_GAPS: dict[tuple[str, str], list[_CollectionGap]] = {
     ("earthsearch", "sentinel-2-c1-l2a"): [
-        (datetime.date(2016, 11, 1), datetime.date(2019, 11, 30)),
-        (datetime.date(2022, 1, 1), datetime.date(2022, 12, 31)),
+        _CollectionGap(datetime.date(2016, 11, 1), datetime.date(2019, 11, 30)),
+        _CollectionGap(
+            datetime.date(2022, 1, 1),
+            datetime.date(2022, 12, 31),
+            fallback="sentinel-2-l2a",
+            fallback_caveat=(
+                "Its items before 2022-01-25 are processing baseline 03.01, whose "
+                "reflectance DNs lack the +1000 offset of every later baseline and of "
+                "Collection 1; gfetch does not harmonize them."
+            ),
+        ),
     ],
 }
 
@@ -106,35 +144,60 @@ def get_source(name: str) -> StacSource:
         raise ValueError(f"Unknown source {name!r}; known sources: {sorted(SOURCES)}") from e
 
 
-def check_collection_coverage(
+def resolve_collection(
     source: StacSource,
     collection: str,
     start: datetime.date | None,
     end: datetime.date | None,
-) -> None:
+) -> str:
     """
-    Check a time range against the periods a collection is known to be missing.
+    Resolve the collection to search for a time range, given the periods a collection
+    is known to be missing.
 
     Parameters
     ----------
     source : StacSource
         STAC API source the collection is searched on.
     collection : str
-        Collection id.
+        Requested collection id.
     start : datetime.date | None
         First day of the time range, or None if open-ended.
     end : datetime.date | None
         Last day of the time range, or None if open-ended.
 
+    Returns
+    -------
+    str
+        `collection` if the time range overlaps none of its known gaps, else the
+        fallback collection of the gap the time range falls entirely within.
+
     Raises
     ------
     ValueError
-        If the time range overlaps a known gap of `collection` on `source`.
+        If the time range overlaps a known gap of `collection` on `source` that has no
+        fallback, or that it doesn't fall entirely within.
     """
-    for gap_start, gap_end in _COLLECTION_GAPS.get((source.name, collection), []):
-        if (start is None or start <= gap_end) and (end is None or end >= gap_start):
-            raise ValueError(
-                f"{source.name} collection {collection!r} is missing data from {gap_start} "
-                f"to {gap_end}, which overlaps the requested time range {start}/{end}. "
-                "Choose a time range outside that period, or another source."
+    for gap in _COLLECTION_GAPS.get((source.name, collection), []):
+        if not ((start is None or start <= gap.end) and (end is None or end >= gap.start)):
+            continue
+        within = start is not None and end is not None and gap.start <= start and end <= gap.end
+        if gap.fallback is not None and within:
+            log.warning(
+                f"!!! {source.name} collection {collection!r} is missing data from "
+                f"{gap.start} to {gap.end}: searching {gap.fallback!r} instead for "
+                f"{start}/{end}. Its items are not Collection 1 reprocessed data, so "
+                f"this mosaic is not radiometrically equivalent to one outside that "
+                f"period. {gap.fallback_caveat}".rstrip()
             )
+            return gap.fallback
+        hint = (
+            f"Split the time range so that each part lies either entirely outside or "
+            f"entirely within that period ({gap.fallback!r} is searched instead within it)."
+            if gap.fallback is not None
+            else "Choose a time range outside that period, or another source."
+        )
+        raise ValueError(
+            f"{source.name} collection {collection!r} is missing data from {gap.start} "
+            f"to {gap.end}, which overlaps the requested time range {start}/{end}. {hint}"
+        )
+    return collection

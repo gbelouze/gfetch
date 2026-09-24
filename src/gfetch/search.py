@@ -6,7 +6,7 @@ import logging
 import pystac
 import pystac_client
 
-from gfetch.sources import StacSource, check_collection_coverage
+from gfetch.sources import StacSource, resolve_collection
 
 log = logging.getLogger(__name__)
 
@@ -120,7 +120,7 @@ def search(
     """
     collection = collection or source.collection(satellite)
     try:
-        check_collection_coverage(source, collection, *_parse_date_range(datetime))
+        collection = resolve_collection(source, collection, *_parse_date_range(datetime))
     except ValueError as e:
         log.error(e)
         raise
