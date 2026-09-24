@@ -4,6 +4,7 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import pytest
+import shapely
 import sliderule.sliderule as sliderule_core
 
 from gfetch import gedi as gedi_module
@@ -15,6 +16,21 @@ from gfetch.gedi import (
     fetch_gedi_l2a,
     split_bbox,
 )
+
+
+def _shots(xs: list[float], ys: list[float], **columns: list) -> gpd.GeoDataFrame:
+    """A `gedi02ap`-like response of footprints at `(xs, ys)` passing every quality
+    filter (`rh98 == 49`), with `columns` overriding or adding columns.
+    """
+    data: dict[str, list] = {
+        "elevation_lm": list(xs),
+        "elevation_hr": list(ys),
+        "solar_elevation": [-10.0] * len(xs),
+        "sensitivity": [0.95] * len(xs),
+        "rh": [np.arange(101) * 0.5 for _ in xs],
+        **columns,
+    }
+    return gpd.GeoDataFrame(data, geometry=gpd.points_from_xy(xs, ys), crs="EPSG:7912")
 
 
 def test_session_init_defaults_trust_env_to_true() -> None:
@@ -88,11 +104,7 @@ def test_fetch_gedi_l2a_splits_into_tiles_without_duplicates(
         if not inside:
             return sliderule_core.emptyframe(crs="EPSG:7912")
         xs, ys = zip(*inside, strict=True)
-        return gpd.GeoDataFrame(
-            {"elevation_lm": list(xs), "elevation_hr": list(ys)},
-            geometry=gpd.points_from_xy(xs, ys),
-            crs="EPSG:7912",
-        )
+        return _shots(list(xs), list(ys))
 
     monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
     monkeypatch.setattr(gedi_module.gedi, "gedi02ap", fake_gedi02ap)
@@ -126,13 +138,31 @@ def _fake_gedi02ap_over(
         if not inside:
             return sliderule_core.emptyframe(crs="EPSG:7912")
         xs, ys = zip(*inside, strict=True)
-        return gpd.GeoDataFrame(
-            {"elevation_lm": list(xs), "elevation_hr": list(ys)},
-            geometry=gpd.points_from_xy(xs, ys),
-            crs="EPSG:7912",
-        )
+        return _shots(list(xs), list(ys))
 
     return fake_gedi02ap
+
+
+def test_fetch_gedi_l2a_skips_tiles_outside_polygon(monkeypatch: pytest.MonkeyPatch) -> None:
+    bbox = (2.0, 48.0, 2.2, 48.2)
+    polygon = shapely.Polygon([(2.0, 48.0), (2.2, 48.0), (2.0, 48.2)])
+    tiles = split_bbox(bbox, 10_000)
+    expected = [t for t in tiles if polygon.intersects(shapely.box(*t))]
+    calls: list[dict] = []
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gedi_module.gedi, "gedi02ap", _fake_gedi02ap_over([], calls))
+
+    fetch_gedi_l2a(bbox, max_size_m=10_000, polygon=polygon)
+
+    assert 0 < len(expected) < len(tiles)
+    assert [c["poly"] for c in calls] == [_bbox_to_poly(t) for t in expected]
+
+
+def test_fetch_gedi_l2a_refuses_polygon_outside_bbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gedi_module.gedi, "gedi02ap", _fake_gedi02ap_over([], []))
+
+    with pytest.raises(ValueError, match="doesn't intersect"):
+        fetch_gedi_l2a((2.0, 48.0, 2.1, 48.1), polygon=shapely.box(10.0, 10.0, 11.0, 11.0))
 
 
 def test_fetch_gedi_l2a_resumes_from_saved_tiles(
@@ -218,7 +248,9 @@ def test_fetch_gedi_l2a_missing_field_on_nonempty_response_raises(
     )
 
     with pytest.raises(KeyError, match="typo_field"):
-        fetch_gedi_l2a((2.0, 48.0, 2.1, 48.1), fields=("elevation_lm", "typo_field"))
+        fetch_gedi_l2a(
+            (2.0, 48.0, 2.1, 48.1), fields=("elevation_lm", "typo_field"), quality_filter=False
+        )
 
 
 def test_fetch_gedi_l2a_passes_anc_fields_to_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -235,7 +267,7 @@ def test_fetch_gedi_l2a_passes_anc_fields_to_request(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
     monkeypatch.setattr(gedi_module.gedi, "gedi02ap", fake_gedi02ap)
 
-    fetch_gedi_l2a((2.0, 48.0, 2.1, 48.1), anc_fields=["quality_flag"])
+    fetch_gedi_l2a((2.0, 48.0, 2.1, 48.1), anc_fields=["quality_flag"], quality_filter=False)
 
     assert captured_parms["anc_fields"] == ["quality_flag"]
 
@@ -258,10 +290,90 @@ def test_fetch_gedi_l2a_keeps_anc_fields_regardless_of_fields(
     )
 
     gdf = fetch_gedi_l2a(
-        (2.0, 48.0, 2.1, 48.1), fields=("elevation_lm",), anc_fields=["quality_flag"]
+        (2.0, 48.0, 2.1, 48.1),
+        fields=("elevation_lm",),
+        anc_fields=["quality_flag"],
+        quality_filter=False,
     )
 
     assert list(gdf.columns) == ["elevation_lm", "quality_flag", gdf.geometry.name]
+
+
+def test_fetch_gedi_l2a_quality_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    good_rh = np.arange(101) * 0.5
+    bad_rh = np.arange(101) * 1.0
+    bad_rh[98] = 81.0
+    captured_parms = {}
+
+    def fake_gedi02ap(parms: dict) -> gpd.GeoDataFrame:
+        captured_parms.update(parms)
+        return _shots(
+            [2.01, 2.02, 2.03, 2.04],
+            [48.01, 48.02, 48.03, 48.04],
+            solar_elevation=[-10.0, 5.0, -10.0, -10.0],
+            sensitivity=[0.95, 0.95, 0.5, 0.95],
+            rh=[good_rh, good_rh, good_rh, bad_rh],
+        )
+
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gedi_module.gedi, "gedi02ap", fake_gedi02ap)
+
+    gdf = fetch_gedi_l2a((2.0, 48.0, 2.1, 48.1))
+
+    assert gdf.geometry.x.tolist() == [2.01]
+    assert list(gdf.columns) == [*GEDI_L2A_DEFAULT_FIELDS, gdf.geometry.name]
+    assert captured_parms["l2_quality_filter"] is True
+    assert captured_parms["degrade_filter"] is True
+    assert captured_parms["anc_fields"] == ["rh"]
+
+
+def test_fetch_gedi_l2a_without_quality_filter_requests_no_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_parms = {}
+
+    def fake_gedi02ap(parms: dict) -> gpd.GeoDataFrame:
+        captured_parms.update(parms)
+        return _shots([2.01], [48.01], solar_elevation=[5.0])
+
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gedi_module.gedi, "gedi02ap", fake_gedi02ap)
+
+    gdf = fetch_gedi_l2a((2.0, 48.0, 2.1, 48.1), quality_filter=False)
+
+    assert len(gdf) == 1
+    assert "l2_quality_filter" not in captured_parms
+    assert "degrade_filter" not in captured_parms
+    assert "anc_fields" not in captured_parms
+
+
+@pytest.mark.parametrize("anc_fields", [None, ["rh", "quality_flag"]])
+def test_fetch_gedi_l2a_rh_percentiles_as_columns(
+    monkeypatch: pytest.MonkeyPatch, anc_fields: list[str] | None
+) -> None:
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gedi_module.gedi, "gedi02ap", lambda parms: _shots([2.01], [48.01], quality_flag=[1])
+    )
+
+    gdf = fetch_gedi_l2a((2.0, 48.0, 2.1, 48.1), anc_fields=anc_fields, rh_percentiles=(0, 50, 98))
+
+    kept_anc = ["quality_flag"] if anc_fields else []
+    expected = [*GEDI_L2A_DEFAULT_FIELDS, *kept_anc, "rh0", "rh50", "rh98", gdf.geometry.name]
+    assert list(gdf.columns) == expected
+    assert gdf[["rh0", "rh50", "rh98"]].iloc[0].tolist() == [0.0, 25.0, 49.0]
+
+
+def test_fetch_gedi_l2a_rh_percentiles_on_empty_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gedi_module.gedi, "gedi02ap", lambda parms: sliderule_core.emptyframe(crs="EPSG:7912")
+    )
+
+    gdf = fetch_gedi_l2a((2.0, 48.0, 2.1, 48.1), rh_percentiles=(50,))
+
+    assert len(gdf) == 0
+    assert list(gdf.columns) == [*GEDI_L2A_DEFAULT_FIELDS, "rh50", gdf.geometry.name]
 
 
 def test_expand_rh_splits_percentile_array_into_named_columns() -> None:
@@ -306,9 +418,8 @@ def test_fetch_gedi_l2a_fields_none_keeps_every_column() -> None:
 
 
 @pytest.mark.slow
-def test_fetch_gedi_l2a_anc_fields_and_expand_rh_over_france() -> None:
+def test_fetch_gedi_l2a_anc_fields_and_rh_percentiles_over_france() -> None:
     anc_fields = [
-        "rh",
         "quality_flag",
         "degrade_flag",
         "surface_flag",
@@ -327,13 +438,18 @@ def test_fetch_gedi_l2a_anc_fields_and_expand_rh_over_france() -> None:
 
     gdf = fetch_gedi_l2a(
         (2.55, 48.35, 2.75, 48.50),
-        time_range=("2020-06-01T00:00:00Z", "2020-06-15T23:59:59Z"),
+        time_range=("2020-01-01T00:00:00Z", "2020-12-31T23:59:59Z"),
+        fields=None,
         anc_fields=anc_fields,
+        rh_percentiles=GEDI_L2A_RH_PERCENTILES,
     )
-    gdf = expand_rh(gdf)
 
     assert len(gdf) > 0
-    for field in [*anc_fields[1:], *(f"rh{p}" for p in GEDI_L2A_RH_PERCENTILES)]:
+    for field in [*anc_fields, *(f"rh{p}" for p in GEDI_L2A_RH_PERCENTILES)]:
         assert field in gdf.columns
     assert "rh" not in gdf.columns
-    assert gdf["quality_flag"].isin([0, 1]).all()
+    assert (gdf["quality_flag"] == 1).all()
+    assert (gdf["degrade_flag"] == 0).all()
+    assert (gdf["solar_elevation"] <= 0).all()
+    assert (gdf["sensitivity"] >= 0.9).all()
+    assert gdf["rh98"].between(0, 80).all()

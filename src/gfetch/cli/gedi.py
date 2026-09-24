@@ -3,7 +3,7 @@ import shutil
 from pathlib import Path
 
 from gfetch.cli.gedi_config import load
-from gfetch.gedi import GEDI_L2A_DEFAULT_FIELDS, expand_rh, fetch_gedi_l2a, write_geoparquet
+from gfetch.gedi import GEDI_L2A_DEFAULT_FIELDS, fetch_gedi_l2a, write_geoparquet
 from gfetch.utils.progress import count_bar
 
 log = logging.getLogger(__name__)
@@ -50,26 +50,29 @@ def gedi(config_path: Path) -> None:
     """
     cfg = load(config_path)
 
-    anc_fields = list(cfg.anc_fields) if cfg.anc_fields is not None else []
-    if cfg.rh_percentiles is not None and "rh" not in anc_fields:
-        anc_fields.append("rh")
-
     start = cfg.time_range.start if cfg.time_range is not None else None
     end = cfg.time_range.end if cfg.time_range is not None else None
     time_range = _to_time_range(start, end)
     tile_dir = cfg.output.with_name(f"{cfg.output.name}.tiles")
+
+    polygon = None
+    if cfg.countries is not None:
+        from gfetch.countries import resolve_country_polygon
+
+        polygon = resolve_country_polygon(cfg.countries)
+
     with count_bar() as progress:
         gdf = fetch_gedi_l2a(
             cfg.resolved_aoi.bbox,
             time_range=time_range,
             fields=cfg.fields if cfg.fields is not None else GEDI_L2A_DEFAULT_FIELDS,
-            anc_fields=anc_fields or None,
+            anc_fields=cfg.anc_fields,
+            polygon=polygon,
+            rh_percentiles=cfg.rh_percentiles,
+            quality_filter=cfg.quality_filter,
             tile_dir=tile_dir,
             progress=progress,
         )
-    if cfg.rh_percentiles is not None:
-        gdf = expand_rh(gdf, cfg.rh_percentiles)
-
     write_geoparquet(gdf, cfg.output)
     log.info(f"Wrote {len(gdf)} footprint(s) to {cfg.output}")
     if tile_dir.exists():

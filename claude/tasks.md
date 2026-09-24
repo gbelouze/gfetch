@@ -1215,3 +1215,33 @@ that state was reached, and should be read chronologically, not as reference mat
     Republic of Tanzania]` in place of `aoi:`, 648 items found via a real
     `intersects=`-filtered STAC query) - not just the test suite.
 
+- **2026-09-24** — GEDI tiling: `GEDI_MAX_TILE_SIZE_M` raised from 10 km to 50 km,
+  and `fetch_gedi_l2a` gained `polygon`, so `gfetch gedi` with `countries:` only
+  requests the tiles of the bbox grid intersecting the countries' union. Estimated
+  by hand on the mozambania config (bbox ~11.5° x 25.9°): ~37k tiles before, ~1.5k
+  bbox tiles at 50 km, of which roughly half intersect Mozambique/Tanzania. The
+  filter is tile-level like geefetch's `filter_polygon`: footprints outside the
+  countries but inside a kept tile are still returned. `polygon` isn't recorded in
+  the resume `params.json`, since it only selects tiles and never changes a tile's
+  own content; `max_size_m` is, so a tile dir left by a 10 km run is refused.
+
+- **2026-09-24** — GEDI quality filter and flat `rh{p}` columns, at the user's
+  request (the tech-stack "no filtering" POC scope is superseded).
+  - Ported geefetch's `l2AQualityFilter` (`geefetch/data/satellites/gedi.py`) minus
+    its full-power-beam condition, which is commented out there too:
+    `quality_flag == 1`, `degrade_flag == 0` via SlideRule's `l2_quality_filter`/
+    `degrade_filter` (less data transferred); `solar_elevation <= 0`,
+    `sensitivity >= 0.9`, `0 <= rh98 <= 80` locally on each tile's response (no
+    SlideRule equivalent; `rh` is requested automatically for `rh98`). On by
+    default (`quality_filter`), recorded in the resume `params.json`.
+  - **Live-verified the server-side params**: Fontainebleau AOI, 2020 full year -
+    63,495 raw shots, 7,794 passing all five conditions counted locally on the
+    unfiltered response, and exactly 7,794 returned by the filtered request, all
+    `quality_flag == 1`/`degrade_flag == 0`. Pitfall hit on the way: the same AOI
+    over 2020-06-01..15 returns 0 filtered shots - genuinely, not a failure: none of
+    its 2,727 shots is at night (`solar_elevation <= 0`), which in mid-latitude
+    summer can empty a short window. The live test now uses the full year.
+  - `rh_percentiles` moved from the CLI (`expand_rh` on the final frame) into
+    `fetch_gedi_l2a` itself, applied per tile before saving, so the tile files no
+    longer carry the 101-element array either. The raw array is only returned when
+    `'rh'` is in `anc_fields` and `rh_percentiles` isn't set.

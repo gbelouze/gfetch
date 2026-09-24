@@ -19,8 +19,10 @@ from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
+import shapely
 from pyproj import Geod
 from rich.progress import Progress
+from shapely.geometry.base import BaseGeometry
 from sliderule import gedi, sliderule
 from sliderule.session import Session
 
@@ -71,10 +73,18 @@ GEDI_L2A_DEFAULT_FIELDS: tuple[str, ...] = ("elevation_lm", "elevation_hr")
 # GEDI L2A image collection exposed as named bands.
 GEDI_L2A_RH_PERCENTILES: tuple[int, ...] = (0, 2, 25, 50, 75, 95, 98, 100)
 
+# geefetch's L2A quality filter, minus its full-power-beam condition (commented out
+# there too). `quality_flag == 1` and `degrade_flag == 0` are applied server-side via
+# SlideRule's `l2_quality_filter`/`degrade_filter`; the rest have no SlideRule
+# equivalent and are applied to each tile's response.
+GEDI_L2A_MAX_SOLAR_ELEVATION: float = 0.0
+GEDI_L2A_MIN_SENSITIVITY: float = 0.9
+GEDI_L2A_RH98_RANGE: tuple[float, float] = (0.0, 80.0)
+
 # A single SlideRule request over a large AOI is unreliable (server-side failures
 # surfacing as an empty response), so `fetch_gedi_l2a` issues one request per tile of
 # at most this size on each side.
-GEDI_MAX_TILE_SIZE_M: float = 10_000.0
+GEDI_MAX_TILE_SIZE_M: float = 50_000.0
 
 _GEOD = Geod(ellps="WGS84")
 
@@ -143,6 +153,8 @@ def _fetch_tile(
     time_range: tuple[str, str] | None,
     fields: Sequence[str] | None,
     anc_fields: Sequence[str] | None,
+    rh_percentiles: Sequence[int] | None,
+    quality_filter: bool,
 ) -> gpd.GeoDataFrame:
     """
     Fetch GEDI L2A footprints over one tile of a larger AOI.
@@ -160,6 +172,10 @@ def _fetch_tile(
         See `fetch_gedi_l2a`.
     anc_fields : Sequence[str] | None
         See `fetch_gedi_l2a`.
+    rh_percentiles : Sequence[int] | None
+        See `fetch_gedi_l2a`.
+    quality_filter : bool
+        See `fetch_gedi_l2a`.
 
     Returns
     -------
@@ -167,11 +183,16 @@ def _fetch_tile(
         Footprints in `tile`, excluding those on its north/east edges unless those
         edges are also `bbox`'s, so that no footprint is returned by two tiles.
     """
+    need_rh = bool(rh_percentiles) or quality_filter
+    request_anc_fields = list(dict.fromkeys([*(anc_fields or ()), *(["rh"] if need_rh else [])]))
     parms: dict = {"poly": _bbox_to_poly(tile)}
     if time_range is not None:
         parms["t0"], parms["t1"] = time_range
-    if anc_fields:
-        parms["anc_fields"] = list(anc_fields)
+    if request_anc_fields:
+        parms["anc_fields"] = request_anc_fields
+    if quality_filter:
+        parms["l2_quality_filter"] = True
+        parms["degrade_filter"] = True
 
     log.debug(f"Requesting GEDI L2A footprints over tile={tile}, time_range={time_range}")
     gdf = gedi.gedi02ap(parms)
@@ -183,8 +204,24 @@ def _fetch_tile(
         keep_y = y <= max_lat if max_lat == bbox[3] else y < max_lat
         gdf = gdf[keep_x & keep_y]
 
+    if quality_filter and not gdf.empty:
+        rh98 = gdf["rh"].map(lambda arr: arr[98])
+        gdf = gdf[
+            (gdf["solar_elevation"] <= GEDI_L2A_MAX_SOLAR_ELEVATION)
+            & (gdf["sensitivity"] >= GEDI_L2A_MIN_SENSITIVITY)
+            & rh98.between(*GEDI_L2A_RH98_RANGE)
+        ]
+
+    rh_columns = [f"rh{p}" for p in rh_percentiles or ()]
+    if "rh" in gdf.columns:
+        if rh_percentiles:
+            gdf = expand_rh(gdf, rh_percentiles)
+        elif "rh" not in (anc_fields or ()):
+            gdf = gdf.drop(columns="rh")
+
     if fields is not None:
-        keep = list(dict.fromkeys([*fields, *(anc_fields or ())]))
+        kept_anc_fields = [f for f in anc_fields or () if not (f == "rh" and rh_percentiles)]
+        keep = list(dict.fromkeys([*fields, *kept_anc_fields, *rh_columns]))
         missing = [f for f in keep if f not in gdf.columns]
         if missing:
             if not gdf.empty:
@@ -213,6 +250,9 @@ def fetch_gedi_l2a(
     fields: Sequence[str] | None = GEDI_L2A_DEFAULT_FIELDS,
     anc_fields: Sequence[str] | None = None,
     max_size_m: float = GEDI_MAX_TILE_SIZE_M,
+    polygon: BaseGeometry | None = None,
+    rh_percentiles: Sequence[int] | None = None,
+    quality_filter: bool = True,
     tile_dir: Path | None = None,
     progress: Progress | None = None,
 ) -> gpd.GeoDataFrame:
@@ -220,15 +260,17 @@ def fetch_gedi_l2a(
     Fetch GEDI L2A footprints over an AOI via SlideRule's on-demand subsetting.
 
     The AOI is split into tiles of at most `max_size_m` on each side (see
-    `split_bbox`), fetched one request at a time. With `tile_dir` set, each tile's
-    result is saved there as soon as it's fetched and reused by a later call, so an
-    interrupted run resumes where it stopped. A tile whose request failed
+    `split_bbox`), fetched one request at a time. With `polygon` set, only the tiles
+    intersecting it are requested - whole tiles are kept or skipped, so footprints
+    outside `polygon` but inside a kept tile are still returned. With `tile_dir` set,
+    each tile's result is saved there as soon as it's fetched and reused by a later
+    call, so an interrupted run resumes where it stopped. A tile whose request failed
     server-side comes back empty (see `_fetch_tile`) and is saved like a genuinely
     empty one, so a resumed run doesn't retry it.
 
-    No filtering is applied beyond the AOI/time range: SlideRule's `degrade_filter`,
-    `l2_quality_filter`, and `surface_filter` all default to off, so degraded/low-
-    quality footprints are included as-is.
+    With `quality_filter` set, footprints are filtered like geefetch's GEDI L2A
+    collection: `quality_flag == 1`, `degrade_flag == 0`, `solar_elevation <= 0`
+    (night shots), `sensitivity >= 0.9` and `0 <= rh98 <= 80`.
 
     Parameters
     ----------
@@ -249,7 +291,7 @@ def fetch_gedi_l2a(
         Extra per-shot fields to read directly out of the source L2A granule,
         beyond `gedi02ap`'s fixed schema, via SlideRule's `anc_fields` request
         parameter - e.g. `'rh'` (the 101-element relative-height percentile
-        array, see `expand_rh`), `'quality_flag'`, `'degrade_flag'`,
+        array, see `rh_percentiles`), `'quality_flag'`, `'degrade_flag'`,
         `'surface_flag'`, `'digital_elevation_model'`, `'elevation_bias_flag'`,
         `'energy_total'`, `'num_detectedmodes'`, `'selected_algorithm'`,
         `'selected_mode'`, `'selected_mode_flag'`, `'delta_time'`,
@@ -261,6 +303,17 @@ def fetch_gedi_l2a(
     max_size_m : float
         Maximum tile width and height, in meters. Defaults to
         `GEDI_MAX_TILE_SIZE_M`.
+    polygon : BaseGeometry | None
+        Exact AOI shape in EPSG:4326 (e.g. a union of country boundaries, whose
+        bounding box is `bbox`), used to skip tiles that don't intersect it.
+        Defaults to None (every tile of `bbox` is requested).
+    rh_percentiles : Sequence[int] | None
+        Relative-height percentiles to return as `rh{p}` columns, each in
+        `[0, 100]`, sliced out of GEDI L2A's 101-element `rh` array (requested
+        automatically). The raw array is not returned, even if `'rh'` is in
+        `anc_fields`. Defaults to None (no `rh{p}` columns).
+    quality_filter : bool
+        Drop low-quality footprints, as geefetch does (see above). Defaults to True.
     tile_dir : Path | None
         Directory holding one GeoParquet file per completed tile, plus the request
         parameters they were fetched with. Raises `ValueError` if called with
@@ -275,8 +328,22 @@ def fetch_gedi_l2a(
     geopandas.GeoDataFrame
         One row per footprint, indexed by acquisition time, geometry in EPSG:7912
         (GEDI's standard CRS, ITRF2014).
+
+    Raises
+    ------
+    ValueError
+        If `polygon` doesn't intersect `bbox`.
     """
     tiles = split_bbox(bbox, max_size_m)
+    if polygon is not None:
+        n_bbox_tiles = len(tiles)
+        shapely.prepare(polygon)
+        tiles = [tile for tile in tiles if polygon.intersects(shapely.box(*tile))]
+        log.info(f"Kept {len(tiles)}/{n_bbox_tiles} tile(s) of bbox={bbox} intersecting the AOI")
+        if not tiles:
+            msg = f"AOI polygon doesn't intersect bbox={bbox}"
+            log.error(msg)
+            raise ValueError(msg)
     if tile_dir is not None:
         _check_tile_params(
             tile_dir,
@@ -286,6 +353,8 @@ def fetch_gedi_l2a(
                 "fields": fields,
                 "anc_fields": anc_fields,
                 "max_size_m": max_size_m,
+                "rh_percentiles": rh_percentiles,
+                "quality_filter": quality_filter,
             },
         )
     log.info(
@@ -310,7 +379,9 @@ def fetch_gedi_l2a(
                 if not sliderule_ready:
                     sliderule.init(verbose=False)
                     sliderule_ready = True
-                tile_gdf = _fetch_tile(tile, bbox, time_range, fields, anc_fields)
+                tile_gdf = _fetch_tile(
+                    tile, bbox, time_range, fields, anc_fields, rh_percentiles, quality_filter
+                )
                 if path is not None:
                     write_geoparquet(tile_gdf, path)
             gdfs.append(tile_gdf)

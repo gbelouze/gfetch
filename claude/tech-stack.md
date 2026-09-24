@@ -878,7 +878,8 @@ it: this is a second, independent pipeline, not a new stage bolted onto the firs
   forest AOI near Paris) consistent with unfiltered, degraded/low-quality footprints
   being included as-is. This is expected, not a bug - a real future consumer of this
   data would very likely want `l2_quality_filter=True` at minimum, deliberately left
-  off here per the user's explicit scope.
+  off here per the user's explicit scope. **Superseded 2026-09-24**: `fetch_gedi_l2a` now applies
+  geefetch's L2A quality filter by default (`quality_filter`, see `claude/tasks.md`).
 - **France sits near GEDI's orbital coverage limit.** GEDI (ISS-mounted) only covers
   roughly ±51.6° latitude; mainland France spans ~42°N-51°N, so coverage should exist
   across almost all of it but thins out near the northern edge. Not yet checked

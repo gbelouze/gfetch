@@ -1,10 +1,11 @@
 from pathlib import Path
 
 import geopandas as gpd
-import numpy as np
 import pytest
+import shapely
 import yaml
 
+from gfetch import countries as countries_module
 from gfetch.cli import gedi as gedi_module
 from gfetch.cli.gedi import gedi as gedi_cmd
 from gfetch.gedi import GEDI_L2A_DEFAULT_FIELDS
@@ -20,30 +21,24 @@ def _write_config(path: Path, **overrides: object) -> Path:
     return path
 
 
-def _fake_gdf(anc_fields: list[str] | None) -> gpd.GeoDataFrame:
-    data: dict[str, object] = {"elevation_lm": [1.0], "elevation_hr": [2.0]}
-    for field in anc_fields or []:
-        data[field] = [np.arange(101, dtype=float)] if field == "rh" else [1]
-    return gpd.GeoDataFrame(data, geometry=gpd.points_from_xy([2.3], [48.8]), crs="EPSG:7912")
+def _fake_gdf() -> gpd.GeoDataFrame:
+    return gpd.GeoDataFrame(
+        {"elevation_lm": [1.0], "elevation_hr": [2.0]},
+        geometry=gpd.points_from_xy([2.3], [48.8]),
+        crs="EPSG:7912",
+    )
 
 
-def test_gedi_cmd_resolves_rh_into_named_columns(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_gedi_cmd_passes_config_to_fetch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     captured = {}
 
-    def fake_fetch(
-        bbox, time_range=None, fields=None, anc_fields=None, tile_dir=None, progress=None
-    ):
-        captured["bbox"] = bbox
-        captured["time_range"] = time_range
-        captured["fields"] = fields
-        captured["anc_fields"] = anc_fields
-        captured["tile_dir"] = tile_dir
-        assert tile_dir is not None
+    def fake_fetch(bbox: tuple, **kwargs: object) -> gpd.GeoDataFrame:
+        captured.update(bbox=bbox, **kwargs)
+        tile_dir = kwargs["tile_dir"]
+        assert isinstance(tile_dir, Path)
         tile_dir.mkdir(parents=True)
         (tile_dir / "tile.parquet").touch()
-        return _fake_gdf(anc_fields)
+        return _fake_gdf()
 
     monkeypatch.setattr(gedi_module, "fetch_gedi_l2a", fake_fetch)
 
@@ -55,37 +50,63 @@ def test_gedi_cmd_resolves_rh_into_named_columns(
     )
     gedi_cmd(config_path)
 
-    output = tmp_path / "l2a.parquet"
-    assert output.exists()
+    assert (tmp_path / "l2a.parquet").exists()
     assert captured["bbox"] == (2.2, 48.7, 2.5, 49.0)
     assert captured["time_range"] == ("2020-01-01T00:00:00Z", "2020-06-01T23:59:59Z")
     assert captured["fields"] == GEDI_L2A_DEFAULT_FIELDS
-    assert captured["anc_fields"] == ["quality_flag", "rh"]
+    assert captured["anc_fields"] == ["quality_flag"]
+    assert captured["rh_percentiles"] == [0, 50, 100]
+    assert captured["quality_filter"] is True
+    assert captured["polygon"] is None
     assert captured["tile_dir"] == tmp_path / "l2a.parquet.tiles"
     assert not captured["tile_dir"].exists()
 
-    gdf = gpd.read_parquet(output)
-    assert list(gdf[["rh0", "rh50", "rh100"]].iloc[0]) == [0.0, 50.0, 100.0]
-    assert "rh" not in gdf.columns
-    assert "quality_flag" in gdf.columns
+
+def test_gedi_cmd_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    def fake_fetch(bbox: tuple, **kwargs: object) -> gpd.GeoDataFrame:
+        captured.update(kwargs)
+        return _fake_gdf()
+
+    monkeypatch.setattr(gedi_module, "fetch_gedi_l2a", fake_fetch)
+
+    gedi_cmd(_write_config(tmp_path / "config.yaml"))
+
+    assert captured["time_range"] is None
+    assert captured["anc_fields"] is None
+    assert captured["rh_percentiles"] is None
 
 
-def test_gedi_cmd_defaults_to_no_time_range_or_anc_fields(
+def test_gedi_cmd_quality_filter_can_be_disabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured = {}
 
-    def fake_fetch(
-        bbox, time_range=None, fields=None, anc_fields=None, tile_dir=None, progress=None
-    ):
-        captured["time_range"] = time_range
-        captured["anc_fields"] = anc_fields
-        return _fake_gdf(anc_fields)
+    def fake_fetch(bbox: tuple, **kwargs: object) -> gpd.GeoDataFrame:
+        captured.update(kwargs)
+        return _fake_gdf()
 
     monkeypatch.setattr(gedi_module, "fetch_gedi_l2a", fake_fetch)
 
-    config_path = _write_config(tmp_path / "config.yaml")
+    gedi_cmd(_write_config(tmp_path / "config.yaml", quality_filter=False))
+
+    assert captured["quality_filter"] is False
+
+
+def test_gedi_cmd_passes_country_polygon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    polygon = shapely.Polygon([(29.0, -27.0), (41.0, -27.0), (29.0, -1.0)])
+    monkeypatch.setattr(countries_module, "resolve_country_polygon", lambda names: polygon)
+    captured = {}
+
+    def fake_fetch(bbox: tuple, **kwargs: object) -> gpd.GeoDataFrame:
+        captured.update(bbox=bbox, **kwargs)
+        return _fake_gdf()
+
+    monkeypatch.setattr(gedi_module, "fetch_gedi_l2a", fake_fetch)
+
+    config_path = _write_config(tmp_path / "config.yaml", aoi=None, countries=["Mozambique"])
     gedi_cmd(config_path)
 
-    assert captured["time_range"] is None
-    assert captured["anc_fields"] is None
+    assert captured["bbox"] == (29.0, -27.0, 41.0, -1.0)
+    assert captured["polygon"] is polygon

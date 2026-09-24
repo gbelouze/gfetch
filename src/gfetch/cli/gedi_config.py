@@ -44,10 +44,12 @@ class GediConfig:
         `gfetch.gedi.fetch_gedi_l2a`'s `anc_fields`. Defaults to None (none
         requested).
     rh_percentiles : list[int] | None
-        Relative-height percentiles to pull out of the `rh` ancillary field into
-        named `rh{p}` columns, via `gfetch.gedi.expand_rh`. Defaults to None,
-        which leaves `rh` as a raw 101-element array column (or omits it, if not
-        requested via `anc_fields`).
+        Relative-height percentiles to return as named `rh{p}` columns, via
+        `gfetch.gedi.fetch_gedi_l2a`'s `rh_percentiles`. Defaults to None (no
+        `rh{p}` columns).
+    quality_filter : bool
+        Drop low-quality footprints like geefetch does, via
+        `gfetch.gedi.fetch_gedi_l2a`'s `quality_filter`. Defaults to True.
     """
 
     output: Path
@@ -57,6 +59,7 @@ class GediConfig:
     fields: list[str] | None = None
     anc_fields: list[str] | None = None
     rh_percentiles: list[int] | None = None
+    quality_filter: bool = True
 
     def __post_init__(self) -> None:
         self.output = Path(self.output).expanduser().absolute()
