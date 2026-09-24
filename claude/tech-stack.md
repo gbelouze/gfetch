@@ -341,7 +341,9 @@ also needs gfetch's first credentialed-source mechanism (`StacSource`/`Config` h
 notion of auth today). `sat:orbit_state` (ascending/descending) is a plain queryable
 STAC property on both sources' items (confirmed on real items) — exposed as
 `Config.orbit_state`, filtered via the existing generic `query` mechanism, no new
-source-level plumbing needed. See `claude/tasks.md`'s 2026-09-22 entry for the full
+source-level plumbing needed. `orbit_state: as_bands` (added 2026-09-24) keeps both
+directions but composites them separately, into `{band}_ascending`/`{band}_descending`
+variables. See `claude/tasks.md`'s 2026-09-22 entry for the full
 reasoning and the `group_by_utm_zone` generalization this required.
 
 **Planetary Computer: asset-key divergence (confirmed 2026-09-22)**, exercising the

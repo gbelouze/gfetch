@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pystac
 
-from gfetch.cli.config import Config, load, resolve_bands
+from gfetch.cli.config import Config, load, resolve_output_variables
 from gfetch.finalize import pack_store, remove_cache
 from gfetch.mosaic import group_by_utm_zone
 from gfetch.utils.progress import count_bar, default_bar
@@ -50,10 +50,10 @@ def pack(config_path: Path, satellite_key: str, *, remove_store: bool = False) -
     stores = _zone_stores(cfg)
     if stores is None:
         return
-    bands = resolve_bands(cfg)
+    variables = resolve_output_variables(cfg)
     with default_bar() as progress:
         for store in stores:
-            pack_store(store, bands, remove_source=remove_store, progress=progress)
+            pack_store(store, variables, remove_source=remove_store, progress=progress)
 
 
 def clean(config_path: Path, satellite_key: str) -> None:
@@ -76,7 +76,7 @@ def clean(config_path: Path, satellite_key: str) -> None:
         remove_cache(
             cfg.cache_dir,
             stores,
-            resolve_bands(cfg),
+            resolve_output_variables(cfg),
             cached_items_path=cfg.cached_items_path,
             progress=progress,
         )

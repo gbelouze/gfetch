@@ -14,13 +14,17 @@ log = logging.getLogger(__name__)
 __all__ = [
     "AOIConfig",
     "BUILTIN_SATELLITES",
+    "ORBIT_STATE_AS_BANDS",
     "Config",
     "TimeRangeConfig",
     "load",
     "resolve_aoi",
     "resolve_bands",
     "resolve_cloud_mask",
+    "resolve_output_variables",
 ]
+
+ORBIT_STATE_AS_BANDS = "as_bands"
 
 # Section keys reserved in a unified job config file (see `load`'s docstring) - not
 # valid `Config` field names, so they're stripped out of the "generic" dict before
@@ -165,7 +169,10 @@ class Config:
     orbit_state : str | None
         Restrict the search to one `sat:orbit_state` ('ascending' or 'descending'),
         e.g. to avoid blending SAR backscatter from different look geometries into one
-        composite. Defaults to None (no filter, both orbit states included).
+        composite. 'as_bands' searches both and composites each separately, into
+        `{band}_ascending`/`{band}_descending` variables (see
+        `resolve_output_variables`). Defaults to None (no filter, both orbit states
+        composited together).
     collection : str | None
         Explicit STAC collection id, used verbatim instead of resolving `satellite`
         through `gfetch.sources.StacSource.collection`. Required for a `custom`
@@ -424,6 +431,30 @@ def resolve_bands(cfg: Config) -> list[str]:
         return list(get_profile(cfg.satellite).default_bands)
     except ValueError:
         return []
+
+
+def resolve_output_variables(cfg: Config) -> list[str]:
+    """
+    Resolve the data variables the `mosaic` stage writes for a config.
+
+    Parameters
+    ----------
+    cfg : Config
+        Job configuration.
+
+    Returns
+    -------
+    list[str]
+        `resolve_bands(cfg)`, or with `orbit_state: as_bands`, one
+        `{band}_{orbit_state}` variable per band and orbit state (see
+        `gfetch.mosaic.orbit_state_variables`).
+    """
+    bands = resolve_bands(cfg)
+    if cfg.orbit_state == ORBIT_STATE_AS_BANDS:
+        from gfetch.mosaic import orbit_state_variables
+
+        return orbit_state_variables(bands)
+    return bands
 
 
 def resolve_cloud_mask(cfg: Config) -> tuple[str | None, frozenset[int]]:

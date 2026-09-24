@@ -1245,3 +1245,32 @@ that state was reached, and should be read chronologically, not as reference mat
     `fetch_gedi_l2a` itself, applied per tile before saving, so the tile files no
     longer carry the 101-element array either. The raw array is only returned when
     `'rh'` is in `anc_fields` and `rh_percentiles` isn't set.
+
+- **2026-09-24** — `orbit_state: as_bands`, at the user's request: both orbit
+  directions searched, each composited separately into `{band}_{orbit_state}`
+  variables (`vv_ascending`, `vv_descending`, `vh_ascending`, `vh_descending`).
+  - Split in `gfetch.mosaic.mosaic(split_orbit_states=True)`: one `load` +
+    `composite` per orbit state, then merged. A single load grouped by orbit
+    state was ruled out: `groupby="solar_day"` can merge a morning descending and
+    an evening ascending pass over the same area into one time step.
+  - An orbit state with no items in a zone gets all-NaN variables, so every zone's
+    store has the same variables. An item without `sat:orbit_state` raises.
+  - `resolve_output_variables(cfg)` gives the store's variable names; `mosaic`
+    (template check, shard listing, resume) and `pack`/`clean` use it, while
+    `download` keeps `resolve_bands` (asset keys).
+  - Live-verified: Paris AOI, 2026-06-01..15 (4 ascending, 6 descending items),
+    `gfetch s1 search` + `gfetch s1 mosaic` on remote hrefs: store holds the four
+    variables, all finite; a rerun skips every shard.
+  - Single-direction coverage (e.g. Australia, descending only) is handled, not an
+    error: live-checked over Alice Springs, June 2026 (5 descending items, 0
+    ascending) - `vv_ascending` all NaN, `vv_descending` fully populated.
+  - **Found on the way: `mosaic` never masked `nodata`.** Sentinel-1's `vv`/`vh`
+    assets carry `nodata: 0` (odc-stac puts it in each variable's `nodata`
+    attribute) and nothing converted it to NaN, so the median counted it as a
+    value: partial temporal coverage was biased towards 0 and uncovered pixels came
+    out 0.0 rather than NaN (checked: a geobox in Kansas loaded with Paris items
+    gave finite 0s). This also affected every non-split S1 mosaic. Sentinel-2
+    escaped via SCL class 0 (no data) in its mask. Fixed by `mask_nodata`, applied
+    before `mask_clouds` (skipping the mask band, which must stay integer for
+    `isin`). Side effect: S1 composites are `float32` (xarray's promotion of
+    `uint16` under `where`), not `float64`.

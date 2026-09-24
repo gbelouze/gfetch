@@ -9,6 +9,7 @@ import logging
 from collections.abc import Callable, Sequence
 from typing import Literal, cast
 
+import numpy as np
 import odc.stac
 import pystac
 import xarray as xr
@@ -35,13 +36,18 @@ _DEFAULT_TIME_CHUNK = -1
 # writes one shard per task, so a shard's output (all bands) is held in memory at once.
 _DEFAULT_SHARD_FACTOR = 32
 
+ORBIT_STATES: tuple[str, ...] = ("ascending", "descending")
+
 
 __all__ = [
+    "ORBIT_STATES",
     "composite",
     "group_by_utm_zone",
     "load",
     "mask_clouds",
+    "mask_nodata",
     "mosaic",
+    "orbit_state_variables",
     "resolve_chunks",
     "resolve_compute_chunks",
     "resolve_shards",
@@ -206,6 +212,40 @@ def load(
     return ds
 
 
+def mask_nodata(ds: xr.Dataset, *, exclude: str | None = None) -> xr.Dataset:
+    """
+    Set each data variable's `nodata` pixels (from its `nodata` attribute) to NaN.
+
+    Without this, a reduction like `composite`'s median counts nodata as a real value:
+    a pixel covered by only some time steps is pulled towards it, and one covered by
+    none comes out as `nodata` instead of NaN.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Dataset as returned by `load`, whose variables carry odc-stac's `nodata`
+        attribute.
+    exclude : str | None
+        Data variable left untouched (e.g. a classification band that
+        `mask_clouds` still needs as integers). Defaults to None.
+
+    Returns
+    -------
+    xr.Dataset
+        `ds` with `nodata` pixels set to NaN and the `nodata` attribute dropped, in
+        every variable that had one other than `exclude`.
+    """
+
+    def mask(da: xr.DataArray) -> xr.DataArray:
+        if da.name == exclude or "nodata" not in da.attrs:
+            return da
+        masked = da.where(da != da.attrs["nodata"])
+        masked.attrs = {k: v for k, v in da.attrs.items() if k != "nodata"}
+        return masked
+
+    return xr.Dataset({name: mask(da) for name, da in ds.data_vars.items()}, attrs=ds.attrs)
+
+
 def mask_clouds(ds: xr.Dataset, mask_band: str, mask_out: frozenset[int]) -> xr.Dataset:
     """
     Mask out invalid/cloudy pixels using a per-pixel classification band.
@@ -302,11 +342,13 @@ def mosaic(
     resampling: str | dict[str, str] | None = None,
     log_footprint: bool = True,
     on_load: Callable[[xr.Dataset], object] | None = None,
+    split_orbit_states: bool = False,
 ) -> xr.Dataset:
     """
     Load, cloud-mask, and composite STAC items into a single mosaic.
 
-    Convenience wrapper chaining `load`, `mask_clouds`, and `composite`.
+    Convenience wrapper chaining `load`, `mask_nodata`, `mask_clouds`, and
+    `composite`. A pixel with no valid observation is NaN.
 
     Parameters
     ----------
@@ -341,7 +383,14 @@ def mosaic(
         Passed to `load`. Defaults to True.
     on_load : Callable[[xr.Dataset], object] | None
         Called with the lazily loaded dataset, before masking and compositing (e.g.
-        to measure how many bytes the mosaic processes). Defaults to None.
+        to measure how many bytes the mosaic processes). Called once per orbit
+        state with `split_orbit_states`. Defaults to None.
+    split_orbit_states : bool
+        Composite each `sat:orbit_state` (see `ORBIT_STATES`) separately, into
+        variables named as `orbit_state_variables` does. An orbit state with no
+        items gets all-NaN variables; an item with no `sat:orbit_state` among
+        `ORBIT_STATES` raises `ValueError`. Defaults to False (one composite over
+        every item).
 
     Returns
     -------
@@ -364,20 +413,24 @@ def mosaic(
         )
         resolved_chunks["time"] = _DEFAULT_TIME_CHUNK
 
-    ds = load(
-        items,
-        geobox,
-        load_bands,
-        groupby=groupby,
-        chunks=resolved_chunks,
-        resampling=_pin_mask_band_resampling(resampling, mask_band),
-        log_footprint=log_footprint,
-    )
-    if on_load is not None:
-        on_load(ds)
-    if mask_band is not None:
-        ds = mask_clouds(ds, mask_band, mask_out)
-    result = composite(ds, method=method)
+    def build(group: Sequence[pystac.Item]) -> xr.Dataset:
+        ds = load(
+            group,
+            geobox,
+            load_bands,
+            groupby=groupby,
+            chunks=resolved_chunks,
+            resampling=_pin_mask_band_resampling(resampling, mask_band),
+            log_footprint=log_footprint,
+        )
+        if on_load is not None:
+            on_load(ds)
+        ds = mask_nodata(ds, exclude=mask_band)
+        if mask_band is not None:
+            ds = mask_clouds(ds, mask_band, mask_out)
+        return composite(ds, method=method)
+
+    result = _composite_by_orbit_state(items, build) if split_orbit_states else build(items)
 
     # Belt-and-suspenders: the `time` override above removes the known trigger for
     # composite()'s reduction disturbing the x/y chunk grid, but nothing guarantees
@@ -385,6 +438,74 @@ def mosaic(
     # needing extra resampling to reach the common geobox). write_region()'s Zarr
     # requires exact alignment for every variable, so we pin it explicitly.
     return result.chunk({"y": resolved_chunks["y"], "x": resolved_chunks["x"]})
+
+
+def orbit_state_variables(bands: Sequence[str]) -> list[str]:
+    """
+    Name the variables `mosaic(split_orbit_states=True)` produces.
+
+    Parameters
+    ----------
+    bands : Sequence[str]
+        Data bands, as passed to `mosaic`.
+
+    Returns
+    -------
+    list[str]
+        `{band}_{orbit_state}` for every band and orbit state in `ORBIT_STATES`,
+        grouped by band (e.g. `['vv_ascending', 'vv_descending', ...]`).
+    """
+    return [f"{band}_{state}" for band in bands for state in ORBIT_STATES]
+
+
+def _composite_by_orbit_state(
+    items: Sequence[pystac.Item], build: Callable[[Sequence[pystac.Item]], xr.Dataset]
+) -> xr.Dataset:
+    """
+    Composite each orbit state's items separately and merge them into one dataset.
+
+    Parameters
+    ----------
+    items : Sequence[pystac.Item]
+        Items to mosaic, each with a `sat:orbit_state` in `ORBIT_STATES`.
+    build : Callable[[Sequence[pystac.Item]], xr.Dataset]
+        Loads and composites a non-empty list of items.
+
+    Returns
+    -------
+    xr.Dataset
+        One `{band}_{orbit_state}` variable per band and orbit state, all-NaN for an
+        orbit state with no items.
+
+    Raises
+    ------
+    ValueError
+        If an item has no `sat:orbit_state` among `ORBIT_STATES`.
+    """
+    groups: dict[str, list[pystac.Item]] = {state: [] for state in ORBIT_STATES}
+    for item in items:
+        state = item.properties.get("sat:orbit_state")
+        if state not in groups:
+            msg = f"Item {item.id} has sat:orbit_state={state!r}, expected one of {ORBIT_STATES}"
+            log.error(msg)
+            raise ValueError(msg)
+        groups[state].append(item)
+    log.debug(f"Items per orbit state: { {s: len(g) for s, g in groups.items()} }")
+
+    composites = {state: build(group) for state, group in groups.items() if group}
+    template = next(iter(composites.values()))
+    parts = []
+    for state in ORBIT_STATES:
+        if state in composites:
+            ds = composites[state]
+        else:
+            log.info(f"No {state} items, its variables are all NaN")
+            ds = xr.full_like(template, np.nan)
+        parts.append(ds.rename({v: f"{v}_{state}" for v in ds.data_vars}))
+
+    # all parts share the same geobbox so "override" is necessary
+    merged = xr.merge(parts, compat="override", join="exact")
+    return merged[orbit_state_variables([str(v) for v in template.data_vars])]
 
 
 def _utm_zone_lon_band(crs: CRS) -> tuple[float, float]:

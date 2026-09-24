@@ -6,7 +6,13 @@ import yaml
 from odc.geo.crs import CRS
 
 from gfetch import countries as countries_module
-from gfetch.cli.config import load, resolve_bands, resolve_cloud_mask, resolve_compute_workers
+from gfetch.cli.config import (
+    load,
+    resolve_bands,
+    resolve_cloud_mask,
+    resolve_compute_workers,
+    resolve_output_variables,
+)
 
 
 def _write_config(path: Path, **overrides: object) -> Path:
@@ -259,3 +265,19 @@ def test_resolve_compute_workers_rejects_invalid(tmp_path: Path, value: object) 
 
     with pytest.raises(ValueError, match="n_compute_workers"):
         resolve_compute_workers(cfg)
+
+
+def test_resolve_output_variables_defaults_to_bands(tmp_path: Path) -> None:
+    cfg = load(_write_config(tmp_path / "config.yaml", orbit_state="ascending"), "s1")
+    assert resolve_output_variables(cfg) == ["vv", "vh"]
+
+
+def test_resolve_output_variables_as_bands_splits_by_orbit_state(tmp_path: Path) -> None:
+    cfg = load(_write_config(tmp_path / "config.yaml", orbit_state="as_bands"), "s1")
+    assert resolve_bands(cfg) == ["vv", "vh"]
+    assert resolve_output_variables(cfg) == [
+        "vv_ascending",
+        "vv_descending",
+        "vh_ascending",
+        "vh_descending",
+    ]

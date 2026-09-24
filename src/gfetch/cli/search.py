@@ -3,13 +3,12 @@ from pathlib import Path
 
 import pystac
 
-from gfetch.cli.config import Config, load
+from gfetch.cli.config import ORBIT_STATE_AS_BANDS, Config, load
+from gfetch.mosaic import ORBIT_STATES
 from gfetch.search import search as search_items
 from gfetch.sources import get_source
 
 log = logging.getLogger(__name__)
-
-_ORBIT_STATES = {"ascending", "descending"}
 
 
 def _build_query(cfg: Config) -> dict | None:
@@ -29,14 +28,16 @@ def _build_query(cfg: Config) -> dict | None:
     Raises
     ------
     ValueError
-        If `cfg.orbit_state` is set to anything other than 'ascending'/'descending'.
+        If `cfg.orbit_state` is set to anything other than 'ascending'/'descending'/
+        'as_bands'.
     """
     query: dict = {}
     if cfg.max_cloud_cover is not None:
         query["eo:cloud_cover"] = {"lt": cfg.max_cloud_cover}
-    if cfg.orbit_state is not None:
-        if cfg.orbit_state not in _ORBIT_STATES:
-            raise ValueError(f"orbit_state must be one of {_ORBIT_STATES}, got {cfg.orbit_state!r}")
+    if cfg.orbit_state is not None and cfg.orbit_state != ORBIT_STATE_AS_BANDS:
+        if cfg.orbit_state not in ORBIT_STATES:
+            valid = [*ORBIT_STATES, ORBIT_STATE_AS_BANDS]
+            raise ValueError(f"orbit_state must be one of {valid}, got {cfg.orbit_state!r}")
         query["sat:orbit_state"] = {"eq": cfg.orbit_state}
     return query or None
 

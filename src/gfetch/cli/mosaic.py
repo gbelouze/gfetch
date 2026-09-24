@@ -10,7 +10,14 @@ import xarray as xr
 from odc.geo.geobox import GeoBox
 from zarr.storage import ZipStore
 
-from gfetch.cli.config import load, resolve_bands, resolve_cloud_mask, resolve_compute_workers
+from gfetch.cli.config import (
+    ORBIT_STATE_AS_BANDS,
+    load,
+    resolve_bands,
+    resolve_cloud_mask,
+    resolve_compute_workers,
+    resolve_output_variables,
+)
 from gfetch.finalize import packed_store_path
 from gfetch.mosaic import (
     group_by_utm_zone,
@@ -76,6 +83,7 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
     items = list(pystac.ItemCollection.from_file(items_path))
     log.debug(f"Loaded {len(items)} item(s) from {items_path}")
     bands = resolve_bands(cfg)
+    variables = resolve_output_variables(cfg)
     mask_band, mask_out = resolve_cloud_mask(cfg)
 
     zones = group_by_utm_zone(items, cfg.resolved_aoi.bbox)
@@ -102,6 +110,7 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
             chunks=compute_chunks,
             log_footprint=log_footprint,
             on_load=on_load,
+            split_orbit_states=cfg.orbit_state == ORBIT_STATE_AS_BANDS,
         )
 
     units: list[tuple[str, Path, list[pystac.Item], GeoBox, dict[str, slice]]] = []
@@ -118,7 +127,7 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
             # happened.
             zip_store = ZipStore(packed, mode="r")
             try:
-                regions = write_regions(zip_store, bands[0])
+                regions = write_regions(zip_store, variables[0])
             finally:
                 zip_store.close()
         else:
@@ -142,8 +151,8 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
 
             # Fails fast, before any shard is built, if this store's on-disk chunk or
             # shard grid doesn't match what this run's config expects
-            validate_chunks(path, bands, {"y": chunks["y"], "x": chunks["x"]}, shards)
-            regions = write_regions(path, bands[0])
+            validate_chunks(path, variables, {"y": chunks["y"], "x": chunks["x"]}, shards)
+            regions = write_regions(path, variables[0])
 
         for region in regions:
             label = f"EPSG:{crs.epsg} shard (y={region['y'].start}, x={region['x'].start})"
@@ -165,7 +174,7 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
             # Each band's shard is its own file, written atomically, so a shard counts
             # as done once every band's file exists; otherwise all its bands are
             # recomputed and rewritten.
-            if packed_store_path(path).exists() or region_is_written(path, region, bands):
+            if packed_store_path(path).exists() or region_is_written(path, region, variables):
                 log.debug(f"{label}: already written, skipping")
             else:
                 n_workers = tuner.next()
@@ -175,5 +184,5 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
                     start = time.perf_counter()
                     with dask_progress(progress, label):
                         write_region(ds, path, region)
-                tuner.observe(n_workers, time.perf_counter() - start, loaded[0].nbytes)
+                tuner.observe(n_workers, time.perf_counter() - start, sum(d.nbytes for d in loaded))
             progress.advance(units_task)

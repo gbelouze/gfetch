@@ -38,6 +38,10 @@ def test_build_query_merges_cloud_cover_and_orbit_state() -> None:
     }
 
 
+def test_build_query_orbit_state_as_bands_searches_both() -> None:
+    assert _build_query(_config(orbit_state="as_bands")) is None
+
+
 def test_build_query_invalid_orbit_state_raises() -> None:
     with pytest.raises(ValueError, match="orbit_state"):
         _build_query(_config(orbit_state="sideways"))

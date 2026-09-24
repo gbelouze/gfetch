@@ -10,7 +10,9 @@ from odc.geo.geobox import GeoBox
 from gfetch.mosaic import (
     _pin_mask_band_resampling,
     group_by_utm_zone,
+    mask_nodata,
     mosaic,
+    orbit_state_variables,
     resolve_chunks,
     resolve_compute_chunks,
     resolve_shards,
@@ -228,6 +230,116 @@ def test_mosaic_pins_output_chunks_to_requested_grid(monkeypatch) -> None:
     y_chunks, x_chunks = ds["red"].data.chunks
     assert y_chunks == (2, 2)
     assert x_chunks == (2, 2)
+
+
+def test_mask_nodata_sets_nodata_to_nan_except_excluded() -> None:
+    ds = xr.Dataset(
+        {
+            "vv": ("x", np.array([0, 5], dtype=np.uint16), {"nodata": 0, "units": "dB"}),
+            "scl": ("x", np.array([0, 4], dtype=np.uint8), {"nodata": 0}),
+            "no_attr": ("x", np.array([0, 1])),
+        }
+    )
+
+    masked = mask_nodata(ds, exclude="scl")
+
+    np.testing.assert_array_equal(masked["vv"].values, [np.nan, 5.0])
+    assert masked["vv"].attrs == {"units": "dB"}
+    assert masked["scl"].identical(ds["scl"])
+    assert masked["no_attr"].identical(ds["no_attr"])
+
+
+def test_mosaic_composite_ignores_nodata(monkeypatch) -> None:
+    """A median over nodata-filled time steps must only see the valid ones, and a
+    pixel no time step covers must come out NaN, not `nodata`."""
+
+    def fake_load(items, geobox, bands, *, groupby, chunks, resampling, log_footprint):
+        time_coord = [datetime.datetime(2020, 6, d, tzinfo=datetime.UTC) for d in (1, 2, 3)]
+        vv = np.array([[[0, 0]], [[0, 10]], [[0, 30]]], dtype=np.uint16)
+        return xr.Dataset(
+            {"vv": (("time", "y", "x"), vv, {"nodata": 0})}, coords={"time": time_coord}
+        )
+
+    monkeypatch.setattr("gfetch.mosaic.load", fake_load)
+
+    ds = mosaic([], GeoBox.from_bbox((0, 0, 1, 1), crs="EPSG:4326", shape=(1, 2)), ["vv"])
+
+    np.testing.assert_array_equal(ds["vv"].values, [[np.nan, 20.0]])
+
+
+def _orbit_item(item_id: str, orbit_state: str | None) -> pystac.Item:
+    item = _item(item_id, (0, 0, 1, 1))
+    if orbit_state is not None:
+        item.properties["sat:orbit_state"] = orbit_state
+    return item
+
+
+def _fake_load_by_item_count(monkeypatch) -> list[list[str]]:
+    """Patch `load` to fill every band with the number of items it was given."""
+    calls: list[list[str]] = []
+
+    def fake_load(items, geobox, bands, *, groupby, chunks, resampling, log_footprint):
+        calls.append([item.id for item in items])
+        value = np.full((1, 2, 2), float(len(items)))
+        return xr.Dataset(
+            {band: (("time", "y", "x"), value) for band in bands},
+            coords={"time": [datetime.datetime(2020, 6, 6, tzinfo=datetime.UTC)]},
+        )
+
+    monkeypatch.setattr("gfetch.mosaic.load", fake_load)
+    return calls
+
+
+def test_mosaic_split_orbit_states_composites_each_separately(monkeypatch) -> None:
+    calls = _fake_load_by_item_count(monkeypatch)
+    items = [
+        _orbit_item("a1", "ascending"),
+        _orbit_item("d1", "descending"),
+        _orbit_item("a2", "ascending"),
+    ]
+
+    ds = mosaic(
+        items,
+        GeoBox.from_bbox((0, 0, 1, 1), crs="EPSG:4326", shape=(2, 2)),
+        ["vv", "vh"],
+        split_orbit_states=True,
+    )
+
+    assert calls == [["a1", "a2"], ["d1"]]
+    assert list(ds.data_vars) == orbit_state_variables(["vv", "vh"])
+    assert (ds["vh_ascending"].values == 2).all()
+    assert (ds["vh_descending"].values == 1).all()
+
+
+def test_mosaic_split_orbit_states_fills_missing_state_with_nan(monkeypatch) -> None:
+    calls = _fake_load_by_item_count(monkeypatch)
+
+    ds = mosaic(
+        [_orbit_item("d1", "descending")],
+        GeoBox.from_bbox((0, 0, 1, 1), crs="EPSG:4326", shape=(2, 2)),
+        ["vv"],
+        split_orbit_states=True,
+    )
+
+    assert calls == [["d1"]]
+    assert list(ds.data_vars) == ["vv_ascending", "vv_descending"]
+    assert np.isnan(ds["vv_ascending"].values).all()
+    assert (ds["vv_descending"].values == 1).all()
+
+
+@pytest.mark.parametrize("orbit_state", [None, "sideways"])
+def test_mosaic_split_orbit_states_rejects_unknown_orbit_state(
+    monkeypatch, orbit_state: str | None
+) -> None:
+    _fake_load_by_item_count(monkeypatch)
+
+    with pytest.raises(ValueError, match="sat:orbit_state"):
+        mosaic(
+            [_orbit_item("x", orbit_state)],
+            GeoBox.from_bbox((0, 0, 1, 1), crs="EPSG:4326", shape=(2, 2)),
+            ["vv"],
+            split_orbit_states=True,
+        )
 
 
 @pytest.mark.slow

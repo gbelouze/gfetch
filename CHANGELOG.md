@@ -15,6 +15,7 @@ Each release can have sections: "Added", "Changed", "Deprecated", "Removed", "Fi
 - Sharded Zarr output (`shard_factor:` config, chunks per shard along each side, default 32): one file per shard instead of per chunk. Each shard is also `mosaic`'s unit of work and resume, listed from the store's own shard grid (`gfetch.write.write_regions`). Reading a sharded store with GDAL/QGIS needs GDAL 3.13+.
 - `compute_chunk_factor:` config (default 1): `mosaic` computes in dask chunks of that many store chunks per side, separately from the store's own `chunks`. Must divide `shard_factor`.
 - `n_compute_workers` accepts a `[min, max]` range: `mosaic` then tunes the dask thread count per shard while it runs (`gfetch.utils.tuning.WorkerTuner`): min, max and middle first, then the best count predicted by fitting `a + b/w + c*w` to the observed seconds per byte processed, plus exploration noise.
+- `orbit_state: as_bands` config: searches both orbit directions and composites each separately, into `{band}_ascending`/`{band}_descending` variables (e.g. `vv_ascending`, `vh_descending`), via `mosaic(split_orbit_states=True)`. An orbit direction with no items in a UTM zone gets all-NaN variables.
 - `benchmark/sharding_write.py` compares unsharded, sharded all-bands and sharded per-band writes.
 - Project scaffold: `pyproject.toml` (Python 3.12, `ruff`/`pyrefly`/`pydoclint` config), `pre-commit` hooks, `AGENTS.md`.
 - `search`, `download`, `mosaic`/`write` pipeline stages, a `sentinel-2` satellite profile, and a `cyclopts`/`omegaconf`-based CLI (`init`/`search`/`download`/`mosaic`), with tests for every stage.
@@ -33,6 +34,7 @@ Each release can have sections: "Added", "Changed", "Deprecated", "Removed", "Fi
 
 ### Fixed
 
+- `mosaic()` (`gfetch <satellite> mosaic`) now masks each band's `nodata` value (e.g. Sentinel-1's 0) to NaN before compositing. Sentinel-1's median previously counted nodata as 0: pixels covered by only some passes (e.g. swath edges) were pulled towards 0, and pixels no pass covered came out as 0 instead of NaN. Sentinel-2 was unaffected, its SCL mask already dropping class 0. Sentinel-1 composites are now `float32` instead of `float64`.
 - `search()` (`gfetch <satellite> search`) raises `ValueError` before searching when the time range overlaps a period Earth Search's `sentinel-2-c1-l2a` is known to be missing (Nov 2016 - Nov 2019 and 2022, pending ESA's baseline 05.00 reprocessing). It previously returned a small fraction of the real scenes without warning (45 instead of ~1,300 over a 230 km box in France for Jan-Sep 2022). A time range lying entirely within 2022 is instead searched against Earth Search's older `sentinel-2-l2a`, with a warning; one straddling 2022 and another year still raises.
 - `gfetch mosaic` recomputed all-nodata patches on every resume: zarr-python skips writing chunks that are entirely fill value by default, so `region_is_written` never saw them as written. `write`/`write_region` now always write empty chunks.
 
