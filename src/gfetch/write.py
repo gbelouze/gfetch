@@ -207,6 +207,8 @@ def prepare_template(
     ----------
     ds : xr.Dataset
         Dataset whose shape/coords/chunking define the store; its data isn't written.
+        When `shards` and `chunks` are given, its dask chunks only need to align with
+        the shards, so building it shard-sized keeps its graph small.
     path : Path
         Destination Zarr store path.
     shards : dict[str, int] | None
@@ -219,12 +221,21 @@ def prepare_template(
         `ds`'s dask chunks.
     """
     ds = _restore_grid_mapping(ds)
-    if chunks is not None:
-        ds = ds.chunk({dim: size for dim, size in chunks.items() if dim in ds.dims})
     encoding = {}
-    if shards is not None:
+    if shards is None:
+        if chunks is not None:
+            ds = ds.chunk({dim: size for dim, size in chunks.items() if dim in ds.dims})
+    else:
+        # The inner chunks go straight into the encoding, never through `ds.chunk`:
+        # dask builds a rechunk's tasks eagerly, one per output chunk, which over a
+        # whole UTM zone at small chunk sizes is tens of millions of tasks.
+        store_chunks = chunks if chunks is not None else {}
         for name, var in ds.data_vars.items():
-            var_chunks = tuple(c[0] for c in var.chunks) if var.chunks is not None else var.shape
+            dask_chunks = tuple(c[0] for c in var.chunks) if var.chunks is not None else var.shape
+            var_chunks = tuple(
+                store_chunks.get(str(dim), chunk)
+                for dim, chunk in zip(var.dims, dask_chunks, strict=True)
+            )
             encoding[name] = {
                 "chunks": var_chunks,
                 "shards": tuple(

@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -294,3 +295,26 @@ def test_prepare_template_uses_explicit_chunks_over_dask_chunks(tmp_path: Path) 
     za = zarr.open_array(store=path / "red")
     assert za.chunks == (4, 4)
     assert za.shards == (16, 16)
+
+
+def test_prepare_template_keeps_a_shard_sized_graph(tmp_path: Path, monkeypatch) -> None:
+    ds = xr.Dataset(
+        {"red": (("y", "x"), np.zeros((64, 64), dtype="float32"))},
+        coords={"y": np.arange(64), "x": np.arange(64)},
+    ).chunk({"y": 32, "x": 32})
+    written: list[xr.Dataset] = []
+    to_zarr = xr.Dataset.to_zarr
+
+    def spy(self: xr.Dataset, *args: Any, **kwargs: Any) -> object:
+        written.append(self)
+        return to_zarr(self, *args, **kwargs)
+
+    monkeypatch.setattr(xr.Dataset, "to_zarr", spy)
+    path = tmp_path / "sharded.zarr"
+    prepare_template(ds, path, shards={"y": 32, "x": 32}, chunks={"y": 4, "x": 4})
+
+    # A rechunk through the 4x4 store chunks would leave 256 tasks in the graph.
+    assert len(dict(written[0]["red"].data.__dask_graph__())) < 16
+    za = zarr.open_array(store=path / "red")
+    assert za.chunks == (4, 4)
+    assert za.shards == (32, 32)

@@ -22,7 +22,7 @@ from gfetch.utils.memory import log_chunk_footprint
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_CHUNKS: dict[str, int] = {"x": 256, "y": 256}
+_DEFAULT_CHUNKS: dict[str, int] = {"x": 64, "y": 64}
 
 # `composite`'s default `median` isn't chunk-wise associative, so dask must gather an
 # entire spatial chunk's `time` axis into one chunk before it can reduce. If `time`
@@ -32,9 +32,12 @@ _DEFAULT_CHUNKS: dict[str, int] = {"x": 256, "y": 256}
 # `time` chunk from the start avoids that rechunk entirely.
 _DEFAULT_TIME_CHUNK = -1
 
-# 32x32 chunks per shard: 8192 px shards at the default chunk size. The mosaic stage
+# 128x128 chunks per shard: 8192 px shards at the default chunk size. The mosaic stage
 # writes one shard per task, so a shard's output (all bands) is held in memory at once.
-_DEFAULT_SHARD_FACTOR = 32
+_DEFAULT_SHARD_FACTOR = 128
+
+# 16x16 chunks per dask chunk: 1024 px at the default chunk size.
+_DEFAULT_COMPUTE_CHUNK_FACTOR = 16
 
 ORBIT_STATES: tuple[str, ...] = ("ascending", "descending")
 
@@ -67,7 +70,7 @@ def resolve_chunks(chunks: dict[str, int] | None) -> dict[str, int]:
     ----------
     chunks : dict[str, int] | None
         Dask chunk sizes as passed to `load`/`mosaic`. Defaults to None, which uses
-        `{"x": 256, "y": 256}`.
+        `{"x": 64, "y": 64}`.
 
     Returns
     -------
@@ -106,7 +109,7 @@ def resolve_shards(shard_factor: int | None, chunks: dict[str, int]) -> dict[str
 
 
 def resolve_compute_chunks(
-    chunks: dict[str, int], compute_chunk_factor: int, shards: dict[str, int] | None
+    chunks: dict[str, int], compute_chunk_factor: int | None, shards: dict[str, int] | None
 ) -> dict[str, int]:
     """
     Resolve the dask chunk sizes the `mosaic` stage computes with.
@@ -115,15 +118,16 @@ def resolve_compute_chunks(
     ----------
     chunks : dict[str, int]
         Store chunk sizes, as resolved by `resolve_chunks`.
-    compute_chunk_factor : int
-        Number of store chunks per dask chunk along each spatial dimension.
+    compute_chunk_factor : int | None
+        Number of store chunks per dask chunk along each spatial dimension. None uses
+        `_DEFAULT_COMPUTE_CHUNK_FACTOR`.
     shards : dict[str, int] | None
         Shard sizes, as resolved by `resolve_shards`, or None if unsharded.
 
     Returns
     -------
     dict[str, int]
-        `chunks` with its spatial sizes multiplied by `compute_chunk_factor`.
+        `chunks` with its spatial sizes multiplied by the compute chunk factor.
 
     Raises
     ------
@@ -131,12 +135,15 @@ def resolve_compute_chunks(
         If a dask chunk doesn't evenly divide the unit of work (a shard, or a chunk
         when unsharded), which would let two dask chunks share a written file.
     """
-    compute = {**chunks, **{dim: compute_chunk_factor * chunks[dim] for dim in ("y", "x")}}
+    factor = (
+        compute_chunk_factor if compute_chunk_factor is not None else _DEFAULT_COMPUTE_CHUNK_FACTOR
+    )
+    compute = {**chunks, **{dim: factor * chunks[dim] for dim in ("y", "x")}}
     unit = shards if shards is not None else chunks
     for dim in ("y", "x"):
         if unit[dim] % compute[dim]:
             raise ValueError(
-                f"compute_chunk_factor={compute_chunk_factor} gives {compute[dim]} px dask "
+                f"compute_chunk_factor={factor} gives {compute[dim]} px dask "
                 f"chunks along {dim!r}, which don't evenly divide the {unit[dim]} px "
                 f"{'shard' if shards is not None else 'chunk'}; use a divisor of "
                 "shard_factor"
@@ -172,7 +179,7 @@ def load(
         mosaics over stacking every individual scene as a separate time step.
     chunks : dict[str, int] | None
         Dask chunk sizes, e.g. `{"time": 1, "x": 512, "y": 512}`. Defaults to None,
-        which chunks the spatial dims at `{"x": 256, "y": 256}`; passing `None`
+        which chunks the spatial dims at `{"x": 64, "y": 64}`; passing `None`
         through to odc-stac itself would instead load everything eagerly, without
         Dask. Regardless of this argument, `time` itself defaults to a single
         full-length chunk unless explicitly given here.

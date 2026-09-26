@@ -92,11 +92,16 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
     chunks = resolve_chunks(cfg.chunks)
     shards = resolve_shards(cfg.shard_factor, chunks)
     compute_chunks = resolve_compute_chunks(chunks, cfg.compute_chunk_factor, shards)
+    # The template spans a whole zone but only its metadata is used. At
+    # `compute_chunks`, odc-stac would build one task per chunk and band over the whole
+    # zone, enough to exhaust memory at small chunk sizes.
+    template_chunks = {**compute_chunks, **shards} if shards is not None else compute_chunks
 
     def build(
         zone_items: list[pystac.Item],
         geobox: GeoBox,
         *,
+        dask_chunks: dict[str, int] = compute_chunks,
         log_footprint: bool = True,
         on_load: Callable[[xr.Dataset], object] | None = None,
     ) -> xr.Dataset:
@@ -107,7 +112,7 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
             mask_band=mask_band,
             mask_out=mask_out,
             resampling=cfg.resampling,
-            chunks=compute_chunks,
+            chunks=dask_chunks,
             log_footprint=log_footprint,
             on_load=on_load,
             split_orbit_states=cfg.orbit_state == ORBIT_STATE_AS_BANDS,
@@ -143,7 +148,7 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
             # ordering dependency between tasks.
             if not store_initialized(path):
                 prepare_template(
-                    build(zone_items, geobox, log_footprint=False),
+                    build(zone_items, geobox, dask_chunks=template_chunks, log_footprint=False),
                     path,
                     shards=shards,
                     chunks={"y": chunks["y"], "x": chunks["x"]},

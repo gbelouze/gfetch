@@ -30,6 +30,7 @@ def _write_config(path: Path, **overrides: object) -> Path:
         "bands": ["red"],
         "chunks": {"x": 4, "y": 4},
         "shard_factor": 2,  # 2x2 chunks per shard -> 2x2 = 4 shards
+        "compute_chunk_factor": 1,
         **overrides,
     }
     path.write_text(yaml.dump(config_dict))
@@ -97,6 +98,34 @@ def test_mosaic_computes_every_patch_on_a_fresh_store(tmp_path: Path, monkeypatc
     # 1 call to build the lazy template + 4 patches (2x2 native chunks per patch over
     # a 16x16 grid with 4x4 native chunks).
     assert len(calls) == 5
+
+
+def test_mosaic_builds_the_template_at_shard_size(tmp_path: Path, monkeypatch) -> None:
+    cfg_path = _write_config(tmp_path / "config.yaml")
+    cfg = load(cfg_path, "s2")
+    _write_fake_items(cfg)
+
+    calls: list[GeoBox] = []
+    chunks_seen: list[dict[str, int]] = []
+    build = _fake_build_mosaic(calls)
+
+    def spy(*args: object, **kwargs: object) -> xr.Dataset:
+        chunks_seen.append(cast("dict[str, int]", kwargs["chunks"]))
+        return build(*args, **kwargs)
+
+    monkeypatch.setattr("gfetch.cli.mosaic.zone_geobox", _fake_zone_geobox)
+    monkeypatch.setattr("gfetch.cli.mosaic.build_mosaic", spy)
+
+    mosaic_cmd(cfg_path, "s2")
+
+    template, *patches = chunks_seen
+    assert (template["y"], template["x"]) == (8, 8)
+    assert all((patch["y"], patch["x"]) == (4, 4) for patch in patches)
+    items = list(pystac.ItemCollection.from_file(cfg.cached_items_path))
+    (crs,) = group_by_utm_zone(items, cfg.resolved_aoi.bbox)
+    za = zarr.open_array(store=cfg.zarr_path(crs) / "red")
+    assert za.chunks == (4, 4)
+    assert za.shards == (8, 8)
 
 
 def test_mosaic_resumes_by_skipping_already_written_patches(tmp_path: Path, monkeypatch) -> None:
