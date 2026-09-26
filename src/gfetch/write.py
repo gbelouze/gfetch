@@ -6,8 +6,11 @@ See `claude/tech-stack.md`'s "HPC / distributed execution" section for why.
 """
 
 import asyncio
+import errno
 import itertools
 import logging
+import shutil
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
@@ -196,9 +199,11 @@ def prepare_template(
 
     Coordinating step for a pre-planned disjoint-region write: call this before
     writing any region, so the store's shape/coords/chunking exist first. Idempotent
-    and safe to call from every worker unconditionally, including concurrently:
-    it's a no-op if `path` is already initialized, relying on `mode="w-"`
-    failing atomically at the filesystem level if the store already exists. This only
+    and safe to call from every worker unconditionally, including concurrently: the
+    template is written into a private temporary directory next to `path`, then
+    renamed onto `path` in one atomic `rename`, so `path` is either absent or a
+    complete template. `rename` refuses to replace a non-empty directory, so the
+    first caller's template wins and every other caller discards its own. This only
     works because every caller derives an identical template from the same
     deterministic inputs (geobox, bands, chunks), so whichever caller's write actually
     lands is immaterial.
@@ -245,11 +250,21 @@ def prepare_template(
             }
         # xarray requires dask chunks aligned to shards; nothing is computed here.
         ds = ds.chunk({dim: size for dim, size in shards.items() if dim in ds.dims})
-    try:
-        ds.to_zarr(path, compute=False, mode="w-", encoding=encoding)
-    except FileExistsError:
+    if store_initialized(path):
         log.debug(f"{path} already initialized, skipping template write")
         return
+    tmp_path = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
+    try:
+        ds.to_zarr(tmp_path, compute=False, mode="w-", encoding=encoding)
+        try:
+            tmp_path.rename(path)
+        except OSError as e:
+            if e.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                raise
+            log.debug(f"{path} initialized concurrently, discarding this template")
+            return
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
     log.info(f"Wrote Zarr template (metadata only) to {path}")
 
 

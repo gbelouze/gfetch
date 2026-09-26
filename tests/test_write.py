@@ -88,6 +88,20 @@ def test_prepare_template_is_idempotent(tmp_path: Path, dataset: xr.Dataset) -> 
     assert np.array_equal(reopened["red"].values, dataset["red"].values)
 
 
+def test_prepare_template_discards_its_template_when_losing_the_race(
+    tmp_path: Path, dataset: xr.Dataset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "regions.zarr"
+    prepare_template(dataset.chunk({"x": 8, "y": 20}), path)
+    # Simulates a caller that checked before the winner's rename landed.
+    monkeypatch.setattr("gfetch.write.store_initialized", lambda _: False)
+
+    prepare_template(dataset.chunk({"x": 4, "y": 20}), path)
+
+    validate_chunks(path, ["red"], {"x": 8, "y": 20})
+    assert [p.name for p in tmp_path.iterdir()] == ["regions.zarr"]
+
+
 def test_validate_chunks_passes_when_matching(tmp_path: Path, dataset: xr.Dataset) -> None:
     path = tmp_path / "regions.zarr"
     prepare_template(dataset.chunk({"x": 8, "y": 20}), path)
