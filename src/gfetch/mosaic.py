@@ -15,7 +15,7 @@ import pystac
 import xarray as xr
 from odc.geo.crs import CRS
 from odc.geo.geobox import GeoBox
-from odc.geo.geom import BoundingBox, bbox_intersection
+from odc.geo.geom import BoundingBox, Geometry, bbox_intersection
 from pyproj.database import query_utm_crs_info
 
 from gfetch.utils.memory import log_chunk_footprint
@@ -40,6 +40,11 @@ _DEFAULT_SHARD_FACTOR = 128
 _DEFAULT_COMPUTE_CHUNK_FACTOR = 16
 
 ORBIT_STATES: tuple[str, ...] = ("ascending", "descending")
+
+# An item's EPSG:4326 `geometry` only approximates its footprint (straight edges in
+# lon/lat are curved in the native CRS, and providers may simplify it), so an item
+# grazing a geobox's edge could otherwise test as disjoint from it.
+_FOOTPRINT_PAD_PX = 2
 
 
 __all__ = [
@@ -336,6 +341,38 @@ def _pin_mask_band_resampling(
     return per_band
 
 
+def _items_intersecting(items: Sequence[pystac.Item], geobox: GeoBox) -> list[pystac.Item]:
+    """
+    Keep only the items whose footprint intersects `geobox`.
+
+    odc-stac builds the time axis from every item it's given, so a shard loaded with its
+    whole zone's items carries every time step of the zone. Steps no item covers are
+    never read, but are still filled with nodata, held in memory, masked and reduced.
+
+    Parameters
+    ----------
+    items : Sequence[pystac.Item]
+        Candidate items.
+    geobox : GeoBox
+        Target pixel grid.
+
+    Returns
+    -------
+    list[pystac.Item]
+        Items whose `geometry` intersects `geobox` padded by `_FOOTPRINT_PAD_PX`
+        pixels, plus any item without a `geometry`. If none do, the first item alone,
+        which loads a single all-nodata time step.
+    """
+    extent = geobox.pad(_FOOTPRINT_PAD_PX).extent.to_crs("EPSG:4326", wrapdateline=True)
+    kept = [
+        item
+        for item in items
+        if item.geometry is None or Geometry(item.geometry, "EPSG:4326").intersects(extent)
+    ]
+    log.debug(f"{len(kept)}/{len(items)} item(s) intersect the geobox")
+    return kept if kept else list(items[:1])
+
+
 def mosaic(
     items: Sequence[pystac.Item],
     geobox: GeoBox,
@@ -355,7 +392,8 @@ def mosaic(
     Load, cloud-mask, and composite STAC items into a single mosaic.
 
     Convenience wrapper chaining `load`, `mask_nodata`, `mask_clouds`, and
-    `composite`. A pixel with no valid observation is NaN.
+    `composite`. A pixel with no valid observation is NaN. Items whose footprint
+    doesn't intersect `geobox` are dropped before loading, see `_items_intersecting`.
 
     Parameters
     ----------
@@ -404,6 +442,7 @@ def mosaic(
     xr.Dataset
         Lazy, dask-backed single-timestep mosaic.
     """
+    items = _items_intersecting(items, geobox)
     load_bands = list(bands)
     if mask_band is not None and mask_band not in load_bands:
         load_bands.append(mask_band)

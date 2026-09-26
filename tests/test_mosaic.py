@@ -1,13 +1,18 @@
 import datetime
+from pathlib import Path
 
 import numpy as np
 import pystac
 import pytest
+import rasterio
 import xarray as xr
 from odc.geo.crs import CRS
 from odc.geo.geobox import GeoBox
+from odc.geo.geom import box
+from rasterio.transform import from_origin
 
 from gfetch.mosaic import (
+    _items_intersecting,
     _pin_mask_band_resampling,
     group_by_utm_zone,
     mask_nodata,
@@ -348,6 +353,97 @@ def test_mosaic_split_orbit_states_rejects_unknown_orbit_state(
             ["vv"],
             split_orbit_states=True,
         )
+
+
+_UTM_X0, _UTM_Y0, _TILE_RES, _TILE_PX = 500_000, 5_400_000, 100, 100
+
+
+def _tile_item(tmp_path: Path, item_id: str, col: int, day: int, seed: int) -> pystac.Item:
+    """An item backed by a local GeoTIFF, the `col`-th 10 km tile east of a fixed
+    EPSG:32631 origin."""
+    left = _UTM_X0 + col * _TILE_RES * _TILE_PX
+    top = _UTM_Y0 + _TILE_RES * _TILE_PX
+    path = tmp_path / f"{item_id}.tif"
+    data = np.random.default_rng(seed).integers(1, 1000, (_TILE_PX, _TILE_PX), dtype=np.uint16)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=_TILE_PX,
+        height=_TILE_PX,
+        count=1,
+        dtype="uint16",
+        crs="EPSG:32631",
+        transform=from_origin(left, top, _TILE_RES, _TILE_RES),
+        nodata=0,
+    ) as dst:
+        dst.write(data, 1)
+    footprint = box(left, _UTM_Y0, left + _TILE_RES * _TILE_PX, top, "EPSG:32631")
+    footprint = footprint.to_crs("EPSG:4326")
+    item = pystac.Item(
+        id=item_id,
+        geometry=footprint.json,
+        bbox=list(footprint.boundingbox),
+        datetime=datetime.datetime(2020, 6, day, tzinfo=datetime.UTC),
+        properties={},
+    )
+    item.add_asset("red", pystac.Asset(str(path), media_type=pystac.MediaType.GEOTIFF))
+    return item
+
+
+def _geobox_in_first_tile() -> GeoBox:
+    # Right edge 50 m short of the second tile, which must be kept but not the sixth.
+    bbox = (_UTM_X0 + 3000, _UTM_Y0 + 2000, _UTM_X0 + 9950, _UTM_Y0 + 8000)
+    return GeoBox.from_bbox(bbox, crs="EPSG:32631", resolution=70)
+
+
+def test_items_intersecting_drops_disjoint_items(tmp_path: Path) -> None:
+    items = [_tile_item(tmp_path, f"c{col}", col, 1, col) for col in (0, 1, 5)]
+    no_geometry = _item("no_geometry", (0, 0, 1, 1))
+
+    kept = _items_intersecting([*items, no_geometry], _geobox_in_first_tile())
+
+    assert [item.id for item in kept] == ["c0", "c1", "no_geometry"]
+
+
+def test_items_intersecting_keeps_first_item_when_none_intersect(tmp_path: Path) -> None:
+    items = [_tile_item(tmp_path, f"c{col}", col, 1, col) for col in (5, 6)]
+
+    assert [item.id for item in _items_intersecting(items, _geobox_in_first_tile())] == ["c5"]
+
+
+@pytest.mark.parametrize(
+    ("cols", "n_kept"),
+    [
+        ((0, 0, 1, 1, 5), 4),
+        # no item intersects: a single all-nodata time step, all-NaN composite
+        ((5, 6), 1),
+    ],
+)
+def test_mosaic_item_filtering_leaves_composite_unchanged(
+    tmp_path: Path, monkeypatch, cols: tuple[int, ...], n_kept: int
+) -> None:
+    items = [_tile_item(tmp_path, f"i{i}", col, i + 1, i) for i, col in enumerate(cols)]
+    geobox = _geobox_in_first_tile()
+
+    def run() -> tuple[xr.Dataset, list[int]]:
+        n_times: list[int] = []
+        ds = mosaic(
+            items,
+            geobox,
+            ["red"],
+            resampling="bilinear",
+            on_load=lambda loaded: n_times.append(loaded.sizes["time"]),
+        )
+        return ds.compute(), n_times
+
+    filtered, filtered_times = run()
+    monkeypatch.setattr("gfetch.mosaic._items_intersecting", lambda items, geobox: list(items))
+    unfiltered, unfiltered_times = run()
+
+    xr.testing.assert_identical(filtered, unfiltered)
+    assert filtered_times == [n_kept]
+    assert unfiltered_times == [len(cols)]
 
 
 @pytest.mark.slow

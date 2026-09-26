@@ -1300,3 +1300,52 @@ that state was reached, and should be read chronologically, not as reference mat
     before `mask_clouds` (skipping the mask band, which must stay integer for
     `isin`). Side effect: S1 composites are `float32` (xarray's promotion of
     `uint16` under `where`), not `float64`.
+
+- **2026-09-26** — **`mosaic` OOM building a zone's Zarr template.** Mozambique +
+  Tanzania, S2 2020, 64 px chunks, `shard_factor: 128`, `compute_chunk_factor: 1`,
+  30-task array on Jean Zay CPU nodes (~40 GB): every task was OOM-killed about 70 min
+  into building the template for EPSG:32736 (66786 x 286412 px, 921 items), before any
+  shard was assigned.
+  - Cause: the template is a full `mosaic()` over the whole zone geobox at the
+    compute chunking, only to read its metadata. 4.7M spatial chunks x 13 bands
+    ≈ 61M odc-stac load tasks, built eagerly, plus the mask/median layers.
+    `prepare_template` then rechunked to the store chunks before rechunking to the
+    shards, which rebuilt the same number of tasks: dask builds rechunk graphs
+    eagerly (measured: 1M output chunks ≈ 60 s, 1.2 GB). EPSG:32735 (about 6.6x
+    smaller) survived, taking 7 min.
+  - Fix: `gfetch mosaic` builds the template at shard-sized dask chunks, and
+    `prepare_template` (sharded case) writes the inner chunks straight into the
+    encoding instead of going through `ds.chunk`. Measured on a synthetic
+    zone-32736-sized lazy dataset: 0.9 s, 8 MB peak.
+  - Rejected: building the template from the geobox alone, without odc-stac. It
+    would restate `mosaic()`'s output variables, dtype (uint16 promoted to float32
+    by `.where`), attrs and CRS coord, and could drift from it silently.
+  - Still open: (1) ~~each shard is loaded with every item in its zone~~, fixed the
+    same day, see the next entry. (2) All array tasks still build the template at the same time on a
+    fresh store; that's cheap now, but the work is duplicated.
+  - Defaults changed on the way: store chunks 256 → 64 px, `shard_factor` 32 → 128
+    (8192 px shards either way), `compute_chunk_factor` 1 → 16 (1024 px dask chunks).
+    At a factor of 1, 64 px chunks gave 16k dask chunks per shard and band, mostly
+    scheduling overhead. Like the other defaults, a user override isn't adapted: the
+    user is responsible for keeping chunks, shards and bricks consistent.
+
+- **2026-09-26** — **`mosaic` drops the items that don't intersect the geobox.**
+  - Confirmed in odc-stac 0.5.3 (`_stac_load.py`): the time axis is built from every
+    item's `groupby` group, with no geobox filtering. Items whose footprint misses a
+    chunk get an empty `tyx_bins` entry, so no read happens, but the time step is
+    still filled with nodata, held in memory (`time: -1`, so the whole `T x 1024² px`
+    brick per band), masked and reduced. Synthetic check: 10 dates over one area plus
+    10 over a disjoint one, loaded onto a geobox in the first, gave `time=20`.
+  - Fix: `mosaic()` keeps only items whose `geometry` intersects the geobox padded by
+    2 px, in EPSG:4326 (`_items_intersecting`). Applied in `mosaic()` itself, so the
+    zone template keeps every item and each shard filters its own. Items without a
+    `geometry` are kept. If none intersect, the first item alone is kept: odc-stac
+    can't load an empty list, and one non-overlapping item gives a single all-nodata
+    step, so an all-NaN shard as before.
+  - Equivalence tested on local GeoTIFFs with bilinear resampling, filtered vs.
+    unfiltered: identical composites. It stayed identical even without the pad, with
+    the geobox's edge 50 m short of an adjacent item: odc warps each item separately,
+    so an item outside the geobox never feeds its pixels. The pad only guards against
+    `geometry` approximating the footprint (edges straight in lon/lat, curved in UTM).
+  - Not measured on the real job yet. Expected gain: per shard, memory and median cost
+    scale with the shard's own time steps instead of the zone's.
