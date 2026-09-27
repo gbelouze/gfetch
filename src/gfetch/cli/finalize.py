@@ -4,9 +4,11 @@ from pathlib import Path
 import pystac
 
 from gfetch.cli.config import Config, load, resolve_output_variables
-from gfetch.finalize import pack_store, remove_cache
+from gfetch.finalize import remove_cache
 from gfetch.mosaic import group_by_utm_zone
-from gfetch.utils.progress import count_bar, default_bar
+from gfetch.utils.progress import count_bar
+from gfetch.vrt import write_vrt
+from gfetch.write import store_initialized
 
 log = logging.getLogger(__name__)
 
@@ -32,9 +34,11 @@ def _zone_stores(cfg: Config) -> list[Path] | None:
     return [cfg.zarr_path(crs) for crs in group_by_utm_zone(items, cfg.resolved_aoi.bbox)]
 
 
-def pack(config_path: Path, satellite_key: str, *, remove_store: bool = False) -> None:
+def vrt(config_path: Path, satellite_key: str) -> None:
     """
-    Pack each of this job's complete Zarr stores into a single-file zip store.
+    Write a multi-band VRT next to each of this job's Zarr stores.
+
+    Stores that don't exist yet are skipped, with a warning.
 
     Parameters
     ----------
@@ -43,17 +47,17 @@ def pack(config_path: Path, satellite_key: str, *, remove_store: bool = False) -
     satellite_key : str
         Which satellite to load from `config_path` - `'s1'`, `'s2'`, or a name under
         its `custom:` section. See `gfetch.cli.config.load`.
-    remove_store : bool
-        Delete each store directory once its zip is in place. Defaults to False.
     """
     cfg = load(config_path, satellite_key)
     stores = _zone_stores(cfg)
     if stores is None:
         return
     variables = resolve_output_variables(cfg)
-    with default_bar() as progress:
-        for store in stores:
-            pack_store(store, variables, remove_source=remove_store, progress=progress)
+    for store in stores:
+        if not store_initialized(store):
+            log.warning(f"{store} not found, run `gfetch mosaic` first. Skipping.")
+            continue
+        write_vrt(store, variables)
 
 
 def clean(config_path: Path, satellite_key: str) -> None:

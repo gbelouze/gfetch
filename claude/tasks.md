@@ -1404,3 +1404,23 @@ that state was reached, and should be read chronologically, not as reference mat
     also runs `validate_geobox`, which fails fast if the store's `x`/`y` coordinates
     differ from the zone geobox. On the job above it rejects the old EPSG:32736
     store and accepts EPSG:32737's.
+
+- **2026-09-27** — **Pack/zip removed; `gfetch <satellite> vrt` added.**
+  - Sharding made the post-hoc zip store redundant for inode usage, so `pack_store`,
+    `packed_store_path`, `gfetch <satellite> pack` and `mosaic`'s `ZipStore`
+    handling are gone; `write_regions` takes a store `Path` again. `clean`
+    (`remove_cache`) stays, now requiring `store_is_complete` for every store.
+  - QGIS opens a mosaic through GDAL's Zarr driver as one subdataset per band.
+    Considered switching the store to a single `(band, y, x)` array (one file per
+    shard across all bands, but one dtype/fill value for every band, a band list
+    fixed at template time, and every existing store rewritten); kept the
+    per-variable layout for now.
+  - `gfetch.vrt.write_vrt` writes `mosaic_epsg<code>.vrt` next to each store instead,
+    stacking the variables as bands. The XML is built directly from the store's
+    metadata, without GDAL: rasterio's bundled GDAL (3.12) can't read sharded
+    stores. Each band's `SourceFilename` is the array directory
+    (`mosaic.zarr/B04`, `relativeToVRT="1"`): verified on GDAL 3.13.3 that this
+    reads correctly and survives moving the pair, while `ZARR:"…":/B04` isn't
+    resolved relative to the VRT. Georeferencing is written into the VRT, so it
+    doesn't depend on GDAL resolving the store's grid mapping (see `tech-stack.md`'s
+    "Consolidated metadata and GDAL").

@@ -687,7 +687,8 @@ per-asset cost - a candidate for removal, not done yet since AGENTS.md prescribe
 core functions in `gfetch.finalize` (`pack_store`, `remove_cache`), exposed as
 `gfetch <satellite> pack [--remove-store]` / `gfetch <satellite> clean`. `mosaic`
 skips a zone whose zip exists (still listing its patches, so `task_id`/`n_tasks`
-assignment doesn't shift if packing happens between tasks). Sharding is the better long-term fix
+assignment doesn't shift if packing happens between tasks). **Removed 2026-09-27**: packing,
+made redundant by sharding; `clean` stays. Sharding is the better long-term fix
 for the store itself; **implemented 2026-09-23**: `shard_factor:` config (chunks per
 shard along each side, default 32, with default chunks now 256 px), `patch_chunks`
 removed. `mosaic`'s unit of work is one shard, listed from the

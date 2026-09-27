@@ -26,7 +26,6 @@ import zarr
 from odc.geo.geobox import GeoBox
 from odc.geo.xr import xr_coords
 from zarr.core.metadata import ArrayV3Metadata
-from zarr.storage import StoreLike
 
 from gfetch.utils.memory import log_chunk_footprint
 
@@ -423,14 +422,14 @@ def _record_skipped(store: Path, variable: str, skip: Callable[[dict[str, slice]
     log.info(f"Skipping {len(skipped)}/{len(units)} storage unit(s)")
 
 
-def _skipped_units(store: StoreLike) -> tuple[list[str], set[tuple[int, ...]]]:
+def _skipped_units(store: Path) -> tuple[list[str], set[tuple[int, ...]]]:
     """
     Read the storage units recorded under `SKIPPED_SHARDS_ATTR`.
 
     Parameters
     ----------
-    store : StoreLike
-        Zarr store.
+    store : Path
+        Zarr store path.
 
     Returns
     -------
@@ -447,7 +446,7 @@ def _skipped_units(store: StoreLike) -> tuple[list[str], set[tuple[int, ...]]]:
     return list(dims), {tuple(index) for index in indices}
 
 
-def write_regions(store: StoreLike, variable: str) -> list[dict[str, slice]]:
+def write_regions(store: Path, variable: str) -> list[dict[str, slice]]:
     """
     List a variable's storage units (shards, or chunks if unsharded) as regions.
 
@@ -457,9 +456,8 @@ def write_regions(store: StoreLike, variable: str) -> list[dict[str, slice]]:
 
     Parameters
     ----------
-    store : StoreLike
-        Zarr store holding `variable`, e.g. a store directory `Path` or a read-only
-        `zarr.storage.ZipStore`.
+    store : Path
+        Zarr store path holding `variable`.
     variable : str
         Array whose storage grid to list.
 

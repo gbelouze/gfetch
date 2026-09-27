@@ -1,4 +1,5 @@
 import datetime
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -6,13 +7,14 @@ import pystac
 import pytest
 import xarray as xr
 import yaml
-from zarr.storage import ZipStore
+from odc.geo.geobox import GeoBox
+from odc.geo.xr import xr_coords
 
 from gfetch.cli.config import Config, load
 from gfetch.cli.finalize import clean as clean_cmd
-from gfetch.cli.finalize import pack as pack_cmd
-from gfetch.finalize import packed_store_path
+from gfetch.cli.finalize import vrt as vrt_cmd
 from gfetch.mosaic import group_by_utm_zone
+from gfetch.vrt import vrt_path
 from gfetch.write import prepare_template, write
 
 
@@ -48,7 +50,7 @@ def _setup_job(tmp_path: Path, *, complete: bool = True) -> tuple[Path, Config, 
     store = cfg.zarr_path(crs)
     ds = xr.Dataset(
         {"red": (("y", "x"), np.ones((8, 8), dtype="float32"))},
-        coords={"y": np.arange(8), "x": np.arange(8)},
+        coords=xr_coords(GeoBox.from_bbox((0, 0, 80, 80), crs=crs, resolution=10)),
     ).chunk({"y": 4, "x": 4})
     if complete:
         write(ds, store)
@@ -57,24 +59,21 @@ def _setup_job(tmp_path: Path, *, complete: bool = True) -> tuple[Path, Config, 
     return cfg_path, cfg, store
 
 
-def test_pack_zips_each_zone_store(tmp_path: Path) -> None:
-    cfg_path, _, store = _setup_job(tmp_path)
-
-    pack_cmd(cfg_path, "s2", remove_store=True)
-
-    assert not store.exists()
-    packed = xr.open_zarr(ZipStore(packed_store_path(store), mode="r"), consolidated=False)
-    assert float(packed["red"].sum()) == 64.0
-
-
-def test_pack_refuses_incomplete_store(tmp_path: Path) -> None:
+def test_vrt_writes_one_per_zone_store(tmp_path: Path) -> None:
     cfg_path, _, store = _setup_job(tmp_path, complete=False)
 
-    with pytest.raises(ValueError, match="incomplete"):
-        pack_cmd(cfg_path, "s2", remove_store=True)
+    vrt_cmd(cfg_path, "s2")
 
-    assert store.exists()
-    assert not packed_store_path(store).exists()
+    assert vrt_path(store).exists()
+
+
+def test_vrt_skips_missing_store(tmp_path: Path) -> None:
+    cfg_path, _, store = _setup_job(tmp_path)
+    shutil.rmtree(store)
+
+    vrt_cmd(cfg_path, "s2")
+
+    assert not vrt_path(store).exists()
 
 
 def test_clean_removes_cache_once_stores_complete(tmp_path: Path) -> None:

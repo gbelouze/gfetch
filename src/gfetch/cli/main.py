@@ -120,29 +120,27 @@ def _register_raster_commands(sub_app: cyclopts.App, satellite_key: str) -> None
 
         mosaic_cmd(config, satellite_key, task_id=task_id, n_tasks=n_tasks)
 
-    @sub_app.command(name="pack")
-    def _pack(config: Path, remove_store: bool = False, verbose: bool = False) -> None:
+    @sub_app.command(name="vrt")
+    def _vrt(config: Path, verbose: bool = False) -> None:
         """
-        Pack each of a job's complete Zarr mosaics into a single-file zip store.
+        Write a multi-band VRT next to each of a job's Zarr mosaics.
 
-        Run once `mosaic` has finished: cuts each store's inode usage from one file
-        per chunk to one file. The zip (`<store>.zip`) is read-only, readable in
-        place via `zarr.storage.ZipStore` or GDAL's `/vsizip/`. Refuses incomplete
-        stores; safe to rerun.
+        Opens in QGIS (or anything GDAL-based) as one raster with a band per mosaic
+        variable, where the Zarr driver alone shows one band at a time. Copies no
+        pixel data. Reading a sharded mosaic needs GDAL >= 3.13. Safe to run before
+        `mosaic` has finished (unwritten shards read as nodata), and to rerun.
 
         Parameters
         ----------
         config : Path
             Path to the configuration YAML file.
-        remove_store : bool
-            Delete each store directory once its zip is in place. Defaults to False.
         verbose : bool
             Enable verbose (DEBUG) logging. Defaults to False.
         """
         _setup_logging(level=logging.DEBUG if verbose else logging.INFO)
-        from gfetch.cli.finalize import pack as pack_cmd
+        from gfetch.cli.finalize import vrt as vrt_cmd
 
-        pack_cmd(config, satellite_key, remove_store=remove_store)
+        vrt_cmd(config, satellite_key)
 
     @sub_app.command(name="clean")
     def _clean(config: Path, verbose: bool = False) -> None:
@@ -264,18 +262,15 @@ def _custom_mosaic(
     mosaic_cmd(config, name, task_id=task_id, n_tasks=n_tasks)
 
 
-@custom_app.command(name="pack")
-def _custom_pack(
-    name: str, config: Path, remove_store: bool = False, verbose: bool = False
-) -> None:
+@custom_app.command(name="vrt")
+def _custom_vrt(name: str, config: Path, verbose: bool = False) -> None:
     """
-    Pack each of a `custom` satellite job's complete Zarr mosaics into a single-file
-    zip store.
+    Write a multi-band VRT next to each of a `custom` satellite job's Zarr mosaics.
 
-    Run once `mosaic` has finished: cuts each store's inode usage from one file per
-    chunk to one file. The zip (`<store>.zip`) is read-only, readable in place via
-    `zarr.storage.ZipStore` or GDAL's `/vsizip/`. Refuses incomplete stores; safe to
-    rerun.
+    Opens in QGIS (or anything GDAL-based) as one raster with a band per mosaic
+    variable, where the Zarr driver alone shows one band at a time. Copies no pixel
+    data. Reading a sharded mosaic needs GDAL >= 3.13. Safe to run before `mosaic`
+    has finished (unwritten shards read as nodata), and to rerun.
 
     Parameters
     ----------
@@ -283,15 +278,13 @@ def _custom_pack(
         Which entry under `config`'s `custom:` section to load.
     config : Path
         Path to the configuration YAML file.
-    remove_store : bool
-        Delete each store directory once its zip is in place. Defaults to False.
     verbose : bool
         Enable verbose (DEBUG) logging. Defaults to False.
     """
     _setup_logging(level=logging.DEBUG if verbose else logging.INFO)
-    from gfetch.cli.finalize import pack as pack_cmd
+    from gfetch.cli.finalize import vrt as vrt_cmd
 
-    pack_cmd(config, name, remove_store=remove_store)
+    vrt_cmd(config, name)
 
 
 @custom_app.command(name="clean")

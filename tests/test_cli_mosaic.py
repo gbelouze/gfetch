@@ -17,7 +17,6 @@ from odc.geo.xr import xr_coords
 from gfetch import countries as countries_module
 from gfetch.cli.config import Config, load
 from gfetch.cli.mosaic import mosaic as mosaic_cmd
-from gfetch.finalize import pack_store
 from gfetch.mosaic import group_by_utm_zone
 from gfetch.write import SKIPPED_SHARDS_ATTR, region_is_written, store_is_complete
 
@@ -177,27 +176,6 @@ def test_mosaic_splits_disjoint_patches_across_tasks(tmp_path: Path, monkeypatch
     (crs,) = group_by_utm_zone(items, cfg.resolved_aoi.bbox)
     path = cfg.zarr_path(crs)
     assert region_is_written(path, {"y": slice(0, 16), "x": slice(0, 16)}, ["red"])
-
-
-def test_mosaic_skips_packed_zone_without_recreating_its_store(tmp_path: Path, monkeypatch) -> None:
-    cfg_path = _write_config(tmp_path / "config.yaml")
-    cfg = load(cfg_path, "s2")
-    _write_fake_items(cfg)
-
-    monkeypatch.setattr("gfetch.cli.mosaic.zone_geobox", _fake_zone_geobox)
-    calls: list[GeoBox] = []
-    monkeypatch.setattr("gfetch.cli.mosaic.build_mosaic", _fake_build_mosaic(calls))
-    mosaic_cmd(cfg_path, "s2")
-
-    items = list(pystac.ItemCollection.from_file(cfg.cached_items_path))
-    (crs,) = group_by_utm_zone(items, cfg.resolved_aoi.bbox)
-    pack_store(cfg.zarr_path(crs), ["red"], remove_source=True)
-
-    calls.clear()
-    mosaic_cmd(cfg_path, "s2")
-
-    assert calls == []
-    assert not cfg.zarr_path(crs).exists()
 
 
 def test_mosaic_tunes_worker_count_within_range(tmp_path: Path, monkeypatch) -> None:

@@ -8,7 +8,6 @@ import dask
 import pystac
 import xarray as xr
 from odc.geo.geobox import GeoBox
-from zarr.storage import ZipStore
 
 from gfetch.cli.config import (
     ORBIT_STATE_AS_BANDS,
@@ -18,7 +17,6 @@ from gfetch.cli.config import (
     resolve_compute_workers,
     resolve_output_variables,
 )
-from gfetch.finalize import packed_store_path
 from gfetch.mosaic import (
     group_by_utm_zone,
     outside_aoi,
@@ -125,44 +123,30 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
     for crs, zone_items in zones.items():
         geobox = zone_geobox(crs, cfg.resolved_aoi.bbox, cfg.resolution)
         path = cfg.zarr_path(crs)
-        packed = packed_store_path(path)
+        # Building the template dataset means running the full mosaic() pipeline
+        # over the whole zone's item list and geobox (odc-stac has to bin every
+        # item against the zone's full tile grid to construct the graph) just to
+        # read off its post-composite shape/dtype/coords: real, non-trivial work
+        # even though `prepare_template`'s `compute=False` never reads or writes
+        # any pixel data. Checking first avoids paying for that on every
+        # invocation once the template already exists (the common case once a job
+        # is past its first run). Every task still calls `prepare_template`
+        # independently and idempotently when it does need to, so there's no
+        # ordering dependency between tasks.
+        if not store_initialized(path):
+            prepare_template(
+                build(zone_items, geobox, dask_chunks=template_chunks, log_footprint=False),
+                path,
+                shards=shards,
+                chunks={"y": chunks["y"], "x": chunks["x"]},
+                skip=outside_aoi(geobox, cfg.aoi_geometry),
+            )
 
-        if packed.exists():
-            log.info(f"EPSG:{crs.epsg}: already packed into {packed}, skipping")
-            # A packed zone is complete (`pack_store` only packs complete stores) and
-            # its directory may be gone; its shards are still listed, from the zip,
-            # so that every task assigns the same shards regardless of when packing
-            # happened.
-            zip_store = ZipStore(packed, mode="r")
-            try:
-                regions = write_regions(zip_store, variables[0])
-            finally:
-                zip_store.close()
-        else:
-            # Building the template dataset means running the full mosaic() pipeline
-            # over the whole zone's item list and geobox (odc-stac has to bin every
-            # item against the zone's full tile grid to construct the graph) just to
-            # read off its post-composite shape/dtype/coords: real, non-trivial work
-            # even though `prepare_template`'s `compute=False` never reads or writes
-            # any pixel data. Checking first avoids paying for that on every
-            # invocation once the template already exists (the common case once a job
-            # is past its first run). Every task still calls `prepare_template`
-            # independently and idempotently when it does need to, so there's no
-            # ordering dependency between tasks.
-            if not store_initialized(path):
-                prepare_template(
-                    build(zone_items, geobox, dask_chunks=template_chunks, log_footprint=False),
-                    path,
-                    shards=shards,
-                    chunks={"y": chunks["y"], "x": chunks["x"]},
-                    skip=outside_aoi(geobox, cfg.aoi_geometry),
-                )
-
-            # Fails fast, before any shard is built, if this store's on-disk chunk,
-            # shard or pixel grid doesn't match what this run's config expects
-            validate_chunks(path, variables, {"y": chunks["y"], "x": chunks["x"]}, shards)
-            validate_geobox(path, geobox)
-            regions = write_regions(path, variables[0])
+        # Fails fast, before any shard is built, if this store's on-disk chunk,
+        # shard or pixel grid doesn't match what this run's config expects
+        validate_chunks(path, variables, {"y": chunks["y"], "x": chunks["x"]}, shards)
+        validate_geobox(path, geobox)
+        regions = write_regions(path, variables[0])
 
         for region in regions:
             label = f"EPSG:{crs.epsg} shard (y={region['y'].start}, x={region['x'].start})"
@@ -184,7 +168,7 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
             # Each band's shard is its own file, written atomically, so a shard counts
             # as done once every band's file exists; otherwise all its bands are
             # recomputed and rewritten.
-            if packed_store_path(path).exists() or region_is_written(path, region, variables):
+            if region_is_written(path, region, variables):
                 log.debug(f"{label}: already written, skipping")
             else:
                 n_workers = tuner.next()
