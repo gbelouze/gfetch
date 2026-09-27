@@ -7,6 +7,7 @@ import xarray as xr
 import zarr
 
 from gfetch.write import (
+    SKIPPED_SHARDS_ATTR,
     prepare_template,
     region_is_written,
     store_initialized,
@@ -310,6 +311,46 @@ def test_sharded_region_writes_are_tracked_per_shard(tmp_path: Path) -> None:
         write_region(ds.isel(region), path, region)
     assert store_is_complete(path, ["red"])
     xr.testing.assert_equal(xr.open_zarr(path, consolidated=False)["red"].load(), ds["red"])
+
+
+def test_skipped_shards_are_recorded_and_excluded(tmp_path: Path) -> None:
+    rng = np.random.default_rng(0)
+    ds = xr.Dataset(
+        {"red": (("y", "x"), rng.random((16, 16)).astype("float32"))},
+        coords={"y": np.arange(16), "x": np.arange(16)},
+    )
+    path = tmp_path / "sharded.zarr"
+    prepare_template(
+        ds.chunk({"y": 4, "x": 4}),
+        path,
+        shards={"y": 8, "x": 8},
+        skip=lambda region: region["x"].start == 8,
+    )
+
+    attrs = zarr.open_group(store=path, mode="r").attrs[SKIPPED_SHARDS_ATTR]
+    assert attrs == {"dimensions": ["y", "x"], "indices": [[0, 1], [1, 1]]}
+    regions = write_regions(path, "red")
+    assert [(r["y"].start, r["x"].start) for r in regions] == [(0, 0), (8, 0)]
+    assert region_is_written(path, {"y": slice(0, 8), "x": slice(8, 16)}, ["red"])
+
+    write_region(ds.isel(regions[0]), path, regions[0])
+    assert not store_is_complete(path, ["red"])
+    write_region(ds.isel(regions[1]), path, regions[1])
+    assert store_is_complete(path, ["red"])
+    assert sorted(p.relative_to(path).as_posix() for p in path.glob("red/c/*/*")) == [
+        "red/c/0/0",
+        "red/c/1/0",
+    ]
+    reopened = xr.open_zarr(path, consolidated=False)["red"].load()
+    assert np.isnan(reopened.isel(x=slice(8, 16))).all()
+
+
+def test_template_without_skip_records_nothing(tmp_path: Path, dataset: xr.Dataset) -> None:
+    path = tmp_path / "sharded.zarr"
+    prepare_template(dataset.chunk({"x": 4, "y": 20}), path, shards={"x": 8})
+
+    assert SKIPPED_SHARDS_ATTR not in zarr.open_group(store=path, mode="r").attrs
+    assert len(write_regions(path, "red")) == 2
 
 
 def test_validate_chunks_raises_on_shard_mismatch(tmp_path: Path, dataset: xr.Dataset) -> None:

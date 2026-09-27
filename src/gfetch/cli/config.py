@@ -1,10 +1,13 @@
 import logging
 from dataclasses import dataclass, field, fields
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 
+import shapely
 from odc.geo.crs import CRS
 from omegaconf import DictConfig, OmegaConf
+from shapely.geometry.base import BaseGeometry
 
 from gfetch.profiles import get_profile
 from gfetch.utils.system import available_cpus
@@ -19,6 +22,7 @@ __all__ = [
     "TimeRangeConfig",
     "load",
     "resolve_aoi",
+    "resolve_aoi_geometry",
     "resolve_bands",
     "resolve_cloud_mask",
     "resolve_output_variables",
@@ -107,6 +111,31 @@ def resolve_aoi(aoi: AOIConfig | None, countries: list[str] | None, *, context: 
 
     min_lon, min_lat, max_lon, max_lat = resolve_country_polygon(countries).bounds
     return AOIConfig(left=min_lon, bottom=min_lat, right=max_lon, top=max_lat)
+
+
+def resolve_aoi_geometry(aoi: AOIConfig, countries: list[str] | None) -> BaseGeometry:
+    """
+    Resolve a job's exact AOI shape, for anything selecting data (search, GEDI tiles,
+    mosaic shards). Output grids use the bounding box `aoi` instead.
+
+    Parameters
+    ----------
+    aoi : AOIConfig
+        The job's resolved AOI bounding box, see `resolve_aoi`.
+    countries : list[str] | None
+        Country names the AOI was derived from, if any.
+
+    Returns
+    -------
+    BaseGeometry
+        The union of `countries`' boundaries, or `aoi` as a box if `countries` is
+        None, in EPSG:4326.
+    """
+    if countries is None:
+        return shapely.box(*aoi.bbox)
+    from gfetch.countries import resolve_country_polygon
+
+    return resolve_country_polygon(countries)
 
 
 @dataclass
@@ -271,6 +300,16 @@ class Config:
         """
         assert self.aoi is not None, "aoi not yet resolved - build this Config via load()"
         return self.aoi
+
+    @cached_property
+    def aoi_geometry(self) -> BaseGeometry:
+        """
+        Returns
+        -------
+        BaseGeometry
+            The exact AOI shape in EPSG:4326, see `resolve_aoi_geometry`.
+        """
+        return resolve_aoi_geometry(self.resolved_aoi, self.countries)
 
     @property
     def cache_dir(self) -> Path:

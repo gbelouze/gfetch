@@ -12,11 +12,13 @@ from typing import Literal, cast
 import numpy as np
 import odc.stac
 import pystac
+import shapely
 import xarray as xr
 from odc.geo.crs import CRS
 from odc.geo.geobox import GeoBox
 from odc.geo.geom import BoundingBox, Geometry, bbox_intersection
 from pyproj.database import query_utm_crs_info
+from shapely.geometry.base import BaseGeometry
 
 from gfetch.utils.memory import log_chunk_footprint
 
@@ -43,7 +45,8 @@ ORBIT_STATES: tuple[str, ...] = ("ascending", "descending")
 
 # An item's EPSG:4326 `geometry` only approximates its footprint (straight edges in
 # lon/lat are curved in the native CRS, and providers may simplify it), so an item
-# grazing a geobox's edge could otherwise test as disjoint from it.
+# grazing a geobox's edge could otherwise test as disjoint from it. The same holds for
+# an EPSG:4326 AOI polygon reprojected onto a geobox.
 _FOOTPRINT_PAD_PX = 2
 
 
@@ -56,6 +59,7 @@ __all__ = [
     "mask_nodata",
     "mosaic",
     "orbit_state_variables",
+    "outside_aoi",
     "resolve_chunks",
     "resolve_compute_chunks",
     "resolve_shards",
@@ -710,3 +714,34 @@ def zone_geobox(crs: CRS, aoi_bbox: tuple[float, float, float, float], resolutio
     # first.
     extent = _zone_aoi_extent(crs, aoi).to_crs(crs)
     return GeoBox.from_bbox(extent, resolution=resolution)
+
+
+def outside_aoi(geobox: GeoBox, aoi: BaseGeometry) -> Callable[[dict[str, slice]], bool]:
+    """
+    Build a test for whether a region of `geobox` lies entirely outside an AOI.
+
+    Parameters
+    ----------
+    geobox : GeoBox
+        Pixel grid the regions index into.
+    aoi : BaseGeometry
+        Exact AOI shape, in EPSG:4326.
+
+    Returns
+    -------
+    Callable[[dict[str, slice]], bool]
+        Takes a region as `{"y": slice, "x": slice}` and returns True if that region,
+        padded by `_FOOTPRINT_PAD_PX` pixels, doesn't intersect `aoi`.
+    """
+    extent = geobox.extent.to_crs("EPSG:4326", wrapdateline=True)
+    clipped = Geometry(aoi, "EPSG:4326").intersection(extent)
+    if clipped.is_empty:
+        return lambda region: True
+    local = clipped.to_crs(geobox.crs).geom
+    shapely.prepare(local)
+
+    def outside(region: dict[str, slice]) -> bool:
+        sub = cast("GeoBox", geobox[region["y"], region["x"]])
+        return not local.intersects(sub.pad(_FOOTPRINT_PAD_PX).extent.geom)
+
+    return outside

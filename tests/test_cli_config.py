@@ -191,6 +191,24 @@ def test_countries_resolves_aoi_to_union_bbox(
     assert cfg.resolved_aoi.bbox == (29.0, -27.0, 41.0, -1.0)
 
 
+def test_aoi_geometry_is_the_country_polygon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    polygon = shapely.Polygon([(29.0, -27.0), (41.0, -27.0), (29.0, -1.0)])
+    monkeypatch.setattr(countries_module, "resolve_country_polygon", lambda names: polygon)
+    config_path = _write_config(tmp_path / "config.yaml", aoi=None, countries=["Mozambique"])
+
+    cfg = load(config_path, "s2")
+
+    assert cfg.aoi_geometry is polygon
+
+
+def test_aoi_geometry_is_the_aoi_box(tmp_path: Path) -> None:
+    cfg = load(_write_config(tmp_path / "config.yaml"), "s2")
+
+    assert cfg.aoi_geometry.equals(shapely.box(2.2, 48.7, 2.5, 49.0))
+
+
 def test_both_aoi_and_countries_raises(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path / "config.yaml", countries=["Mozambique"])
 

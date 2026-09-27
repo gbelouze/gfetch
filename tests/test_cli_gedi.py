@@ -57,7 +57,7 @@ def test_gedi_cmd_passes_config_to_fetch(tmp_path: Path, monkeypatch: pytest.Mon
     assert captured["anc_fields"] == ["quality_flag"]
     assert captured["rh_percentiles"] == [0, 50, 100]
     assert captured["quality_filter"] is True
-    assert captured["polygon"] is None
+    assert captured["polygon"].equals(shapely.box(2.2, 48.7, 2.5, 49.0))
     assert captured["tile_dir"] == tmp_path / "l2a.parquet.tiles"
     assert not captured["tile_dir"].exists()
 

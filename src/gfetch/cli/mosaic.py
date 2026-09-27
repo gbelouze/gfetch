@@ -21,6 +21,7 @@ from gfetch.cli.config import (
 from gfetch.finalize import packed_store_path
 from gfetch.mosaic import (
     group_by_utm_zone,
+    outside_aoi,
     resolve_chunks,
     resolve_compute_chunks,
     resolve_shards,
@@ -52,7 +53,8 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
     being killed/preempted: an already-written band of a shard is skipped, and an
     unwritten one is computed and written as a whole. Safe for several concurrent invocations to
     split the work via `task_id`/`n_tasks`, since each shard is its own file and is
-    assigned to exactly one task.
+    assigned to exactly one task. Shards entirely outside the AOI's exact shape (e.g.
+    the country polygons) are never computed and read back as NaN.
 
     Parameters
     ----------
@@ -152,6 +154,7 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
                     path,
                     shards=shards,
                     chunks={"y": chunks["y"], "x": chunks["x"]},
+                    skip=outside_aoi(geobox, cfg.aoi_geometry),
                 )
 
             # Fails fast, before any shard is built, if this store's on-disk chunk or

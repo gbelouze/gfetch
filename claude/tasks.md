@@ -1349,3 +1349,40 @@ that state was reached, and should be read chronologically, not as reference mat
     `geometry` approximating the footprint (edges straight in lon/lat, curved in UTM).
   - Not measured on the real job yet. Expected gain: per shard, memory and median cost
     scale with the shard's own time steps instead of the zone's.
+
+- **2026-09-27** — **`mosaic` skips the shards outside the AOI polygon.** Mozambique +
+  Tanzania, S2 Feb–Mar 2024, `max_cloud_cover: 20`, 2048 px shards: the log was
+  mostly "0/29 item(s) intersect the geobox".
+  - Not a filtering bug. Zone grids are the AOI *bbox* clipped to each zone, while the
+    search uses the country polygons, so much of each grid (Malawi, Zambia, Zimbabwe,
+    the Indian Ocean) has no item. 4116/9100 shards had no item at all. The "/29" is
+    EPSG:32735, a 0.66°-wide strip at lon 29.34–30 that only 45/700 shards of which
+    touch the countries. Cross-checked against item bboxes (a superset of their
+    `geometry`): of the ~800 empty shards inside the countries, only 39 were hit by a
+    bbox, all from partial edge-of-swath items.
+  - A separate, data-side effect: ~330k km² of the countries (mostly lat −7 to −15)
+    have no item at all, because `max_cloud_cover: 20` removes every rainy-season scene
+    there. Left to the user, it's a config choice.
+  - Fix: `Config.aoi_geometry` (and `GediConfig.aoi_geometry`) hold the exact AOI
+    shape: the countries' union, or the `aoi` box. Anything selecting data uses it
+    (STAC `intersects`, GEDI tile filtering, shard planning); output grids keep using
+    the bbox, since a Zarr array is a rectangle anyway. `gfetch mosaic` passes
+    `outside_aoi(geobox, aoi_geometry)` to `prepare_template`, which records the
+    matching shards under the root group attribute `gfetch:skipped_shards` (dimension
+    names + shard indices) before the template's atomic rename. `write_regions` leaves
+    them out and `region_is_written`/`store_is_complete` treat them as written, so
+    resume and completeness need no config. Skipped shards read back as the fill
+    value (NaN).
+  - On the job above: 4515/9100 shards kept (45/700, 2750/4620, 1720/3780), about
+    0.2 s of planning per zone. Existing stores have no attribute, so nothing is
+    skipped for them: rebuild a job's stores to benefit.
+  - Rejected: a sentinel file per skipped shard (more files, and the skip decision
+    would be made per task at run time instead of once per store); recomputing the
+    skip set from the config in `finalize` (a second place the decision could drift).
+  - Dropped: cropping each zone's grid to bbox(polygon ∩ zone band). Once shards are
+    skipped it only shrinks the array extent.
+  - Still open: (1) merge a thin end-zone strip like EPSG:32735 into its neighbour
+    zone (at lon 29.34, zone 36's scale factor is ~1.0016 vs ~1.0010 at a normal zone
+    edge) — agreed, to implement later; it changes the stores' layouts. (2) Remove
+    the pack/zip functionality (`pack_store`, `ZipStore` handling in `gfetch mosaic`
+    and `finalize`), made redundant by sharding — agreed, to do later.

@@ -5,6 +5,7 @@ import numpy as np
 import pystac
 import pytest
 import rasterio
+import shapely
 import xarray as xr
 from odc.geo.crs import CRS
 from odc.geo.geobox import GeoBox
@@ -18,6 +19,7 @@ from gfetch.mosaic import (
     mask_nodata,
     mosaic,
     orbit_state_variables,
+    outside_aoi,
     resolve_chunks,
     resolve_compute_chunks,
     resolve_shards,
@@ -87,6 +89,31 @@ def test_zone_geobox_clips_aoi_to_zone_band() -> None:
     assert clipped.left == pytest.approx(29.0, abs=0.05)
     assert clipped.right == pytest.approx(30.0, abs=0.05)
     assert clipped.right < 31.0  # stayed clipped to the 35S zone, not the full AOI
+
+
+def test_outside_aoi_tests_regions_against_the_aoi_polygon() -> None:
+    # 2x2 regions of ~0.5 degree each; the triangle covers the south-west one only.
+    geobox = GeoBox.from_bbox((29.0, -6.0, 30.0, -5.0), crs="EPSG:4326", resolution=0.01)
+    geobox = geobox.to_crs("EPSG:32735")
+    half_y, half_x = geobox.shape.y // 2, geobox.shape.x // 2
+    aoi = shapely.Polygon([(29.05, -5.95), (29.3, -5.95), (29.05, -5.7)])
+
+    outside = outside_aoi(geobox, aoi)
+
+    top, bottom = slice(0, half_y), slice(half_y, None)
+    left, right = slice(0, half_x), slice(half_x, None)
+    assert not outside({"y": bottom, "x": left})
+    assert outside({"y": bottom, "x": right})
+    assert outside({"y": top, "x": left})
+    assert outside({"y": top, "x": right})
+
+
+def test_outside_aoi_disjoint_from_geobox_skips_everything() -> None:
+    geobox = GeoBox.from_bbox((29.0, -6.0, 30.0, -5.0), crs="EPSG:4326", resolution=0.01)
+
+    outside = outside_aoi(geobox, shapely.box(35.0, -6.0, 36.0, -5.0))
+
+    assert outside({"y": slice(None), "x": slice(None)})
 
 
 def test_resolve_chunks_defaults() -> None:

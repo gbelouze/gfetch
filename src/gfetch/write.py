@@ -16,9 +16,9 @@ import itertools
 import logging
 import shutil
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import xarray as xr
 import zarr
@@ -30,6 +30,7 @@ from gfetch.utils.memory import log_chunk_footprint
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "SKIPPED_SHARDS_ATTR",
     "prepare_template",
     "region_is_written",
     "store_initialized",
@@ -41,6 +42,11 @@ __all__ = [
 ]
 
 _ZarrMode = Literal["a", "a-", "r", "r+", "w", "w-"]
+
+# Root group attribute listing the storage units (shards, or chunks if unsharded) that
+# are never written and read back as fill value, as
+# `{"dimensions": [dim, ...], "indices": [[index along each dim], ...]}`.
+SKIPPED_SHARDS_ATTR = "gfetch:skipped_shards"
 
 
 def _restore_grid_mapping(ds: xr.Dataset) -> xr.Dataset:
@@ -198,6 +204,7 @@ def prepare_template(
     path: Path,
     shards: dict[str, int] | None = None,
     chunks: dict[str, int] | None = None,
+    skip: Callable[[dict[str, slice]], bool] | None = None,
 ) -> None:
     """
     Write only a Zarr store's metadata and coordinates, without any chunk data.
@@ -229,6 +236,11 @@ def prepare_template(
         Store chunk size per dimension name (the inner chunks, when sharded).
         Dimensions not listed keep `ds`'s dask chunking. Defaults to None, which uses
         `ds`'s dask chunks.
+    skip : Callable[[dict[str, slice]], bool] | None
+        Called on each storage unit's region, as listed by `write_regions`; units it
+        returns True for are recorded under `SKIPPED_SHARDS_ATTR`, and are then left
+        out of `write_regions` and ignored by `region_is_written`. All data variables
+        must share one storage grid. Defaults to None (every unit is written).
     """
     ds = _restore_grid_mapping(ds)
     encoding = {}
@@ -264,6 +276,8 @@ def prepare_template(
     tmp_path = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
     try:
         ds.to_zarr(tmp_path, compute=False, mode="w-", encoding=encoding, consolidated=False)
+        if skip is not None:
+            _record_skipped(tmp_path, str(next(iter(ds.data_vars))), skip)
         try:
             tmp_path.rename(path)
         except OSError as e:
@@ -309,12 +323,92 @@ def write_region(ds: xr.Dataset, path: Path, region: dict[str, slice]) -> None:
     log.debug(f"Wrote region {region} to {path}")
 
 
+def _storage_units(za: zarr.Array) -> list[tuple[tuple[int, ...], dict[str, slice]]]:
+    """
+    List an array's storage units, as their index along each dimension and region.
+
+    Parameters
+    ----------
+    za : zarr.Array
+        Zarr v3 array with named dimensions.
+
+    Returns
+    -------
+    list[tuple[tuple[int, ...], dict[str, slice]]]
+        Every unit's index along each dimension and its region, in row-major order,
+        edge units clipped to the array's extent.
+    """
+    assert isinstance(za.metadata, ArrayV3Metadata), "not a Zarr v3 array"
+    assert za.metadata.dimension_names is not None, "array has no dimension names"
+    dims = [dim for dim in za.metadata.dimension_names if dim is not None]
+    assert len(dims) == za.ndim, "array has an unnamed dimension"
+    per_dim_slices = []
+    for sizes in za.write_chunk_sizes:
+        bounds = [0, *itertools.accumulate(sizes)]
+        per_dim_slices.append(list(enumerate(slice(a, b) for a, b in itertools.pairwise(bounds))))
+    return [
+        (tuple(i for i, _ in unit), dict(zip(dims, (sl for _, sl in unit), strict=True)))
+        for unit in itertools.product(*per_dim_slices)
+    ]
+
+
+def _record_skipped(store: Path, variable: str, skip: Callable[[dict[str, slice]], bool]) -> None:
+    """
+    Record the storage units `skip` selects under `SKIPPED_SHARDS_ATTR`.
+
+    Parameters
+    ----------
+    store : Path
+        Zarr store path, with `variable` already created.
+    variable : str
+        Array whose storage grid every data variable shares.
+    skip : Callable[[dict[str, slice]], bool]
+        See `prepare_template`.
+    """
+    group = zarr.open_group(store=store, mode="r+")
+    za = group[variable]
+    assert isinstance(za, zarr.Array), f"{variable} is not an array"
+    assert isinstance(za.metadata, ArrayV3Metadata), f"{variable} is not Zarr v3"
+    units = _storage_units(za)
+    skipped = [list(index) for index, region in units if skip(region)]
+    group.attrs[SKIPPED_SHARDS_ATTR] = {
+        "dimensions": list(za.metadata.dimension_names or ()),
+        "indices": skipped,
+    }
+    log.info(f"Skipping {len(skipped)}/{len(units)} storage unit(s)")
+
+
+def _skipped_units(store: StoreLike) -> tuple[list[str], set[tuple[int, ...]]]:
+    """
+    Read the storage units recorded under `SKIPPED_SHARDS_ATTR`.
+
+    Parameters
+    ----------
+    store : StoreLike
+        Zarr store.
+
+    Returns
+    -------
+    tuple[list[str], set[tuple[int, ...]]]
+        The dimension names, and each skipped unit's index along them. Empty if
+        nothing is skipped.
+    """
+    record = zarr.open_group(store=store, mode="r").attrs.get(SKIPPED_SHARDS_ATTR)
+    if record is None:
+        return [], set()
+    assert isinstance(record, dict), f"malformed {SKIPPED_SHARDS_ATTR}: {record!r}"
+    dims = cast("list[str]", record["dimensions"])
+    indices = cast("list[list[int]]", record["indices"])
+    return list(dims), {tuple(index) for index in indices}
+
+
 def write_regions(store: StoreLike, variable: str) -> list[dict[str, slice]]:
     """
     List a variable's storage units (shards, or chunks if unsharded) as regions.
 
     Each region is one independent unit of work for `write_region`: two writers never
-    touch the same file as long as each writes whole regions from this list.
+    touch the same file as long as each writes whole regions from this list. Units
+    recorded as skipped (see `prepare_template`'s `skip`) are left out.
 
     Parameters
     ----------
@@ -333,14 +427,11 @@ def write_regions(store: StoreLike, variable: str) -> list[dict[str, slice]]:
     za = zarr.open_group(store=store, mode="r")[variable]
     assert isinstance(za, zarr.Array), f"{variable} is not an array"
     assert isinstance(za.metadata, ArrayV3Metadata), f"{variable} is not Zarr v3"
-    assert za.metadata.dimension_names is not None, f"{variable} has no dimension names"
-    dims = [dim for dim in za.metadata.dimension_names if dim is not None]
-    assert len(dims) == za.ndim, f"{variable} has an unnamed dimension"
-    per_dim_slices = []
-    for sizes in za.write_chunk_sizes:
-        bounds = [0, *itertools.accumulate(sizes)]
-        per_dim_slices.append([slice(a, b) for a, b in itertools.pairwise(bounds)])
-    return [dict(zip(dims, slices, strict=True)) for slices in itertools.product(*per_dim_slices)]
+    skipped_dims, skipped = _skipped_units(store)
+    assert not skipped or skipped_dims == list(za.metadata.dimension_names or ()), (
+        f"{variable}'s dimensions differ from {SKIPPED_SHARDS_ATTR}'s {skipped_dims}"
+    )
+    return [region for index, region in _storage_units(za) if index not in skipped]
 
 
 def region_is_written(path: Path, region: dict[str, slice], variables: Sequence[str]) -> bool:
@@ -350,7 +441,8 @@ def region_is_written(path: Path, region: dict[str, slice], variables: Sequence[
     A storage unit is a shard, or a chunk in an unsharded store. Reads their
     boundaries and dimension order from the store's own array metadata rather than
     taking them as a parameter, so this can't drift from whatever `prepare_template`
-    actually wrote. A unit's file existing means it was fully written: zarr-python's
+    actually wrote. Units recorded as skipped (see `prepare_template`'s `skip`) count
+    as written. A unit's file existing means it was fully written: zarr-python's
     `LocalStore` writes every file atomically (temp file + rename), and `write_region`
     always writes whole units, so there's no separate partial-write state to guard
     against here.
@@ -373,6 +465,8 @@ def region_is_written(path: Path, region: dict[str, slice], variables: Sequence[
         `variables`.
     """
 
+    skipped_dims, skipped = _skipped_units(path)
+
     async def _all_written() -> bool:
         checks = []
         for var in variables:
@@ -390,7 +484,10 @@ def region_is_written(path: Path, region: dict[str, slice], variables: Sequence[
                 start = sl.start if sl.start is not None else 0
                 stop = sl.stop if sl.stop is not None else size
                 axis_chunk_ranges.append(range(start // chunk_size, -(-stop // chunk_size)))
+            positions = [dims.index(dim) for dim in skipped_dims if dim in dims]
             for coords in itertools.product(*axis_chunk_ranges):
+                if tuple(coords[i] for i in positions) in skipped:
+                    continue
                 checks.append(za.store.exists(za.metadata.encode_chunk_key(coords)))
         return all(await asyncio.gather(*checks))
 

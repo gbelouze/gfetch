@@ -63,16 +63,10 @@ def gedi(config_path: Path, product: str) -> None:
     time_range = _to_time_range(start, end)
     tile_dir = cfg.output.with_name(f"{cfg.output.name}.tiles")
 
-    polygon = None
-    if cfg.countries is not None:
-        from gfetch.countries import resolve_country_polygon
-
-        polygon = resolve_country_polygon(cfg.countries)
-
     common = {
         "time_range": time_range,
         "anc_fields": cfg.anc_fields,
-        "polygon": polygon,
+        "polygon": cfg.aoi_geometry,
         "quality_filter": cfg.quality_filter,
         "tile_dir": tile_dir,
     }

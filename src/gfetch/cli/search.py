@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 
 import pystac
+import shapely
 
 from gfetch.cli.config import ORBIT_STATE_AS_BANDS, Config, load
 from gfetch.mosaic import ORBIT_STATES
@@ -60,14 +61,6 @@ def search(config_path: Path, satellite_key: str) -> None:
     query = _build_query(cfg)
     log.debug(f"query={query}")
 
-    intersects = None
-    if cfg.countries is not None:
-        import shapely
-
-        from gfetch.countries import resolve_country_polygon
-
-        intersects = shapely.geometry.mapping(resolve_country_polygon(cfg.countries))
-
     items = search_items(
         source,
         cfg.satellite,
@@ -75,7 +68,7 @@ def search(config_path: Path, satellite_key: str) -> None:
         cfg.time_range.datetime,
         query=query,
         collection=cfg.collection,
-        intersects=intersects,
+        intersects=shapely.geometry.mapping(cfg.aoi_geometry),
     )
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)

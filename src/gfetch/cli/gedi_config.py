@@ -1,10 +1,18 @@
 import logging
 from dataclasses import dataclass, fields
+from functools import cached_property
 from pathlib import Path
 
 from omegaconf import DictConfig, OmegaConf
+from shapely.geometry.base import BaseGeometry
 
-from gfetch.cli.config import RESERVED_SECTION_KEYS, AOIConfig, TimeRangeConfig, resolve_aoi
+from gfetch.cli.config import (
+    RESERVED_SECTION_KEYS,
+    AOIConfig,
+    TimeRangeConfig,
+    resolve_aoi,
+    resolve_aoi_geometry,
+)
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +83,17 @@ class GediConfig:
         """
         assert self.aoi is not None, "aoi not yet resolved - build this GediConfig via load()"
         return self.aoi
+
+    @cached_property
+    def aoi_geometry(self) -> BaseGeometry:
+        """
+        Returns
+        -------
+        BaseGeometry
+            The exact AOI shape in EPSG:4326, see
+            `gfetch.cli.config.resolve_aoi_geometry`.
+        """
+        return resolve_aoi_geometry(self.resolved_aoi, self.countries)
 
 
 @dataclass

@@ -6,20 +6,26 @@ from typing import cast
 import dask
 import numpy as np
 import pystac
+import pytest
+import shapely
 import xarray as xr
 import yaml
 import zarr
 from odc.geo.geobox import GeoBox
 
+from gfetch import countries as countries_module
 from gfetch.cli.config import Config, load
 from gfetch.cli.mosaic import mosaic as mosaic_cmd
 from gfetch.finalize import pack_store
 from gfetch.mosaic import group_by_utm_zone
-from gfetch.write import region_is_written, store_is_complete
+from gfetch.write import SKIPPED_SHARDS_ATTR, region_is_written, store_is_complete
 
-# Fixed regardless of the real AOI/CRS, so every test gets an exact, hand-picked
-# pixel grid instead of depending on real UTM reprojection arithmetic.
-_FIXED_GEOBOX = GeoBox.from_bbox((0, 0, 16, 16), crs="EPSG:3857", resolution=1.0)
+# Fixed regardless of the real CRS, so every test gets an exact, hand-picked pixel grid
+# instead of depending on real UTM reprojection arithmetic. It lies inside
+# `_write_config`'s AOI, so no shard is skipped as outside it.
+_FIXED_GEOBOX = GeoBox.from_bbox(
+    (245440, 6224940, 245456, 6224956), crs="EPSG:3857", resolution=1.0
+)
 
 
 def _write_config(path: Path, **overrides: object) -> Path:
@@ -237,3 +243,30 @@ def test_mosaic_computes_in_bricks_of_several_store_chunks(tmp_path: Path, monke
     assert za.chunks == (4, 4)
     assert za.shards == (8, 8)
     assert store_is_complete(cfg.zarr_path(crs), ["red"])
+
+
+def test_mosaic_skips_shards_outside_the_country_polygon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Within the fixed geobox's bottom-left 8x8 shard, clear of the others.
+    polygon = shapely.box(2.20483, 48.70492, 2.20486, 48.70494)
+    monkeypatch.setattr(countries_module, "resolve_country_polygon", lambda names: polygon)
+    cfg_path = _write_config(tmp_path / "config.yaml", aoi=None, countries=["Somewhere"])
+    cfg = load(cfg_path, "s2")
+    _write_fake_items(cfg)
+
+    calls: list[GeoBox] = []
+    monkeypatch.setattr("gfetch.cli.mosaic.zone_geobox", _fake_zone_geobox)
+    monkeypatch.setattr("gfetch.cli.mosaic.build_mosaic", _fake_build_mosaic(calls))
+    mosaic_cmd(cfg_path, "s2")
+
+    assert len(calls) == 1 + 1  # template + the one shard in the AOI
+    assert calls[1] == _FIXED_GEOBOX[8:16, 0:8]
+    items = list(pystac.ItemCollection.from_file(cfg.cached_items_path))
+    (crs,) = group_by_utm_zone(items, cfg.resolved_aoi.bbox)
+    path = cfg.zarr_path(crs)
+    assert zarr.open_group(store=path, mode="r").attrs[SKIPPED_SHARDS_ATTR] == {
+        "dimensions": ["y", "x"],
+        "indices": [[0, 0], [0, 1], [1, 1]],
+    }
+    assert store_is_complete(path, ["red"])
