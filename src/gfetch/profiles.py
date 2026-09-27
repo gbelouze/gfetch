@@ -26,12 +26,15 @@ class SatelliteProfile:
     cloud_mask_out : frozenset[int]
         Classification values to mask out as invalid/cloudy. Unused if
         `cloud_mask_band` is None.
+    default_source : str
+        `gfetch.sources.SOURCES` key searched when no source is configured.
     """
 
     name: str
     default_bands: tuple[str, ...]
     cloud_mask_band: str | None
     cloud_mask_out: frozenset[int]
+    default_source: str
 
 
 # Sentinel-2 L2A Scene Classification (SCL) values: 0 no-data, 1 saturated/defective,
@@ -45,6 +48,7 @@ PROFILES: dict[str, SatelliteProfile] = {
         default_bands=("red", "green", "blue"),
         cloud_mask_band="scl",
         cloud_mask_out=_SENTINEL2_SCL_MASK_OUT,
+        default_source="earthsearch",
     ),
     # SAR isn't affected by clouds, so there's no cloud-mask-equivalent band.
     "sentinel-1": SatelliteProfile(
@@ -52,6 +56,8 @@ PROFILES: dict[str, SatelliteProfile] = {
         default_bands=("vv", "vh"),
         cloud_mask_band=None,
         cloud_mask_out=frozenset(),
+        # The only source with terrain-corrected Sentinel-1, see `gfetch.sources`.
+        default_source="planetary-computer",
     ),
 }
 

@@ -26,6 +26,7 @@ __all__ = [
     "resolve_bands",
     "resolve_cloud_mask",
     "resolve_output_variables",
+    "resolve_source",
 ]
 
 ORBIT_STATE_AS_BANDS = "as_bands"
@@ -186,9 +187,9 @@ class Config:
         `countries` must be given.
     satellite : str
         Satellite/profile name (e.g. 'sentinel-2'). Defaults to 'sentinel-2'.
-    source : str
+    source : str | None
         STAC source name (e.g. 'earthsearch', 'planetary-computer'). Defaults to
-        'earthsearch'.
+        None, see `resolve_source`.
     bands : list[str] | None
         Asset keys to download/load. Defaults to None, which uses the satellite
         profile's default bands.
@@ -269,7 +270,7 @@ class Config:
     aoi: AOIConfig | None = None
     countries: list[str] | None = None
     satellite: str = "sentinel-2"
-    source: str = "earthsearch"
+    source: str | None = None
     bands: list[str] | None = None
     max_cloud_cover: float | None = None
     orbit_state: str | None = None
@@ -495,6 +496,29 @@ def resolve_output_variables(cfg: Config) -> list[str]:
 
         return orbit_state_variables(bands)
     return bands
+
+
+def resolve_source(cfg: Config) -> str:
+    """
+    Resolve the STAC source to search for a config.
+
+    Parameters
+    ----------
+    cfg : Config
+        Job configuration.
+
+    Returns
+    -------
+    str
+        `cfg.source` if set, else `cfg.satellite`'s `gfetch.profiles.
+        SatelliteProfile.default_source` if it has a profile, else 'earthsearch'.
+    """
+    if cfg.source is not None:
+        return cfg.source
+    try:
+        return get_profile(cfg.satellite).default_source
+    except ValueError:
+        return "earthsearch"
 
 
 def resolve_cloud_mask(cfg: Config) -> tuple[str | None, frozenset[int]]:

@@ -36,9 +36,12 @@ _SENTINEL2_COLLECTIONS = {
     "planetary-computer": "sentinel-2-l2a",
 }
 
+# Earth Search only has GRD, which isn't terrain-corrected: its geolocation is off by
+# up to several hundred meters over relief. Planetary Computer's RTC is, and it reads
+# anonymously once signed despite its collection's `msft:requires_account: true`.
 _SENTINEL1_COLLECTIONS = {
     "earthsearch": "sentinel-1-grd",
-    "planetary-computer": "sentinel-1-grd",
+    "planetary-computer": "sentinel-1-rtc",
 }
 
 

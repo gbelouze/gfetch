@@ -1441,3 +1441,19 @@ that state was reached, and should be read chronologically, not as reference mat
     minutes still fails, and is recomputed on the next run; not worth read-time
     signing for the download-less path.
   - Verified live: a small `sentinel-1-rtc` job mosaics from remote hrefs.
+
+- **2026-09-27** — **`s1` defaults to Planetary Computer's `sentinel-1-rtc`.**
+  - GRD isn't terrain-corrected, and odc-stac warps it through GDAL's default
+    GCP polynomial, which doesn't even pass through the GCPs: on one Tanzanian
+    scene (GCP heights 539–2027 m) it misses them by 94 m median, 293 m p90, 943 m
+    max, correlated with GCP height (r = −0.65). The user measured ~250 m against
+    S2 in Tanzania, less in flatter Gabon. RTC is already orthorectified, in UTM.
+  - RTC's `msft:requires_account: true` turned out not to block anonymous reads:
+    a signed href opens without an account (verified 2026-09-27), which lifts the
+    credentials blocker behind the original GRD-only decision.
+  - `SatelliteProfile.default_source` (`planetary-computer` for S1, `earthsearch`
+    for S2) is used when a config sets no `source`, via `resolve_source`, following
+    the `resolve_bands`/`resolve_cloud_mask` pattern. A top-level `source:` still
+    applies to every satellite, so a config with `source: earthsearch` at the top
+    still gets GRD for `s1`. PC's `sentinel-1` now maps to RTC, so PC GRD is only
+    reachable through a `custom:` section.

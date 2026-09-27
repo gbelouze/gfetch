@@ -12,6 +12,7 @@ from gfetch.cli.config import (
     resolve_cloud_mask,
     resolve_compute_workers,
     resolve_output_variables,
+    resolve_source,
 )
 
 
@@ -33,7 +34,8 @@ def test_load_minimal_config(tmp_path: Path) -> None:
     assert cfg.resolved_aoi.bbox == (2.2, 48.7, 2.5, 49.0)
     assert cfg.time_range.datetime == "2024-01-01/2024-06-01"
     assert cfg.satellite == "sentinel-2"
-    assert cfg.source == "earthsearch"
+    assert cfg.source is None
+    assert resolve_source(cfg) == "earthsearch"
     assert cfg.bands is None
     assert cfg.resampling == {}
     assert cfg.orbit_state is None
@@ -299,3 +301,21 @@ def test_resolve_output_variables_as_bands_splits_by_orbit_state(tmp_path: Path)
         "vh_ascending",
         "vh_descending",
     ]
+
+
+@pytest.mark.parametrize(
+    ("satellite_key", "overrides", "expected"),
+    [
+        ("s1", {}, "planetary-computer"),
+        ("s2", {}, "earthsearch"),
+        ("s1", {"source": "earthsearch"}, "earthsearch"),
+        ("s1", {"s1": {"source": "earthsearch"}}, "earthsearch"),
+        ("x", {"custom": {"x": {"collection": "c", "bands": ["b"]}}}, "earthsearch"),
+    ],
+)
+def test_resolve_source_falls_back_to_profile_default(
+    tmp_path: Path, satellite_key: str, overrides: dict, expected: str
+) -> None:
+    cfg = load(_write_config(tmp_path / "config.yaml", **overrides), satellite_key)
+
+    assert resolve_source(cfg) == expected

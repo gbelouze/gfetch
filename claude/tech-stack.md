@@ -333,7 +333,8 @@ UTM zones; confirmed on a real item). PC additionally has `sentinel-1-rtc`
 (radiometrically terrain-corrected, analysis-ready, float32) but it's gated behind
 `msft:requires_account: true` — the only gfetch-relevant collection anywhere that needs
 real credentials, unlike every other anonymous-SAS-signed/public-S3 source gfetch uses.
-**Decision: ship GRD only for now** (both sources registered, `median` composite kept
+**Superseded 2026-09-27**: `s1` now defaults to PC's `sentinel-1-rtc`, which reads
+anonymously once signed (see `claude/tasks.md`). **Decision: ship GRD only for now** (both sources registered, `median` composite kept
 as the default — not `mean`, since averaging raw uncalibrated, non-terrain-corrected
 amplitude across different orbit geometries isn't physically rigorous the way it would
 be for RTC backscatter). RTC support is a deliberately separate, larger follow-up that

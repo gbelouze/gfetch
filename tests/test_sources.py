@@ -22,8 +22,8 @@ def test_registered_sources_resolve_sentinel2_collection() -> None:
 
 
 def test_registered_sources_resolve_sentinel1_collection() -> None:
-    for source in SOURCES.values():
-        assert source.collection("sentinel-1") == "sentinel-1-grd"
+    assert SOURCES["earthsearch"].collection("sentinel-1") == "sentinel-1-grd"
+    assert SOURCES["planetary-computer"].collection("sentinel-1") == "sentinel-1-rtc"
 
 
 def test_collection_unknown_satellite() -> None:

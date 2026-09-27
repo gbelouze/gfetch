@@ -47,6 +47,7 @@ Each release can have sections: "Added", "Changed", "Deprecated", "Removed", "Fi
 
 ### Changed
 
+- `gfetch s1` defaults to Planetary Computer's terrain-corrected `sentinel-1-rtc` (float32 backscatter) instead of Earth Search's `sentinel-1-grd` (uint16 amplitude), whose geolocation is off by up to several hundred meters over relief. `source: planetary-computer` now always resolves Sentinel-1 to RTC; `source: earthsearch` still gives GRD. `source` now defaults per satellite (`gfetch.profiles.SatelliteProfile.default_source`, via `gfetch.cli.config.resolve_source`) when a config sets none; a top-level `source:` still applies to every satellite.
 - `patch_chunks` is removed in favour of `shard_factor`: a config still setting it fails to load. `shard_factor: 1` keeps an unsharded store, compatible with stores written before.
 - Default `chunks` is 256 px (was 2048), so the default 8192 px shard holds 32x32 chunks.
 - Sentinel-2 cloud masking also masks SCL class 7 (unclassified, in practice largely low-probability cloud).

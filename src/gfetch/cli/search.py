@@ -4,7 +4,7 @@ from pathlib import Path
 import pystac
 import shapely
 
-from gfetch.cli.config import ORBIT_STATE_AS_BANDS, Config, load
+from gfetch.cli.config import ORBIT_STATE_AS_BANDS, Config, load, resolve_source
 from gfetch.mosaic import ORBIT_STATES
 from gfetch.search import search as search_items
 from gfetch.sources import get_source
@@ -57,7 +57,7 @@ def search(config_path: Path, satellite_key: str) -> None:
         its `custom:` section. See `gfetch.cli.config.load`.
     """
     cfg = load(config_path, satellite_key)
-    source = get_source(cfg.source)
+    source = get_source(resolve_source(cfg))
     query = _build_query(cfg)
     log.debug(f"query={query}")
 
