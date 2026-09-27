@@ -12,6 +12,7 @@ import xarray as xr
 import yaml
 import zarr
 from odc.geo.geobox import GeoBox
+from odc.geo.xr import xr_coords
 
 from gfetch import countries as countries_module
 from gfetch.cli.config import Config, load
@@ -82,7 +83,7 @@ def _fake_build_mosaic(calls: list[GeoBox]) -> Callable[..., xr.Dataset]:
         # `prepare_template`'s `compute=False` has nothing to defer and writes real
         # (all-zero) chunk data immediately, making every patch look already-written.
         chunks = cast("dict[str, int] | None", kwargs.get("chunks")) or {"y": 4, "x": 4}
-        ds = xr.Dataset(data).chunk({"y": chunks["y"], "x": chunks["x"]})
+        ds = xr.Dataset(data, coords=xr_coords(geobox)).chunk({"y": chunks["y"], "x": chunks["x"]})
         if on_load is not None:
             on_load(ds)
         return ds

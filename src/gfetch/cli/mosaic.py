@@ -35,6 +35,7 @@ from gfetch.write import (
     region_is_written,
     store_initialized,
     validate_chunks,
+    validate_geobox,
     write_region,
     write_regions,
 )
@@ -157,9 +158,10 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
                     skip=outside_aoi(geobox, cfg.aoi_geometry),
                 )
 
-            # Fails fast, before any shard is built, if this store's on-disk chunk or
-            # shard grid doesn't match what this run's config expects
+            # Fails fast, before any shard is built, if this store's on-disk chunk,
+            # shard or pixel grid doesn't match what this run's config expects
             validate_chunks(path, variables, {"y": chunks["y"], "x": chunks["x"]}, shards)
+            validate_geobox(path, geobox)
             regions = write_regions(path, variables[0])
 
         for region in regions:

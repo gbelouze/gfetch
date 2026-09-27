@@ -43,6 +43,11 @@ _DEFAULT_COMPUTE_CHUNK_FACTOR = 16
 
 ORBIT_STATES: tuple[str, ...] = ("ascending", "descending")
 
+# An AOI strip narrower than this in an end UTM zone goes to its neighbour zone
+# instead of getting its own store. At the equator, 1 degree past a zone's edge is
+# 4 degrees from its central meridian: scale error ~0.20%, vs ~0.10% at the edge.
+_MIN_ZONE_WIDTH_DEG = 1.0
+
 # An item's EPSG:4326 `geometry` only approximates its footprint (straight edges in
 # lon/lat are curved in the native CRS, and providers may simplify it), so an item
 # grazing a geobox's edge could otherwise test as disjoint from it. The same holds for
@@ -558,9 +563,9 @@ def _composite_by_orbit_state(
     return merged[orbit_state_variables([str(v) for v in template.data_vars])]
 
 
-def _utm_zone_lon_band(crs: CRS) -> tuple[float, float]:
+def _utm_zone_number(crs: CRS) -> int:
     """
-    Longitude band (EPSG:4326) covered by a UTM zone.
+    UTM zone number of a UTM CRS, regardless of its hemisphere.
 
     Parameters
     ----------
@@ -569,12 +574,28 @@ def _utm_zone_lon_band(crs: CRS) -> tuple[float, float]:
 
     Returns
     -------
-    tuple[float, float]
-        `(west, east)` longitude bounds of the zone's natural 6-degree-wide band.
+    int
+        Zone number, from 1 to 60.
     """
     utm_zone = crs.proj.utm_zone
     assert utm_zone is not None, f"{crs} is not a UTM CRS"
-    zone_number = int(utm_zone[:-1])
+    return int(utm_zone[:-1])
+
+
+def _utm_zone_lon_band(zone_number: int) -> tuple[float, float]:
+    """
+    Longitude band (EPSG:4326) covered by a UTM zone.
+
+    Parameters
+    ----------
+    zone_number : int
+        UTM zone number, from 1 to 60.
+
+    Returns
+    -------
+    tuple[float, float]
+        `(west, east)` longitude bounds of the zone's natural 6-degree-wide band.
+    """
     west = -180.0 + 6.0 * (zone_number - 1)
     return west, west + 6.0
 
@@ -602,25 +623,52 @@ def _utm_zones_for_aoi(aoi: BoundingBox) -> list[CRS]:
     ]
 
 
-def _zone_aoi_extent(crs: CRS, aoi: BoundingBox) -> BoundingBox:
+def _zone_extents(aoi: BoundingBox) -> dict[CRS, BoundingBox]:
     """
-    AOI clipped to a UTM zone's natural longitude band, still in EPSG:4326.
+    Split an AOI between the UTM zones it spans, each zone getting one output grid.
+
+    Each zone gets the AOI clipped to its natural longitude band, except that an end
+    zone's strip narrower than `_MIN_ZONE_WIDTH_DEG` goes to its neighbour zone, whose
+    extent then reaches past its own band. The narrower end is merged first, until
+    both ends are wide enough or a single zone is left. Zones are merged by number,
+    so both hemispheres of an AOI crossing the equator are merged alike.
 
     Parameters
     ----------
-    crs : CRS
-        UTM zone to clip the AOI to.
     aoi : BoundingBox
         AOI bounding box in EPSG:4326.
 
     Returns
     -------
-    BoundingBox
-        `aoi` intersected with `crs`'s 6-degree-wide longitude band, in EPSG:4326.
+    dict[CRS, BoundingBox]
+        Each remaining zone's share of `aoi`, in EPSG:4326.
     """
-    west, east = _utm_zone_lon_band(crs)
-    zone_band = BoundingBox(west, aoi.bottom, east, aoi.top, crs="EPSG:4326")
-    return bbox_intersection([aoi, zone_band])
+    zones = _utm_zones_for_aoi(aoi)
+    columns: list[list[float]] = []
+    numbers: list[int] = []
+    for number in sorted({_utm_zone_number(crs) for crs in zones}):
+        west, east = _utm_zone_lon_band(number)
+        columns.append([max(west, aoi.left), min(east, aoi.right)])
+        numbers.append(number)
+    while len(columns) > 1:
+        widths = [columns[0][1] - columns[0][0], columns[-1][1] - columns[-1][0]]
+        end = 0 if widths[0] <= widths[1] else -1
+        if widths[end] >= _MIN_ZONE_WIDTH_DEG:
+            break
+        west, east = columns.pop(end)
+        number = numbers.pop(end)
+        # The popped zone's neighbour is now the end on the same side.
+        columns[end] = [min(columns[end][0], west), max(columns[end][1], east)]
+        log.debug(
+            f"Merging the AOI's {east - west:.2f}-degree strip in UTM zone {number} into "
+            f"zone {numbers[end]}"
+        )
+    extents = dict(zip(numbers, columns, strict=True))
+    return {
+        crs: BoundingBox(extents[n][0], aoi.bottom, extents[n][1], aoi.top, crs="EPSG:4326")
+        for crs in zones
+        if (n := _utm_zone_number(crs)) in extents
+    }
 
 
 def _bbox_overlaps(a: BoundingBox, b: BoundingBox) -> bool:
@@ -649,6 +697,9 @@ def group_by_utm_zone(
     """
     Assign items to every UTM zone (among those the AOI spans) their footprint overlaps.
 
+    A zone's extent is its share of the AOI, see `_zone_extents`: a thin strip of the
+    AOI in an end zone is assigned to its neighbour zone instead.
+
     An item is not assumed to fit within a single zone; that holds for Sentinel-2's
     MGRS-tiled items, but not in general (e.g. Sentinel-1 GRD items are delivered in
     EPSG:4326 and routinely span several zones). Grouping by AOI-relevant zone overlap
@@ -669,13 +720,11 @@ def group_by_utm_zone(
     -------
     dict[CRS, list[pystac.Item]]
         Items grouped by overlapping UTM zone. An item spanning more than one zone
-        appears in more than one list; a zone the AOI spans but no item overlaps is
-        omitted.
+        appears in more than one list; a zone the AOI spans but no item overlaps, or
+        whose strip was merged into its neighbour, is omitted.
     """
-    aoi = BoundingBox(*aoi_bbox, crs="EPSG:4326")
     groups: dict[CRS, list[pystac.Item]] = {}
-    for crs in _utm_zones_for_aoi(aoi):
-        zone_extent = _zone_aoi_extent(crs, aoi)
+    for crs, zone_extent in _zone_extents(BoundingBox(*aoi_bbox, crs="EPSG:4326")).items():
         zone_items = [
             item
             for item in items
@@ -689,13 +738,14 @@ def group_by_utm_zone(
 
 def zone_geobox(crs: CRS, aoi_bbox: tuple[float, float, float, float], resolution: float) -> GeoBox:
     """
-    Build the output pixel grid for one UTM zone: the AOI clipped to that zone's own
-    natural longitude band.
+    Build the output pixel grid for one UTM zone: its share of the AOI, see
+    `_zone_extents`.
 
     Parameters
     ----------
     crs : CRS
-        Target UTM CRS for this zone.
+        Target UTM CRS for this zone, one of `group_by_utm_zone`'s keys for the same
+        `aoi_bbox`.
     aoi_bbox : tuple[float, float, float, float]
         Full AOI bounding box (min_lon, min_lat, max_lon, max_lat) in EPSG:4326;
         may span more than one UTM zone.
@@ -705,14 +755,14 @@ def zone_geobox(crs: CRS, aoi_bbox: tuple[float, float, float, float], resolutio
     Returns
     -------
     GeoBox
-        Pixel grid covering the portion of `aoi_bbox` that falls within `crs`'s zone.
+        Pixel grid covering `crs`'s share of `aoi_bbox`.
     """
     aoi = BoundingBox(*aoi_bbox, crs="EPSG:4326")
     # GeoBox.from_bbox() only reprojects when crs is literally the string "utm";
     # a resolved CRS object is instead taken as the CRS the bbox values are already
     # in, so the intersection (computed in EPSG:4326) must be reprojected explicitly
     # first.
-    extent = _zone_aoi_extent(crs, aoi).to_crs(crs)
+    extent = _zone_extents(aoi)[crs].to_crs(crs)
     return GeoBox.from_bbox(extent, resolution=resolution)
 
 

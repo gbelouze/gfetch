@@ -20,8 +20,11 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Literal, cast
 
+import numpy as np
 import xarray as xr
 import zarr
+from odc.geo.geobox import GeoBox
+from odc.geo.xr import xr_coords
 from zarr.core.metadata import ArrayV3Metadata
 from zarr.storage import StoreLike
 
@@ -36,6 +39,7 @@ __all__ = [
     "store_initialized",
     "store_is_complete",
     "validate_chunks",
+    "validate_geobox",
     "write",
     "write_region",
     "write_regions",
@@ -197,6 +201,47 @@ def validate_chunks(
                         f"configuration - delete {path} and let it be recreated, or fix "
                         "the configuration to match the existing store."
                     )
+
+
+def validate_geobox(path: Path, geobox: GeoBox) -> None:
+    """
+    Check that an already-initialized store's pixel grid matches `geobox`.
+
+    A store's grid is fixed once `prepare_template` writes it, while `geobox` is
+    derived from the configuration (AOI, resolution, UTM zone split). Writing a
+    region against a store built on another grid would put its pixels in the wrong
+    place without any error.
+
+    Parameters
+    ----------
+    path : Path
+        Zarr store path, already initialized via `prepare_template`.
+    geobox : GeoBox
+        Pixel grid this run expects the store to have.
+
+    Raises
+    ------
+    ValueError
+        If the store's `x`/`y` coordinates differ from `geobox`'s in size or bounds.
+    """
+    ds = xr.open_zarr(path, consolidated=False)
+    expected = xr_coords(geobox)
+    # Absolute: a relative tolerance at UTM northings (~1e7 m) would span pixels.
+    atol = 1e-3 * min(abs(geobox.resolution.x), abs(geobox.resolution.y))
+    for dim in ("y", "x"):
+        actual, wanted = ds[dim].values, expected[dim].values
+        if actual.shape != wanted.shape or not np.allclose(
+            actual[[0, -1]], wanted[[0, -1]], rtol=0, atol=atol
+        ):
+            msg = (
+                f"{path}: on-disk {dim!r} grid ({actual.size} px, {actual[0]} to "
+                f"{actual[-1]}) differs from this run's ({wanted.size} px, {wanted[0]} to "
+                f"{wanted[-1]}). The store was likely created by an earlier run under a "
+                f"different configuration or gfetch version - delete {path} and let it be "
+                "recreated."
+            )
+            log.error(msg)
+            raise ValueError(msg)
 
 
 def prepare_template(

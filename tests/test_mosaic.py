@@ -43,7 +43,7 @@ def _item(item_id: str, bbox: tuple[float, float, float, float]) -> pystac.Item:
 def test_group_by_utm_zone_splits_items_by_overlapping_zone() -> None:
     west = _item("west", (29.5, -6.0, 29.6, -5.9))  # zone 35S
     east = _item("east", (39.0, -6.0, 39.1, -5.9))  # zone 37S
-    aoi_bbox = (29.0, -6.5, 40.0, -5.5)  # spans zones 35S/36S/37S
+    aoi_bbox = (28.0, -6.5, 40.0, -5.5)  # spans zones 35S/36S/37S
 
     groups = group_by_utm_zone([west, east], aoi_bbox)
 
@@ -79,16 +79,60 @@ def test_group_by_utm_zone_item_spanning_zones_appears_in_both() -> None:
 
 def test_zone_geobox_clips_aoi_to_zone_band() -> None:
     # AOI spans two zones (boundary at 30 degrees E); zone 35S covers 24-30E.
-    aoi_bbox = (29.0, -6.0, 31.0, -5.0)
+    aoi_bbox = (28.0, -6.0, 32.0, -5.0)
 
     geobox = zone_geobox(CRS("EPSG:32735"), aoi_bbox, resolution=1000.0)
     clipped = geobox.boundingbox.to_crs("EPSG:4326")
 
     # A few km of slack: coarse (1km) pixel snapping plus reprojection distortion at
     # the box's edges, not an exact round-trip.
-    assert clipped.left == pytest.approx(29.0, abs=0.05)
+    assert clipped.left == pytest.approx(28.0, abs=0.05)
     assert clipped.right == pytest.approx(30.0, abs=0.05)
-    assert clipped.right < 31.0  # stayed clipped to the 35S zone, not the full AOI
+    assert clipped.right < 32.0  # stayed clipped to the 35S zone, not the full AOI
+
+
+def test_thin_end_zone_strip_goes_to_its_neighbour_zone() -> None:
+    west = _item("west", (29.5, -6.0, 29.6, -5.9))  # zone 35S, 0.66 degree strip
+    east = _item("east", (39.0, -6.0, 39.1, -5.9))  # zone 37S
+    aoi_bbox = (29.34, -9.0, 40.85, -1.0)  # spans zones 35S/36S/37S
+
+    groups = group_by_utm_zone([west, east], aoi_bbox)
+
+    assert set(groups) == {CRS("EPSG:32736"), CRS("EPSG:32737")}
+    assert [it.id for it in groups[CRS("EPSG:32736")]] == ["west"]
+    geobox = zone_geobox(CRS("EPSG:32736"), aoi_bbox, resolution=1000.0)
+    extended = geobox.boundingbox.to_crs("EPSG:4326")
+    assert extended.left == pytest.approx(29.34, abs=0.05)
+    assert extended.right == pytest.approx(36.0, abs=0.05)
+
+
+def test_two_thin_zones_merge_into_the_wider_one() -> None:
+    aoi_bbox = (29.6, -6.0, 30.3, -5.0)  # 0.4 degree in 35S, 0.3 degree in 36S
+    item = _item("a", aoi_bbox)
+
+    groups = group_by_utm_zone([item], aoi_bbox)
+
+    assert set(groups) == {CRS("EPSG:32735")}
+    geobox = zone_geobox(CRS("EPSG:32735"), aoi_bbox, resolution=100.0)
+    merged = geobox.boundingbox.to_crs("EPSG:4326")
+    assert merged.left == pytest.approx(29.6, abs=0.01)
+    assert merged.right == pytest.approx(30.3, abs=0.01)
+
+
+def test_thin_zone_strip_merges_in_both_hemispheres() -> None:
+    aoi_bbox = (29.5, -1.0, 33.0, 1.0)  # crosses the equator and the 35/36 boundary
+    item = _item("a", aoi_bbox)
+
+    groups = group_by_utm_zone([item], aoi_bbox)
+
+    assert set(groups) == {CRS("EPSG:32636"), CRS("EPSG:32736")}
+
+
+def test_single_thin_zone_is_kept() -> None:
+    aoi_bbox = (29.5, -6.0, 29.7, -5.0)
+    item = _item("a", aoi_bbox)
+
+    assert set(group_by_utm_zone([item], aoi_bbox)) == {CRS("EPSG:32735")}
 
 
 def test_outside_aoi_tests_regions_against_the_aoi_polygon() -> None:

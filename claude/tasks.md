@@ -1386,3 +1386,21 @@ that state was reached, and should be read chronologically, not as reference mat
     edge) — agreed, to implement later; it changes the stores' layouts. (2) Remove
     the pack/zip functionality (`pack_store`, `ZipStore` handling in `gfetch mosaic`
     and `finalize`), made redundant by sharding — agreed, to do later.
+
+- **2026-09-27** — **Thin end-zone strips merge into their neighbour UTM zone.**
+  - `_zone_extents` splits the AOI bbox between the zones it spans; an end zone
+    whose strip is narrower than `_MIN_ZONE_WIDTH_DEG` (1°) goes to its neighbour,
+    whose grid then reaches past its own band. The narrower end merges first, until
+    both ends are ≥ 1° or one zone is left; a lone narrow zone is kept. Zones merge
+    by number, so both hemispheres of an equator-crossing AOI follow. Decided on the
+    bbox, not on items, so every stage (`group_by_utm_zone`, `zone_geobox`,
+    `finalize`'s store listing) agrees without reading the items.
+  - Distortion: at the equator, 1° past a zone's edge is 4° from its central
+    meridian, scale error ~0.20% vs ~0.10% at a normal edge. On the Mozambique +
+    Tanzania job, EPSG:32735's 0.66° strip (lon 29.34–30) goes to EPSG:32736.
+  - A store's grid is fixed once written, so a changed zone split (or AOI,
+    resolution) made a resumed run write shards against a stale grid without
+    error: `validate_chunks` only compares chunk/shard sizes. `gfetch mosaic` now
+    also runs `validate_geobox`, which fails fast if the store's `x`/`y` coordinates
+    differ from the zone geobox. On the job above it rejects the old EPSG:32736
+    store and accepts EPSG:32737's.

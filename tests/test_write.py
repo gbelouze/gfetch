@@ -5,6 +5,8 @@ import numpy as np
 import pytest
 import xarray as xr
 import zarr
+from odc.geo.geobox import GeoBox
+from odc.geo.xr import xr_coords
 
 from gfetch.write import (
     SKIPPED_SHARDS_ATTR,
@@ -13,6 +15,7 @@ from gfetch.write import (
     store_initialized,
     store_is_complete,
     validate_chunks,
+    validate_geobox,
     write,
     write_region,
     write_regions,
@@ -351,6 +354,28 @@ def test_template_without_skip_records_nothing(tmp_path: Path, dataset: xr.Datas
 
     assert SKIPPED_SHARDS_ATTR not in zarr.open_group(store=path, mode="r").attrs
     assert len(write_regions(path, "red")) == 2
+
+
+def test_validate_geobox_passes_on_the_store_grid_and_raises_otherwise(tmp_path: Path) -> None:
+    geobox = GeoBox.from_bbox((500_000, 9_000_000, 500_160, 9_000_200), "EPSG:32736", resolution=10)
+    ds = xr.Dataset(
+        {"red": (("y", "x"), np.zeros(geobox.shape, dtype="float32"))},
+        coords=xr_coords(geobox),
+    )
+    path = tmp_path / "out.zarr"
+    write(ds, path)
+
+    validate_geobox(path, geobox)
+    with pytest.raises(ValueError, match="'x' grid"):
+        validate_geobox(
+            path,
+            GeoBox.from_bbox((499_000, 9_000_000, 500_160, 9_000_200), "EPSG:32736", resolution=10),
+        )
+    with pytest.raises(ValueError, match="'y' grid"):
+        validate_geobox(
+            path,
+            GeoBox.from_bbox((500_000, 9_000_010, 500_160, 9_000_210), "EPSG:32736", resolution=10),
+        )
 
 
 def test_validate_chunks_raises_on_shard_mismatch(tmp_path: Path, dataset: xr.Dataset) -> None:
