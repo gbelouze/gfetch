@@ -1424,3 +1424,20 @@ that state was reached, and should be read chronologically, not as reference mat
     resolved relative to the VRT. Georeferencing is written into the VRT, so it
     doesn't depend on GDAL resolving the store's grid mapping (see `tech-stack.md`'s
     "Consolidated metadata and GDAL").
+
+- **2026-09-27** — **`mosaic` reads Planetary Computer assets without `download`.**
+  - PC's STAC items hold unsigned Azure Blob hrefs; `search` saves them as-is, so
+    `mosaic` from `items.json` got HTTP 409 on every read (`download` was fine:
+    stac-asset signs PC hrefs itself). Found with `sentinel-1-rtc`, which opens
+    anonymously once signed despite its `msft:requires_account: true`.
+  - `gfetch.sources.planetary_computer_signer()` is passed as `odc.stac.load`'s
+    `patch_url`, only when loading from remote hrefs. odc-stac patches hrefs when
+    the graph is built, and GDAL opens the files only when dask computes it, so the
+    token must outlive the whole shard. PC's SAS API issues a new token on every
+    request, valid 45 minutes (verified); the `planetary-computer` package caches
+    tokens until under 60 s remain, which could hand a shard a nearly expired one.
+    So gfetch requests its own tokens (stdlib `urllib`, ~20 lines, no new
+    dependency), from a new signer per shard. A shard computing longer than 45
+    minutes still fails, and is recomputed on the next run; not worth read-time
+    signing for the download-less path.
+  - Verified live: a small `sentinel-1-rtc` job mosaics from remote hrefs.

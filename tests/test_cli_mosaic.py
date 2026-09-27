@@ -178,6 +178,35 @@ def test_mosaic_splits_disjoint_patches_across_tasks(tmp_path: Path, monkeypatch
     assert region_is_written(path, {"y": slice(0, 16), "x": slice(0, 16)}, ["red"])
 
 
+@pytest.mark.parametrize("from_cache", [True, False])
+def test_mosaic_signs_hrefs_only_when_loading_remotely(
+    tmp_path: Path, monkeypatch, from_cache: bool
+) -> None:
+    cfg_path = _write_config(tmp_path / "config.yaml")
+    cfg = load(cfg_path, "s2")
+    _write_fake_items(cfg)
+    if not from_cache:
+        cfg.cached_items_path.rename(cfg.items_path)
+    monkeypatch.setattr("gfetch.cli.mosaic.zone_geobox", _fake_zone_geobox)
+    signers: list[object] = []
+    fake_build = _fake_build_mosaic([])
+
+    def recording_build(zone_items, geobox, bands, *, patch_url, **kwargs):
+        signers.append(patch_url)
+        return fake_build(zone_items, geobox, bands, **kwargs)
+
+    monkeypatch.setattr("gfetch.cli.mosaic.build_mosaic", recording_build)
+    mosaic_cmd(cfg_path, "s2")
+
+    # Template build, then one call per shard.
+    assert len(signers) == 5
+    if from_cache:
+        assert signers == [None] * 5
+    else:
+        assert all(callable(s) for s in signers)
+        assert len({id(s) for s in signers}) == 5
+
+
 def test_mosaic_tunes_worker_count_within_range(tmp_path: Path, monkeypatch) -> None:
     cfg_path = _write_config(tmp_path / "config.yaml", n_compute_workers=[1, 3])
     cfg = load(cfg_path, "s2")

@@ -174,6 +174,7 @@ def load(
     chunks: dict[str, int] | None = None,
     resampling: str | dict[str, str] | None = None,
     log_footprint: bool = True,
+    patch_url: Callable[[str], str] | None = None,
 ) -> xr.Dataset:
     """
     Load STAC items onto a common grid, lazily (dask-backed).
@@ -205,6 +206,11 @@ def load(
     log_footprint : bool
         Log the loaded dataset's per-chunk memory footprint, see
         `gfetch.utils.memory.log_chunk_footprint`. Defaults to True.
+    patch_url : Callable[[str], str] | None
+        Applied to every asset href before loading, e.g. to sign it, see
+        `gfetch.sources.planetary_computer_signer`. Hrefs are patched here, while
+        pixels are only read once the dataset is computed. Defaults to None (hrefs
+        used as-is).
 
     Returns
     -------
@@ -214,8 +220,7 @@ def load(
     # Without this, GDAL/rasterio falls through to botocore's full credential chain on
     # every S3 asset, hanging on an EC2-instance-metadata lookup that never succeeds
     # off-EC2. Every gfetch STAC source is either an unsigned public S3 bucket or Azure
-    # Blob Storage with its SAS token already embedded in the href, so `aws_unsigned`
-    # is always safe here.
+    # Blob Storage, signed via `patch_url`, so `aws_unsigned` is always safe here.
     odc.stac.configure_s3_access(aws_unsigned=True)
     log.debug(f"Loading {len(items)} item(s), bands={list(bands)}, geobox shape={geobox.shape}")
     effective_chunks = resolve_chunks(chunks)
@@ -226,6 +231,7 @@ def load(
         groupby=groupby,
         chunks=cast("dict[str, int | Literal['auto']]", effective_chunks),
         resampling=resampling,
+        patch_url=patch_url,
     )
     log.info(f"Loaded dataset: {dict(ds.sizes)}")
     if log_footprint:
@@ -396,6 +402,7 @@ def mosaic(
     log_footprint: bool = True,
     on_load: Callable[[xr.Dataset], object] | None = None,
     split_orbit_states: bool = False,
+    patch_url: Callable[[str], str] | None = None,
 ) -> xr.Dataset:
     """
     Load, cloud-mask, and composite STAC items into a single mosaic.
@@ -445,6 +452,8 @@ def mosaic(
         items gets all-NaN variables; an item with no `sat:orbit_state` among
         `ORBIT_STATES` raises `ValueError`. Defaults to False (one composite over
         every item).
+    patch_url : Callable[[str], str] | None
+        Passed to `load`. Defaults to None.
 
     Returns
     -------
@@ -477,6 +486,7 @@ def mosaic(
             chunks=resolved_chunks,
             resampling=_pin_mask_band_resampling(resampling, mask_band),
             log_footprint=log_footprint,
+            patch_url=patch_url,
         )
         if on_load is not None:
             on_load(ds)

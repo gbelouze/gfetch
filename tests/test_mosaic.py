@@ -233,7 +233,7 @@ def test_pin_mask_band_resampling(
 def test_mosaic_pins_mask_band_to_nearest_even_with_explicit_override(monkeypatch) -> None:
     captured: dict = {}
 
-    def fake_load(items, geobox, bands, *, groupby, chunks, resampling, log_footprint):
+    def fake_load(items, geobox, bands, *, groupby, chunks, resampling, log_footprint, patch_url):
         captured["resampling"] = resampling
         return xr.Dataset(
             {
@@ -266,7 +266,7 @@ def test_mosaic_overrides_non_default_time_chunk_and_warns(monkeypatch, caplog) 
     """
     captured: dict = {}
 
-    def fake_load(items, geobox, bands, *, groupby, chunks, resampling, log_footprint):
+    def fake_load(items, geobox, bands, *, groupby, chunks, resampling, log_footprint, patch_url):
         captured["chunks"] = chunks
         return xr.Dataset(
             {"red": (("time", "y", "x"), np.array([[[1.0]]]))},
@@ -295,7 +295,7 @@ def test_mosaic_pins_output_chunks_to_requested_grid(monkeypatch) -> None:
     `load()` happened to return.
     """
 
-    def fake_load(items, geobox, bands, *, groupby, chunks, resampling, log_footprint):
+    def fake_load(items, geobox, bands, *, groupby, chunks, resampling, log_footprint, patch_url):
         time_coord = [datetime.datetime(2020, 6, d, tzinfo=datetime.UTC) for d in (1, 2)]
         red = xr.DataArray(
             np.zeros((2, 4, 4)), dims=("time", "y", "x"), coords={"time": time_coord}
@@ -337,7 +337,7 @@ def test_mosaic_composite_ignores_nodata(monkeypatch) -> None:
     """A median over nodata-filled time steps must only see the valid ones, and a
     pixel no time step covers must come out NaN, not `nodata`."""
 
-    def fake_load(items, geobox, bands, *, groupby, chunks, resampling, log_footprint):
+    def fake_load(items, geobox, bands, *, groupby, chunks, resampling, log_footprint, patch_url):
         time_coord = [datetime.datetime(2020, 6, d, tzinfo=datetime.UTC) for d in (1, 2, 3)]
         vv = np.array([[[0, 0]], [[0, 10]], [[0, 30]]], dtype=np.uint16)
         return xr.Dataset(
@@ -362,7 +362,7 @@ def _fake_load_by_item_count(monkeypatch) -> list[list[str]]:
     """Patch `load` to fill every band with the number of items it was given."""
     calls: list[list[str]] = []
 
-    def fake_load(items, geobox, bands, *, groupby, chunks, resampling, log_footprint):
+    def fake_load(items, geobox, bands, *, groupby, chunks, resampling, log_footprint, patch_url):
         calls.append([item.id for item in items])
         value = np.full((1, 2, 2), float(len(items)))
         return xr.Dataset(
@@ -515,6 +515,22 @@ def test_mosaic_item_filtering_leaves_composite_unchanged(
     xr.testing.assert_identical(filtered, unfiltered)
     assert filtered_times == [n_kept]
     assert unfiltered_times == [len(cols)]
+
+
+def test_mosaic_reads_assets_through_patch_url(tmp_path: Path) -> None:
+    item = _tile_item(tmp_path, "i0", 0, 1, 0)
+    real_href = item.assets["red"].href
+    item.assets["red"].href = "https://unsigned.example/i0.tif"
+    patched: list[str] = []
+
+    def patch_url(href: str) -> str:
+        patched.append(href)
+        return real_href
+
+    ds = mosaic([item], _geobox_in_first_tile(), ["red"], patch_url=patch_url).compute()
+
+    assert patched == ["https://unsigned.example/i0.tif"]
+    assert not ds["red"].isnull().all()
 
 
 @pytest.mark.slow

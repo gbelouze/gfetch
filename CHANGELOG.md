@@ -33,6 +33,7 @@ Each release can have sections: "Added", "Changed", "Deprecated", "Removed", "Fi
 - `gfetch.write.store_is_complete()`.
 - `custom:` job config section: one or more arbitrary STAC satellite/source combinations, each requiring an explicit `collection` id and `bands` (no `gfetch.profiles`/`gfetch.sources` registry entry needed). Runs through `gfetch custom <verb> <name> <config>`.
 - `countries:` job config field, as an alternative to `aoi:`: a list of country names (matched, with a typo suggestion, against the public `world-administrative-boundaries` dataset) resolved to the bounding box of their union. `search` additionally queries by the exact country polygon (`intersects=`) rather than just its bounding box.
+- `gfetch <satellite> mosaic` without a prior `download` now reads Planetary Computer assets directly, signing their hrefs with SAS tokens (`gfetch.sources.planetary_computer_signer`, passed to `odc.stac.load` via the new `patch_url` argument of `gfetch.mosaic.load`/`mosaic`). It previously failed with HTTP 409 on their unsigned hrefs. Tokens are requested afresh for each shard and last 45 minutes, so a shard taking longer fails (and is recomputed on the next run).
 
 ### Fixed
 

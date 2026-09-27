@@ -26,6 +26,7 @@ from gfetch.mosaic import (
     zone_geobox,
 )
 from gfetch.mosaic import mosaic as build_mosaic
+from gfetch.sources import planetary_computer_signer
 from gfetch.utils.progress import count_bar, dask_progress, temporary_task
 from gfetch.utils.tuning import WorkerTuner
 from gfetch.write import (
@@ -48,7 +49,9 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
 
     Runs against the local cache if `gfetch download` has been run, otherwise loads
     directly from the items' remote hrefs (fine for a single internet-connected
-    machine; a compute-only HPC node needs the local cache). Safe to resume after
+    machine; a compute-only HPC node needs the local cache). Planetary Computer hrefs
+    are then signed once per shard, with tokens valid for 45 minutes: a shard taking
+    longer fails, and is recomputed on the next run. Safe to resume after
     being killed/preempted: an already-written band of a shard is skipped, and an
     unwritten one is computed and written as a whole. Safe for several concurrent invocations to
     split the work via `task_id`/`n_tasks`, since each shard is its own file and is
@@ -72,7 +75,8 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
     """
     cfg = load(config_path, satellite_key)
 
-    if cfg.cached_items_path.exists():
+    from_remote = not cfg.cached_items_path.exists()
+    if not from_remote:
         items_path = cfg.cached_items_path
     elif cfg.items_path.exists():
         items_path = cfg.items_path
@@ -117,6 +121,8 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
             log_footprint=log_footprint,
             on_load=on_load,
             split_orbit_states=cfg.orbit_state == ORBIT_STATE_AS_BANDS,
+            # A new signer per call, so each shard reads with freshly issued tokens.
+            patch_url=planetary_computer_signer() if from_remote else None,
         )
 
     units: list[tuple[str, Path, list[pystac.Item], GeoBox, dict[str, slice]]] = []
