@@ -65,9 +65,9 @@ def _largest(shapes: list[tuple[int, ...]]) -> str:
     Returns
     -------
     str
-        E.g. `(23, 256, 256) x12/13`, or `none` if `shapes` is empty.
+        E.g. `(23, 256, 256) x 12/13`, or `none` if `shapes` is empty.
     """
     if not shapes:
         return "none"
     largest = max(shapes, key=math.prod)
-    return f"{largest} x{shapes.count(largest)}/{len(shapes)}"
+    return f"{largest} x {shapes.count(largest)}/{len(shapes)}"

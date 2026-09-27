@@ -49,7 +49,7 @@ def test_write_round_trips(tmp_path: Path, dataset: xr.Dataset) -> None:
     path = tmp_path / "out.zarr"
     write(dataset, path)
 
-    reopened = xr.open_zarr(path)
+    reopened = xr.open_zarr(path, consolidated=False)
     assert np.array_equal(reopened["red"].values, dataset["red"].values)
 
 
@@ -62,7 +62,7 @@ def test_disjoint_region_write_matches_full_write(tmp_path: Path, dataset: xr.Da
     for sl in (slice(0, mid), slice(mid, None)):
         write_region(dataset.isel(x=sl), template_path, {"x": sl, "y": slice(None)})
 
-    reopened = xr.open_zarr(template_path)
+    reopened = xr.open_zarr(template_path, consolidated=False)
     assert np.array_equal(reopened["red"].values, dataset["red"].values)
 
 
@@ -84,7 +84,7 @@ def test_prepare_template_is_idempotent(tmp_path: Path, dataset: xr.Dataset) -> 
     write_region(dataset, path, {"x": slice(None), "y": slice(None)})
     prepare_template(chunked, path)  # must not re-truncate an already-written store
 
-    reopened = xr.open_zarr(path)
+    reopened = xr.open_zarr(path, consolidated=False)
     assert np.array_equal(reopened["red"].values, dataset["red"].values)
 
 
@@ -182,6 +182,33 @@ def test_disjoint_region_write_restores_grid_mapping(
     assert red.attrs["grid_mapping"] == "spatial_ref"
 
 
+def test_sharded_template_restores_grid_mapping(
+    tmp_path: Path, dataset_with_crs: xr.Dataset
+) -> None:
+    path = tmp_path / "sharded.zarr"
+    prepare_template(dataset_with_crs.chunk({"x": 4, "y": 20}), path, shards={"x": 8})
+
+    red = zarr.open_array(store=path / "red")
+    assert red.attrs["grid_mapping"] == "spatial_ref"
+
+
+def test_write_does_not_consolidate_metadata(tmp_path: Path, dataset_with_crs: xr.Dataset) -> None:
+    path = tmp_path / "out.zarr"
+    write(dataset_with_crs, path)
+
+    assert zarr.open_group(store=path, mode="r").metadata.consolidated_metadata is None
+
+
+def test_region_writes_do_not_consolidate_metadata(
+    tmp_path: Path, dataset_with_crs: xr.Dataset
+) -> None:
+    path = tmp_path / "regions.zarr"
+    prepare_template(dataset_with_crs.chunk({"x": 4, "y": 20}), path, shards={"x": 8})
+    write_region(dataset_with_crs.isel(x=slice(0, 8)), path, {"x": slice(0, 8), "y": slice(None)})
+
+    assert zarr.open_group(store=path, mode="r").metadata.consolidated_metadata is None
+
+
 def test_disjoint_region_write_workers_do_not_overlap(tmp_path: Path, dataset: xr.Dataset) -> None:
     """Each worker's region write must only touch its own slice - two workers writing
     non-overlapping regions must not corrupt each other's data.
@@ -198,7 +225,7 @@ def test_disjoint_region_write_workers_do_not_overlap(tmp_path: Path, dataset: x
     # Only the first half has been written; the rest of the store should still hold
     # whatever `prepare_template` initialized it to (zeros/fill-value), not garbage
     # and not the first half's data repeated.
-    partial = xr.open_zarr(template_path)
+    partial = xr.open_zarr(template_path, consolidated=False)
     assert np.array_equal(partial["red"].values[:, :mid], dataset["red"].values[:, :mid])
     assert not np.array_equal(partial["red"].values[:, mid:], dataset["red"].values[:, mid:])
 
@@ -282,7 +309,7 @@ def test_sharded_region_writes_are_tracked_per_shard(tmp_path: Path) -> None:
     for region in write_regions(path, "red")[1:]:
         write_region(ds.isel(region), path, region)
     assert store_is_complete(path, ["red"])
-    xr.testing.assert_equal(xr.open_zarr(path)["red"].load(), ds["red"])
+    xr.testing.assert_equal(xr.open_zarr(path, consolidated=False)["red"].load(), ds["red"])
 
 
 def test_validate_chunks_raises_on_shard_mismatch(tmp_path: Path, dataset: xr.Dataset) -> None:

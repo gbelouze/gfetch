@@ -63,7 +63,7 @@ def test_pack_zips_each_zone_store(tmp_path: Path) -> None:
     pack_cmd(cfg_path, "s2", remove_store=True)
 
     assert not store.exists()
-    packed = xr.open_zarr(ZipStore(packed_store_path(store), mode="r"))
+    packed = xr.open_zarr(ZipStore(packed_store_path(store), mode="r"), consolidated=False)
     assert float(packed["red"].sum()) == 64.0
 
 

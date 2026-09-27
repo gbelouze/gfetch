@@ -730,6 +730,41 @@ recomputed it on every resume and a store could never count as complete.
 `write`/`write_region` now pass `write_empty_chunks=True`. Costs one small (compressed)
 file per empty chunk.
 
+## Consolidated metadata and GDAL (added 2026-09-27)
+
+Stores are georeferenced CF-style: `x`/`y` pixel-centre coordinates give the
+transform, and each band's `grid_mapping: "spatial_ref"` attribute names a scalar
+variable whose attributes (`crs_wkt`, `spatial_ref`, `GeoTransform`) give the CRS.
+QGIS reported several stores as lacking georeferencing, for two separate reasons:
+
+- **Missing `grid_mapping`** on the bands of sharded templates: `to_zarr`'s
+  `encoding=` replaces a variable's `.encoding` instead of merging into it, so the
+  link restored by `_restore_grid_mapping` was dropped. Fixed in `prepare_template`.
+- **Consolidated metadata** (a zarr-python extension to Zarr v3; its root `zarr.json`
+  holds a `consolidated_metadata.metadata` listing, sorted alphabetically). GDAL's Zarr
+  driver (3.13.3, found by bisecting copies of real stores) resolves a band's
+  `grid_mapping` only if the grid mapping variable is listed *before* the band. The band
+  keeps its transform but loses its CRS, silently. S1 bands (`vh_*`, `vv_*`) sort after
+  `spatial_ref` and worked; most S2 bands (`blue` ... `rededge3`) sort before it and
+  didn't. Unconsolidated stores are unaffected: GDAL then opens arrays from the
+  filesystem in any order.
+
+**Decision (2026-09-27)**: `write`/`prepare_template`/`write_region` pass
+`consolidated=False`. Costs one metadata read per variable when opening (negligible
+on local/HPC disks, noticeable over HTTP), and readers should pass
+`xr.open_zarr(..., consolidated=False)` to avoid xarray's fallback `RuntimeWarning`.
+Rejected: keeping consolidation with `spatial_ref` moved first in the listing, since
+any later `zarr.consolidate_metadata()` re-sorts it and silently breaks GDAL again.
+
+Stores written before this fix are patched in place by the one-off `patch_crs.py`
+(metadata only: adds `spatial_ref` from odc-geo's `crs` attribute on `x`/`y` when
+missing, sets `grid_mapping`, adds `spatial_ref` to the root `coordinates` attribute,
+and on consolidated stores moves `spatial_ref` first in the listing).
+
+**Not done**: reporting the ordering bug upstream to GDAL. A minimal repro: a
+consolidated v3 store with bands `a` and `z`, both `grid_mapping: "spatial_ref"`;
+`gdalinfo ZARR:"store.zarr":/a` shows no CRS, while `/z` shows it (verified on GDAL 3.13.3).
+
 ## Future: disk-bounded streaming download+mosaic (deferred, not designed for v1)
 
 Added 2026-09-22, from a user design discussion — **not built, not scheduled**; recorded

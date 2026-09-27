@@ -3,6 +3,11 @@
 Default output target is plain Zarr (not Icechunk) with pre-planned, non-overlapping
 per-worker chunk regions, safe on any POSIX filesystem, including shared HPC storage.
 See `claude/tech-stack.md`'s "HPC / distributed execution" section for why.
+
+Stores are written without consolidated metadata: GDAL's Zarr driver (hence QGIS)
+drops the CRS of any band listed before its grid mapping variable in a consolidated
+listing, see `claude/tech-stack.md`'s "Consolidated metadata and GDAL" section. Open
+them with `xr.open_zarr(path, consolidated=False)`.
 """
 
 import asyncio
@@ -95,7 +100,7 @@ def write(ds: xr.Dataset, path: Path, *, mode: _ZarrMode = "w") -> None:
     ds = _restore_grid_mapping(ds)
     log.debug(f"Writing dataset {dict(ds.sizes)} to {path} (mode={mode})")
     log_chunk_footprint(ds, log)
-    ds.to_zarr(path, mode=mode, write_empty_chunks=True)
+    ds.to_zarr(path, mode=mode, write_empty_chunks=True, consolidated=False)
     log.info(f"Wrote dataset to {path}")
 
 
@@ -248,6 +253,9 @@ def prepare_template(
                     for dim, chunk in zip(var.dims, var_chunks, strict=True)
                 ),
             }
+            # `to_zarr`'s `encoding` replaces `var.encoding` instead of merging into it.
+            if "grid_mapping" in var.encoding:
+                encoding[name]["grid_mapping"] = var.encoding["grid_mapping"]
         # xarray requires dask chunks aligned to shards; nothing is computed here.
         ds = ds.chunk({dim: size for dim, size in shards.items() if dim in ds.dims})
     if store_initialized(path):
@@ -255,7 +263,7 @@ def prepare_template(
         return
     tmp_path = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
     try:
-        ds.to_zarr(tmp_path, compute=False, mode="w-", encoding=encoding)
+        ds.to_zarr(tmp_path, compute=False, mode="w-", encoding=encoding, consolidated=False)
         try:
             tmp_path.rename(path)
         except OSError as e:
@@ -297,7 +305,7 @@ def write_region(ds: xr.Dataset, path: Path, region: dict[str, slice]) -> None:
     # zarr-python skips writing chunks that are entirely fill value (e.g. an all-NaN
     # nodata shard) by default, which `region_is_written` couldn't tell apart from a
     # chunk that was never written.
-    ds.to_zarr(path, region=region, write_empty_chunks=True)
+    ds.to_zarr(path, region=region, write_empty_chunks=True, consolidated=False)
     log.debug(f"Wrote region {region} to {path}")
 
 

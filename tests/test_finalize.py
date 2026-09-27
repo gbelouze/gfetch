@@ -45,7 +45,7 @@ def test_pack_store_round_trips(tmp_path: Path, dataset: xr.Dataset) -> None:
     assert dest == packed_store_path(store) == tmp_path / "mosaic.zarr.zip"
     assert store.exists()
     assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".")] == []
-    packed = xr.open_zarr(ZipStore(dest, mode="r"))
+    packed = xr.open_zarr(ZipStore(dest, mode="r"), consolidated=False)
     xr.testing.assert_equal(packed[["red", "green"]].load(), dataset[["red", "green"]])
 
 

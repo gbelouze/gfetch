@@ -55,8 +55,9 @@ def pack_store(
     Pack a complete Zarr store directory into a single uncompressed zip file.
 
     The result is a regular Zarr store, readable in place via
-    `zarr.storage.ZipStore(path, mode="r")` (e.g. `xr.open_zarr(ZipStore(...))`) or
-    GDAL's `/vsizip/` prefix, and costs one inode instead of one per chunk. It is
+    `zarr.storage.ZipStore(path, mode="r")` (e.g.
+    `xr.open_zarr(ZipStore(...), consolidated=False)`) or GDAL's `/vsizip/` prefix, and
+    costs one inode instead of one per chunk. It is
     read-only: a zip can't be written to concurrently, so pack only once `mosaic` is
     done with the store.
 
