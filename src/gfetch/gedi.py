@@ -451,11 +451,14 @@ def _fetch_tiles(
     ) as task:
         n_reused = 0
         sliderule_ready = False
-        for tile in tiles:
+        for i, tile in enumerate(tiles, start=1):
             path = _tile_path(tile_dir, tile) if tile_dir is not None else None
             if path is not None and path.exists():
                 tile_gdf = gpd.read_parquet(path)
                 n_reused += 1
+                log.debug(
+                    f"GEDI {product} tile reused, {len(tile_gdf)} footprint(s) [{i}/{len(tiles)}]"
+                )
             else:
                 if not sliderule_ready:
                     sliderule.init(verbose=False)
@@ -463,6 +466,9 @@ def _fetch_tiles(
                 tile_gdf = fetch_tile(tile)
                 if path is not None:
                     write_geoparquet(tile_gdf, path)
+                log.info(
+                    f"GEDI {product} tile fetched, {len(tile_gdf)} footprint(s) [{i}/{len(tiles)}]"
+                )
             gdfs.append(tile_gdf)
             if progress is not None and task is not None:
                 progress.advance(task)

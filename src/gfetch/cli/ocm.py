@@ -76,9 +76,12 @@ def ocm(
             count_bar() as progress,
             temporary_task(progress, "Computing OmniCloudMask", total=len(pending)) as task,
         ):
-            for item in write_ocms(
-                pending, models=models, device=device, dtype=dtype, batch_size=batch_size
+            for i, item in enumerate(
+                write_ocms(
+                    pending, models=models, device=device, dtype=dtype, batch_size=batch_size
+                ),
+                start=1,
             ):
-                log.debug(f"{item.id}: mask written")
+                log.info(f"{item.id}: mask written [{i}/{len(pending)}]")
                 progress.advance(task)
     log.info(f"OmniCloudMask masks ready for {len(my_items)} item(s)")

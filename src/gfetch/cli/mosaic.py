@@ -188,12 +188,12 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
         count_bar() as progress,
         temporary_task(progress, "Computing shards", total=len(my_units)) as units_task,
     ):
-        for label, path, zone_items, unit_geobox, region in my_units:
+        for i, (label, path, zone_items, unit_geobox, region) in enumerate(my_units, start=1):
             # Each band's shard is its own file, written atomically, so a shard counts
             # as done once every band's file exists; otherwise all its bands are
             # recomputed and rewritten.
             if region_is_written(path, region, variables):
-                log.debug(f"{label}: already written, skipping")
+                log.info(f"{label}: already written, skipping [{i}/{len(my_units)}]")
             else:
                 n_workers = tuner.next()
                 loaded: list[xr.Dataset] = []
@@ -202,5 +202,7 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
                     start = time.perf_counter()
                     with dask_progress(progress, label):
                         write_region(ds, path, region)
-                tuner.observe(n_workers, time.perf_counter() - start, sum(d.nbytes for d in loaded))
+                elapsed = time.perf_counter() - start
+                tuner.observe(n_workers, elapsed, sum(d.nbytes for d in loaded))
+                log.info(f"{label}: written in {elapsed:.0f}s [{i}/{len(my_units)}]")
             progress.advance(units_task)

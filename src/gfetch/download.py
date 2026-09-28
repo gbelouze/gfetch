@@ -327,7 +327,7 @@ async def _download_item(
                 )
             else:
                 messages: asyncio.Queue[Message] = asyncio.Queue()
-                with temporary_task(progress, item.id, total=None) as task:
+                with temporary_task(progress, item.id, total=None, bytes=True) as task:
                     downloaded, _ = await asyncio.gather(
                         download_item(
                             _rewrite_s3_hrefs(item),
@@ -446,8 +446,14 @@ async def download_items(
         f"(max_concurrent_items={max_concurrent_items})"
     )
 
+    n_done = 0
+
     async def _download_one(item: pystac.Item, task: TaskID | None) -> pystac.Item | None:
+        nonlocal n_done
         result = await _download_item(item, cache_dir, asset_keys, config, semaphore, progress)
+        n_done += 1
+        status = "cached" if result is not None else "dropped"
+        log.info(f"{item.id}: {status} [{n_done}/{len(items)}]")
         if progress is not None and task is not None:
             progress.advance(task)
         return result
