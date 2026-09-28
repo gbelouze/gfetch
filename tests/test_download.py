@@ -3,9 +3,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
 
+import aiohttp
 import pystac
 import pytest
+from multidict import CIMultiDict, CIMultiDictProxy
 from rich.progress import Progress
+from stac_asset import DownloadError
+from yarl import URL
 
 from gfetch.download import _s3_uri_to_public_https, download_items
 
@@ -234,3 +238,92 @@ def test_download_items_multiple_items(tmp_path: Path) -> None:
         item_dir = cache_dir / f"item-{i}"
         assert (item_dir / "red.tif").read_bytes() == f"RED-{i}".encode()
         assert result.assets["red"].href == str(item_dir / "red.tif")
+
+
+def _http_error(href: str, status: int) -> aiohttp.ClientResponseError:
+    url = URL(f"{href}?sig=token")
+    request_info = aiohttp.RequestInfo(url, "GET", CIMultiDictProxy(CIMultiDict()), url)
+    return aiohttp.ClientResponseError(request_info, (), status=status)
+
+
+def _failing_download_item(
+    monkeypatch: pytest.MonkeyPatch, failures: dict[str, list[int]]
+) -> list[list[str]]:
+    """Patch download_item() to fail on the assets in `failures`, each popping its next
+    HTTP status per call it's included in, and return the asset keys of every call.
+    """
+    import gfetch.download as download_mod
+
+    real_download_item = download_mod.download_item
+    calls: list[list[str]] = []
+
+    async def fake_download_item(item, directory, *, config, keep_non_downloaded):
+        calls.append(list(config.include))
+        errors: list[Exception] = [
+            _http_error(item.assets[key].href, failures[key].pop(0))
+            for key in config.include
+            if failures.get(key)
+        ]
+        if errors:
+            raise DownloadError(errors)
+        return await real_download_item(
+            item, directory, config=config, keep_non_downloaded=keep_non_downloaded
+        )
+
+    monkeypatch.setattr(download_mod, "download_item", fake_download_item)
+    return calls
+
+
+def test_download_items_skips_missing_asset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    for key in ("vv", "vh"):
+        (source_dir / f"{key}.tif").write_bytes(key.encode())
+    item = _make_item("item-1", {k: source_dir / f"{k}.tif" for k in ("vv", "vh")})
+    calls = _failing_download_item(monkeypatch, {"vh": [404]})
+    cache_dir = tmp_path / "cache"
+
+    [result] = asyncio.run(download_items([item], cache_dir, ["vv", "vh"]))
+
+    assert calls == [["vv", "vh"], ["vv"]]
+    item_dir = cache_dir / "item-1"
+    assert list(result.assets) == ["vv"]
+    assert result.assets["vv"].href == str(item_dir / "vv.tif")
+    assert (item_dir / "vv.complete").exists()
+    assert not (item_dir / "vh.complete").exists()
+    assert "skipping asset(s) ['vh']" in caplog.text
+
+
+def test_download_items_drops_item_with_all_assets_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    items = []
+    for i in range(2):
+        src = source_dir / f"vv-{i}.tif"
+        src.write_bytes(f"VV-{i}".encode())
+        items.append(_make_item(f"item-{i}", {"vv": src}))
+    _failing_download_item(monkeypatch, {"vv": [404]})
+
+    results = asyncio.run(download_items(items, tmp_path / "cache", ["vv"]))
+
+    assert [r.id for r in results] == ["item-1"]
+
+
+def test_download_items_retries_other_http_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    src = source_dir / "vv.tif"
+    src.write_bytes(b"VV")
+    item = _make_item("item-1", {"vv": src})
+    calls = _failing_download_item(monkeypatch, {"vv": [500]})
+
+    [result] = asyncio.run(download_items([item], tmp_path / "cache", ["vv"]))
+
+    assert calls == [["vv"], ["vv"]]
+    assert list(result.assets) == ["vv"]

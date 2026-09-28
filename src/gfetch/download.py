@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 import aiohttp
 import pystac
 import stac_asset.http_client
-from stac_asset import Config, download_item
+from stac_asset import Config, DownloadError, download_item
 from stac_asset.messages import (
     ErrorAssetDownload,
     FinishAssetDownload,
@@ -105,6 +105,57 @@ def _s3_uri_to_public_https(href: str) -> str:
     return f"https://{bucket}.s3.amazonaws.com/{key}"
 
 
+def _strip_query(url: str) -> str:
+    """
+    Drop the query string and fragment of a URL (e.g. a Planetary Computer SAS token).
+
+    Parameters
+    ----------
+    url : str
+        URL to strip.
+
+    Returns
+    -------
+    str
+        `url` without its query string and fragment.
+    """
+    return urlsplit(url)._replace(query="", fragment="").geturl()
+
+
+def _missing_asset_keys(error: DownloadError, item: pystac.Item) -> set[str] | None:
+    """
+    Find which of `item`'s assets a download failed on because they don't exist.
+
+    Planetary Computer occasionally lists assets whose blob is missing from its
+    storage account, which consistently answers 404 for them.
+
+    Parameters
+    ----------
+    error : DownloadError
+        Error raised by `download_item()` for `item`.
+    item : pystac.Item
+        Item whose download raised `error`.
+
+    Returns
+    -------
+    set[str] | None
+        Keys of the assets that 404'd, or None if `error` holds any other kind of
+        failure, or a 404 that can't be traced back to one of `item`'s assets.
+    """
+    keys_by_url = {
+        _strip_query(_s3_uri_to_public_https(asset.href)): key for key, asset in item.assets.items()
+    }
+    missing = set()
+    for e in error.exceptions:
+        if not (isinstance(e, aiohttp.ClientResponseError) and e.status == 404):
+            return None
+        key = keys_by_url.get(_strip_query(str(e.request_info.real_url)))
+        if key is None:
+            return None
+        missing.add(key)
+    return missing
+
+
 def _rewrite_s3_hrefs(item: pystac.Item) -> pystac.Item:
     """
     Deep-copy an item with every `s3://` asset href rewritten to its public HTTPS
@@ -133,6 +184,7 @@ async def _retry_async[T](
     tries: int = _RETRY_TRIES,
     delay: float = _RETRY_INITIAL_DELAY,
     backoff: float = _RETRY_BACKOFF,
+    give_up: Callable[[Exception], bool] = lambda _: False,
 ) -> T:
     """
     Retry an async callable with exponential backoff.
@@ -152,6 +204,9 @@ async def _retry_async[T](
         Initial delay in seconds between attempts. Defaults to 1.0.
     backoff : float
         Multiplier applied to the delay after each failed attempt. Defaults to 1.7.
+    give_up : Callable[[Exception], bool]
+        Predicate on a raised exception, true if it is permanent and must be re-raised
+        right away. Defaults to never giving up early.
 
     Returns
     -------
@@ -164,7 +219,7 @@ async def _retry_async[T](
             return await coro_fn()
         except Exception as e:
             attempt += 1
-            if attempt >= tries:
+            if attempt >= tries or give_up(e):
                 raise
             log.warning(f"Attempt {attempt}/{tries} failed ({e}), retrying in {delay:.1f}s")
             await asyncio.sleep(delay)
@@ -214,7 +269,7 @@ async def _download_item(
     config: Config,
     semaphore: asyncio.Semaphore,
     progress: Progress | None = None,
-) -> pystac.Item:
+) -> pystac.Item | None:
     """
     Download the requested assets of one STAC item into `cache_dir`, atomically and
     resumably.
@@ -239,9 +294,11 @@ async def _download_item(
 
     Returns
     -------
-    pystac.Item
+    pystac.Item | None
         A copy of `item` whose requested asset hrefs point at the local cache instead
-        of the remote source, ready to be handed to `odc.stac.load()`.
+        of the remote source, ready to be handed to `odc.stac.load()`. Assets missing
+        from the remote storage (404) are logged and left out, and None is returned if
+        that leaves no asset at all.
     """
     item_dir = cache_dir / item.id
     item_dir.mkdir(parents=True, exist_ok=True)
@@ -249,59 +306,80 @@ async def _download_item(
     available_keys = [k for k in asset_keys if k in item.assets]
     pending_keys = [k for k in available_keys if not (item_dir / f"{k}.complete").exists()]
 
-    if pending_keys:
-        download_config = dataclasses.replace(config, include=pending_keys)
+    missing_keys: set[str] = set()
 
-        async def _attempt() -> pystac.Item:
-            # The move out of the temp dir must happen before it's cleaned up on
-            # exiting this `with` block, so it stays inside `_attempt` (retried as a
-            # whole) rather than after it. A fresh deep copy of `item` is required
-            # per attempt too: download_item() mutates its input item in place (sets
-            # its self href, rewrites asset hrefs), so retrying against the same
-            # object would hand a failed attempt's corrupted state to the next one.
-            log.debug(f"{item.id}: starting download of {pending_keys}")
-            with tempfile.TemporaryDirectory(dir=item_dir) as tmp:
-                if progress is None:
-                    downloaded = await download_item(
-                        _rewrite_s3_hrefs(item),
-                        Path(tmp),
-                        config=download_config,
-                        keep_non_downloaded=True,
+    async def _attempt(keys: list[str]) -> pystac.Item:
+        # The move out of the temp dir must happen before it's cleaned up on exiting
+        # this `with` block, so it stays inside `_attempt` (retried as a whole) rather
+        # than after it. A fresh deep copy of `item` is required per attempt too:
+        # download_item() mutates its input item in place (sets its self href,
+        # rewrites asset hrefs), so retrying against the same object would hand a
+        # failed attempt's corrupted state to the next one.
+        log.debug(f"{item.id}: starting download of {keys}")
+        download_config = dataclasses.replace(config, include=keys)
+        with tempfile.TemporaryDirectory(dir=item_dir) as tmp:
+            if progress is None:
+                downloaded = await download_item(
+                    _rewrite_s3_hrefs(item),
+                    Path(tmp),
+                    config=download_config,
+                    keep_non_downloaded=True,
+                )
+            else:
+                messages: asyncio.Queue[Message] = asyncio.Queue()
+                with temporary_task(progress, item.id, total=None) as task:
+                    downloaded, _ = await asyncio.gather(
+                        download_item(
+                            _rewrite_s3_hrefs(item),
+                            Path(tmp),
+                            config=download_config,
+                            keep_non_downloaded=True,
+                            messages=messages,
+                        ),
+                        _report_asset_progress(messages, progress, task, len(keys)),
                     )
-                else:
-                    messages: asyncio.Queue[Message] = asyncio.Queue()
-                    with temporary_task(progress, item.id, total=None) as task:
-                        downloaded, _ = await asyncio.gather(
-                            download_item(
-                                _rewrite_s3_hrefs(item),
-                                Path(tmp),
-                                config=download_config,
-                                keep_non_downloaded=True,
-                                messages=messages,
-                            ),
-                            _report_asset_progress(messages, progress, task, len(pending_keys)),
-                        )
-                for key in pending_keys:
-                    # .get_absolute_href() (not .href) is required here:
-                    # download_item() always relative-ifies asset hrefs once it
-                    # sets a self href, which it always does when writing into a
-                    # directory.
-                    href = downloaded.assets[key].get_absolute_href()
-                    assert href is not None, f"downloaded asset {key} has no absolute href"
-                    tmp_path = Path(href)
-                    final_path = item_dir / f"{key}{tmp_path.suffix}"
-                    shutil.move(tmp_path, final_path)
-                    (item_dir / f"{key}.complete").touch()
-                    downloaded.assets[key].href = str(final_path)
-                    log.debug(f"Downloaded {item.id}/{key} -> {final_path}")
-            return downloaded
+            for key in keys:
+                # .get_absolute_href() (not .href) is required here: download_item()
+                # always relative-ifies asset hrefs once it sets a self href, which it
+                # always does when writing into a directory.
+                href = downloaded.assets[key].get_absolute_href()
+                assert href is not None, f"downloaded asset {key} has no absolute href"
+                tmp_path = Path(href)
+                final_path = item_dir / f"{key}{tmp_path.suffix}"
+                shutil.move(tmp_path, final_path)
+                (item_dir / f"{key}.complete").touch()
+                downloaded.assets[key].href = str(final_path)
+                log.debug(f"Downloaded {item.id}/{key} -> {final_path}")
+        return downloaded
 
+    def _is_missing_asset(e: Exception) -> bool:
+        return isinstance(e, DownloadError) and _missing_asset_keys(e, item) is not None
+
+    result = None
+    if pending_keys:
         async with semaphore:
-            result = await _retry_async(_attempt)
+            while keys := [k for k in pending_keys if k not in missing_keys]:
+                try:
+                    result = await _retry_async(lambda: _attempt(keys), give_up=_is_missing_asset)
+                    break
+                except DownloadError as e:
+                    newly_missing = _missing_asset_keys(e, item)
+                    if newly_missing is None:
+                        raise
+                    log.warning(
+                        f"{item.id}: skipping asset(s) {sorted(newly_missing)}, missing "
+                        f"from the remote storage (404): {e}"
+                    )
+                    missing_keys |= newly_missing
     else:
         log.debug(f"{item.id}: all requested assets already cached, skipping download")
+    if result is None:
         result = copy.deepcopy(item)
 
+    available_keys = [k for k in available_keys if k not in missing_keys]
+    if missing_keys and not available_keys:
+        log.warning(f"{item.id}: no requested asset left to download, dropping item")
+        return None
     for key in available_keys:
         if key not in pending_keys:
             suffix = Path(urlsplit(item.assets[key].href).path).suffix
@@ -355,7 +433,9 @@ async def download_items(
     -------
     list[pystac.Item]
         Copies of `items` whose requested asset hrefs point at the local cache, in
-        the same order as `items`, ready to be handed to `odc.stac.load()`.
+        the same order as `items`, ready to be handed to `odc.stac.load()`. Assets
+        missing from the remote storage (404) are logged and left out, and so are
+        items left with no asset at all.
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -366,7 +446,7 @@ async def download_items(
         f"(max_concurrent_items={max_concurrent_items})"
     )
 
-    async def _download_one(item: pystac.Item, task: TaskID | None) -> pystac.Item:
+    async def _download_one(item: pystac.Item, task: TaskID | None) -> pystac.Item | None:
         result = await _download_item(item, cache_dir, asset_keys, config, semaphore, progress)
         if progress is not None and task is not None:
             progress.advance(task)
@@ -377,6 +457,7 @@ async def download_items(
         if progress is not None
         else nullcontext(None)
     ) as task:
-        result = list(await asyncio.gather(*(_download_one(item, task) for item in items)))
+        results = await asyncio.gather(*(_download_one(item, task) for item in items))
+    result = [r for r in results if r is not None]
     log.info(f"Downloaded {len(result)} item(s) into {cache_dir}")
     return result
