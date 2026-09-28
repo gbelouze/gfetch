@@ -5,18 +5,21 @@ from contextlib import contextmanager
 from typing import Any
 
 from dask.callbacks import Callback
-from rich.console import Console
+from rich.console import Console, RenderableType
 from rich.progress import (
     BarColumn,
     DownloadColumn,
     MofNCompleteColumn,
     Progress,
+    ProgressColumn,
+    Task,
     TaskID,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
+from rich.text import Text
 
 __all__ = ["count_bar", "dask_progress", "default_bar", "gfetch_debug", "temporary_task"]
 
@@ -54,10 +57,33 @@ def _disabled() -> bool:
     return disabled
 
 
+class _PerUnitColumn(ProgressColumn):
+    """
+    Column rendering differently for byte-counting and item-counting tasks.
+
+    A task counts bytes when it was added with a `bytes=True` field, e.g.
+    `progress.add_task(description, bytes=True)`.
+    """
+
+    def __init__(
+        self, count_column: ProgressColumn | None, bytes_column: ProgressColumn | None
+    ) -> None:
+        super().__init__()
+        self._count_column = count_column
+        self._bytes_column = bytes_column
+
+    def render(self, task: Task) -> RenderableType:
+        column = self._bytes_column if task.fields.get("bytes", False) else self._count_column
+        return column(task) if column is not None else Text("")
+
+
 def default_bar() -> Progress:
     """
     Build the shared `rich.progress.Progress` instance used for byte-oriented
     progress (e.g. downloads) across gfetch commands.
+
+    Tasks added with a `bytes=True` field show sizes and a transfer speed, the
+    others an item count.
 
     Returns
     -------
@@ -68,9 +94,9 @@ def default_bar() -> Progress:
     return Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
-        MofNCompleteColumn(),
-        DownloadColumn(),
-        TransferSpeedColumn(),
+        _PerUnitColumn(MofNCompleteColumn(), DownloadColumn()),
+        _PerUnitColumn(None, TransferSpeedColumn()),
+        TimeElapsedColumn(),
         TimeRemainingColumn(),
         refresh_per_second=1,
         disable=_disabled(),
