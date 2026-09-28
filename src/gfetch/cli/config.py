@@ -9,7 +9,7 @@ from odc.geo.crs import CRS
 from omegaconf import DictConfig, OmegaConf
 from shapely.geometry.base import BaseGeometry
 
-from gfetch.profiles import get_profile
+from gfetch.profiles import OCM_BAND, OCM_INPUT_BANDS, OCM_MASK_OUT, get_profile
 from gfetch.utils.system import available_cpus
 
 log = logging.getLogger(__name__)
@@ -219,6 +219,15 @@ class Config:
         Classification values to mask out, overriding
         `gfetch.profiles.SatelliteProfile.cloud_mask_out`. Only meaningful together
         with `cloud_mask_band`. Defaults to an empty list (no override).
+    ocm : bool
+        Cloud-mask with OmniCloudMask instead of SCL (Sentinel-2 only): `download`
+        also fetches the model weights, `gfetch s2 ocm` computes each item's mask,
+        and `mosaic` masks out thick cloud, thin cloud and cloud shadow with it.
+        `bands` must include 'red', 'green' and 'nir', and `cloud_mask_band` must
+        be unset. Defaults to False.
+    ocm_model_dir : Path | None
+        Directory holding OmniCloudMask's model weights, shared by the `download`
+        and `ocm` stages. Defaults to None, see `ocm_model_path`.
     resolution : float
         Output pixel resolution, in the target CRS's units (meters, for UTM).
         Defaults to 10.0.
@@ -277,6 +286,8 @@ class Config:
     collection: str | None = None
     cloud_mask_band: str | None = None
     cloud_mask_out: list[int] = field(default_factory=list)
+    ocm: bool = False
+    ocm_model_dir: Path | None = None
     resolution: float = 10.0
     n_workers: int = 4
     resampling: dict[str, str] = field(default_factory=dict)
@@ -287,6 +298,8 @@ class Config:
 
     def __post_init__(self) -> None:
         self.output_dir = Path(self.output_dir).expanduser().absolute()
+        if self.ocm_model_dir is not None:
+            self.ocm_model_dir = Path(self.ocm_model_dir).expanduser().absolute()
 
     @property
     def resolved_aoi(self) -> AOIConfig:
@@ -321,6 +334,18 @@ class Config:
             Directory holding the downloaded asset cache.
         """
         return self.output_dir / "cache"
+
+    @property
+    def ocm_model_path(self) -> Path:
+        """
+        Returns
+        -------
+        Path
+            `ocm_model_dir` if set, else `<output_dir>/ocm_models`.
+        """
+        return (
+            self.ocm_model_dir if self.ocm_model_dir is not None else self.output_dir / "ocm_models"
+        )
 
     @property
     def items_path(self) -> Path:
@@ -409,8 +434,9 @@ def load(path: Path, satellite_key: str) -> Config:
     ------
     ValueError
         If `satellite_key` is neither a built-in nor a key under `custom:`, a
-        `custom` section is missing `collection`/`bands`, or neither/both of
-        `aoi`/`countries` are given (see `resolve_aoi`).
+        `custom` section is missing `collection`/`bands`, neither/both of
+        `aoi`/`countries` are given (see `resolve_aoi`), or `ocm` is set with a
+        config it can't apply to (see `_validate_ocm`).
     """
     log.debug(f"Loading config from {path} (satellite={satellite_key!r})")
     raw = OmegaConf.load(path)
@@ -456,9 +482,40 @@ def load(path: Path, satellite_key: str) -> Config:
     merged = OmegaConf.merge(structured, overrides)
     OmegaConf.resolve(merged)
     cfg: Config = OmegaConf.to_object(merged)  # type: ignore[assignment]
-    cfg.aoi = resolve_aoi(cfg.aoi, cfg.countries, context=f"{path} (satellite={satellite_key!r})")
+    context = f"{path} (satellite={satellite_key!r})"
+    cfg.aoi = resolve_aoi(cfg.aoi, cfg.countries, context=context)
+    _validate_ocm(cfg, context=context)
     log.debug(f"Resolved output_dir={cfg.output_dir}")
     return cfg
+
+
+def _validate_ocm(cfg: Config, *, context: str) -> None:
+    """
+    Check that a config with `ocm` set can actually be masked with OmniCloudMask.
+
+    Parameters
+    ----------
+    cfg : Config
+        Job configuration.
+    context : str
+        Description of what's being validated (e.g. the config path), prefixed to
+        the error message.
+
+    Raises
+    ------
+    ValueError
+        If `ocm` is set on a satellite other than Sentinel-2, together with
+        `cloud_mask_band`, or without every one of `OCM_INPUT_BANDS` in the bands.
+    """
+    if not cfg.ocm:
+        return
+    if cfg.satellite != "sentinel-2":
+        raise ValueError(f"{context}: `ocm` only applies to sentinel-2, set it under `s2:`")
+    if cfg.cloud_mask_band is not None:
+        raise ValueError(f"{context}: `ocm` and `cloud_mask_band` are mutually exclusive")
+    missing = [band for band in OCM_INPUT_BANDS if band not in resolve_bands(cfg)]
+    if missing:
+        raise ValueError(f"{context}: `ocm` needs bands {missing}, add them to `bands`")
 
 
 def resolve_bands(cfg: Config) -> list[str]:
@@ -544,12 +601,15 @@ def resolve_cloud_mask(cfg: Config) -> tuple[str | None, frozenset[int]]:
     Returns
     -------
     tuple[str | None, frozenset[int]]
+        OmniCloudMask's `(OCM_BAND, OCM_MASK_OUT)` if `cfg.ocm` is set, else
         `(cfg.cloud_mask_band, cfg.cloud_mask_out)` if `cloud_mask_band` is set, else
         `cfg.satellite`'s `gfetch.profiles.SatelliteProfile` mask if it has one, else
         `(None, frozenset())` (no masking - e.g. a `custom` satellite with no
         override and no profile, or a profile with no cloud-mask band like
         Sentinel-1).
     """
+    if cfg.ocm:
+        return OCM_BAND, OCM_MASK_OUT
     if cfg.cloud_mask_band is not None:
         return cfg.cloud_mask_band, frozenset(cfg.cloud_mask_out)
     try:

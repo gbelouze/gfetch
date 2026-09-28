@@ -14,7 +14,9 @@ log = logging.getLogger(__name__)
 def download(config_path: Path, satellite_key: str) -> None:
     """
     Download the assets of this job's searched items into the local cache, and write
-    the local-href items as this job's `download` -> `mosaic` hand-off file.
+    the local-href items as this job's `download` -> `mosaic` hand-off file. With
+    `ocm` set, also download OmniCloudMask's model weights, for the offline `ocm`
+    stage.
 
     Parameters
     ----------
@@ -32,9 +34,15 @@ def download(config_path: Path, satellite_key: str) -> None:
     items = list(pystac.ItemCollection.from_file(cfg.items_path))
     mask_band, mask_out = resolve_cloud_mask(cfg)
     asset_keys = resolve_bands(cfg)
-    if mask_band is not None and mask_band not in asset_keys:
+    # OmniCloudMask's band isn't a STAC asset: the `ocm` stage computes it later.
+    if not cfg.ocm and mask_band is not None and mask_band not in asset_keys:
         asset_keys.append(mask_band)
     log.debug(f"Resolved asset keys: {asset_keys}")
+
+    if cfg.ocm:
+        from gfetch.ocm import fetch_models
+
+        fetch_models(cfg.ocm_model_path)
 
     with default_bar() as progress:
         cached_items = asyncio.run(

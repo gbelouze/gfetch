@@ -1474,3 +1474,29 @@ that state was reached, and should be read chronologically, not as reference mat
     `gfetch.utils.geoparquet`, since `gfetch.gedi` imports sliderule at module
     level. Verified live: an S1 RTC `as_bands` search (14 items, 2 shards) gives
     12/7 items, 8/7 solar days, 9+3/3+4 ascending+descending per shard.
+
+- **2026-09-28** — **Added OmniCloudMask (`gfetch s2 ocm`)** as an opt-in
+  replacement for SCL cloud masking; see `claude/tech-stack.md`'s "Cloud masking:
+  OmniCloudMask" section.
+  - POC first (`poc/omnicloudmask_s2.py`, standalone): on three cached T36M* scenes,
+    SCL flagged ~40% of a Rift-lake window as cloud where it was bright lake flats
+    and escarpment, which OCM left clear (OCM's own miss there: some salt crust as
+    thin cloud). On cumulus scenes both caught the clouds, OCM adding small
+    clouds/shadows SCL missed (+10-14% of pixels vs. 1-3% SCL-only). ~3 s per
+    40 km window at 20 m, but on MPS (Apple GPU, OCM's auto-pick); no CPU timing.
+  - Decided with the user: a separate stage (so it can run on GPU nodes), enabled
+    by `ocm: true` under `s2:`. Explicit rather than "use it if present", so a
+    composite never mixes SCL- and OCM-masked items. `mosaic` refuses to run until
+    every item has a mask.
+  - No change to the `cached_items.json` hand-off (a central file concurrent `ocm`
+    tasks would race on): `<item>/ocm.tif`'s existence is the completion marker
+    (written to a temp file, then renamed), and `mosaic` adds the asset to each
+    item in memory (`gfetch.ocm.with_ocm_asset`).
+  - Thick cloud, thin cloud and shadow always masked out. No-data written as 255,
+    since OCM's own no-data value 0 is also its "clear" class.
+  - Inputs red/green/nir (B08, 10 m), averaged to 20 m; `nir` must be in `bands`
+    (validated at config load), so it also ends up in the mosaic. Compute nodes are
+    offline, so `download` fetches the weights into `ocm_model_dir` (default
+    `<output_dir>/ocm_models`): checked in OCM 1.7.1's source that `get_models`
+    doesn't touch the network when the file is already there.
+  - `omnicloudmask` (torch, timm) is an optional `ocm` extra.

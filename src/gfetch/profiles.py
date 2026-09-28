@@ -5,7 +5,15 @@ default stays overridable.
 
 from dataclasses import dataclass
 
-__all__ = ["PROFILES", "SatelliteProfile", "get_profile"]
+__all__ = [
+    "OCM_BAND",
+    "OCM_INPUT_BANDS",
+    "OCM_MASK_OUT",
+    "OCM_NODATA",
+    "PROFILES",
+    "SatelliteProfile",
+    "get_profile",
+]
 
 
 @dataclass(frozen=True)
@@ -41,6 +49,14 @@ class SatelliteProfile:
 # 3 cloud shadow, 7 unclassified (in practice largely low-probability cloud), 8/9 cloud
 # medium/high probability, 10 thin cirrus.
 _SENTINEL2_SCL_MASK_OUT = frozenset({0, 1, 3, 7, 8, 9, 10})
+
+# OmniCloudMask, an alternative Sentinel-2 cloud mask computed by `gfetch s2 ocm` into
+# the local cache, see `gfetch.ocm`. Classes: 0 clear, 1 thick cloud, 2 thin cloud,
+# 3 cloud shadow, `OCM_NODATA` no-data.
+OCM_BAND = "ocm"
+OCM_INPUT_BANDS = ("red", "green", "nir")
+OCM_NODATA = 255
+OCM_MASK_OUT = frozenset({1, 2, 3, OCM_NODATA})
 
 PROFILES: dict[str, SatelliteProfile] = {
     "sentinel-2": SatelliteProfile(

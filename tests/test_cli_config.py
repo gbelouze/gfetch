@@ -319,3 +319,33 @@ def test_resolve_source_falls_back_to_profile_default(
     cfg = load(_write_config(tmp_path / "config.yaml", **overrides), satellite_key)
 
     assert resolve_source(cfg) == expected
+
+
+_OCM_BANDS = ["red", "green", "blue", "nir"]
+
+
+def test_ocm_replaces_scl_as_cloud_mask(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path / "config.yaml", s2={"ocm": True, "bands": _OCM_BANDS})
+    cfg = load(config_path, "s2")
+
+    assert resolve_cloud_mask(cfg) == ("ocm", frozenset({1, 2, 3, 255}))
+    assert cfg.ocm_model_path == cfg.output_dir / "ocm_models"
+
+
+@pytest.mark.parametrize(
+    ("satellite_key", "section", "match"),
+    [
+        ("s1", {"bands": _OCM_BANDS}, "only applies to sentinel-2"),
+        ("s2", {"bands": ["red", "green", "blue"]}, r"needs bands \['nir'\]"),
+        ("s2", {"bands": _OCM_BANDS, "cloud_mask_band": "scl"}, "mutually exclusive"),
+    ],
+)
+def test_ocm_rejects_configs_it_cannot_apply_to(
+    tmp_path: Path, satellite_key: str, section: dict, match: str
+) -> None:
+    config_path = _write_config(
+        tmp_path / "config.yaml", **{satellite_key: {"ocm": True, **section}}
+    )
+
+    with pytest.raises(ValueError, match=match):
+        load(config_path, satellite_key)

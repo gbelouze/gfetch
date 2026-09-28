@@ -767,6 +767,27 @@ and on consolidated stores moves `spatial_ref` first in the listing).
 consolidated v3 store with bands `a` and `z`, both `grid_mapping: "spatial_ref"`;
 `gdalinfo ZARR:"store.zarr":/a` shows no CRS, while `/z` shows it (verified on GDAL 3.13.3).
 
+## Cloud masking: OmniCloudMask (added 2026-09-28)
+
+Sentinel-2 L2A's SCL misclassifies bright surfaces (salt flats, bright soil,
+escarpments) as cloud, and misses small cumulus and their shadows. OmniCloudMask
+(OCM, `omnicloudmask` on PyPI, MIT) is a CNN ensemble predicting clear / thick cloud /
+thin cloud / shadow from red, green and NIR at 10-50 m. Opt-in via `ocm: true`:
+
+- `download` also fetches the model weights (`ocm_model_dir`, default
+  `<output_dir>/ocm_models`), since compute nodes are offline. `nir` must be one of
+  the `bands`.
+- `gfetch s2 ocm` computes `<cache>/<item>/ocm.tif` per item at 20 m (no-data 255),
+  written to a temp file and renamed. Split across SLURM array tasks via
+  `--task-id`/`--n-tasks`; uses a GPU if one is visible (`--device` overrides).
+  torch's thread pool is sized to `available_cpus()`.
+- `mosaic` adds an `ocm` asset to each cached item in memory, and masks classes 1-3
+  (plus 255) instead of SCL's. It refuses to run if any item has no mask yet.
+
+Run as its own stage so it can go to GPU nodes: CPU inference cost is unmeasured
+(the only timing so far, ~3 s per 40 km window at 20 m, was on an Apple GPU).
+POC and comparison: `poc/omnicloudmask_s2.py`, `claude/tasks.md` (2026-09-28).
+
 ## Future: disk-bounded streaming download+mosaic (deferred, not designed for v1)
 
 Added 2026-09-22, from a user design discussion — **not built, not scheduled**; recorded

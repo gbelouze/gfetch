@@ -19,3 +19,5 @@ wheels/
 
 # Benchmark scratch data (downloaded imagery, not source)
 benchmark/cache/
+
+poc/out/

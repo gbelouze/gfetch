@@ -34,6 +34,11 @@ search-path = [".", "benchmark"]
 [project.scripts]
 gfetch = "gfetch.cli.main:app"
 
+[project.optional-dependencies]
+ocm = [
+    "omnicloudmask>=1.7.1",
+]
+
 [build-system]
 requires = ["uv_build>=0.8.13,<0.9.0"]
 build-backend = "uv_build"

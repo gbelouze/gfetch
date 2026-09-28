@@ -59,6 +59,11 @@ uv run gfetch coverage config.yaml   # optional, offline: items per mosaic shard
 uv run gfetch mosaic config.yaml     # compute-only: load, cloud-mask, composite, write to Zarr
 ```
 
+For Sentinel-2, `ocm: true` under `s2:` masks clouds with
+[OmniCloudMask](https://github.com/DPIRD-DMA/OmniCloudMask) instead of SCL. It needs
+`uv sync --extra ocm`, `nir` in `bands`, and a `gfetch s2 ocm config.yaml` run between
+`download` and `mosaic` (on a GPU node, ideally).
+
 `mosaic` writes one Zarr store per UTM zone the AOI spans
 (`<output_dir>/mosaic_epsg<code>.zarr`) — a country-scale AOI crossing several zones
 produces several stores, each in its own zone's native CRS, rather than one store

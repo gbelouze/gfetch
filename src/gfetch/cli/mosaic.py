@@ -56,7 +56,9 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
     unwritten one is computed and written as a whole. Safe for several concurrent invocations to
     split the work via `task_id`/`n_tasks`, since each shard is its own file and is
     assigned to exactly one task. Shards entirely outside the AOI's exact shape (e.g.
-    the country polygons) are never computed and read back as NaN.
+    the country polygons) are never computed and read back as NaN. With `ocm` set, it
+    masks with each item's OmniCloudMask mask, which must be in the local cache
+    already (see `gfetch.ocm`).
 
     Parameters
     ----------
@@ -87,6 +89,22 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
 
     items = list(pystac.ItemCollection.from_file(items_path))
     log.debug(f"Loaded {len(items)} item(s) from {items_path}")
+    if cfg.ocm:
+        if from_remote:
+            log.error(
+                "`ocm` masks are computed from the local cache, run `gfetch s2 download` first."
+            )
+            return
+        from gfetch.ocm import ocm_path, with_ocm_asset
+
+        missing = [item.id for item in items if not ocm_path(cfg.cache_dir, item.id).exists()]
+        if missing:
+            log.error(
+                f"{len(missing)}/{len(items)} item(s) have no OmniCloudMask mask yet (e.g. "
+                f"{missing[0]}), run `gfetch s2 ocm` first."
+            )
+            return
+        items = [with_ocm_asset(item, ocm_path(cfg.cache_dir, item.id)) for item in items]
     bands = resolve_bands(cfg)
     variables = resolve_output_variables(cfg)
     mask_band, mask_out = resolve_cloud_mask(cfg)

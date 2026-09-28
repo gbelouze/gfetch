@@ -183,12 +183,66 @@ def _register_raster_commands(sub_app: cyclopts.App, satellite_key: str) -> None
         clean_cmd(config, satellite_key)
 
 
+def _register_ocm_command(sub_app: cyclopts.App, satellite_key: str) -> None:
+    """
+    Register the OmniCloudMask command on a Sentinel-2 sub-app.
+
+    Parameters
+    ----------
+    sub_app : cyclopts.App
+        Sub-app to register the command on (i.e. `gfetch s2`).
+    satellite_key : str
+        Which satellite this sub-app loads from a job config. See
+        `gfetch.cli.config.load`.
+    """
+
+    @sub_app.command(name="ocm")
+    def _ocm(
+        config: Path,
+        task_id: int = 0,
+        n_tasks: int = 1,
+        device: str | None = None,
+        verbose: bool = False,
+    ) -> None:
+        """
+        Compute an OmniCloudMask cloud/shadow mask for each of a job's cached items.
+
+        Needs `ocm: true` in the config and the `ocm` extra. Run after `download`
+        and before `mosaic`, which then masks with it instead of SCL. No internet
+        access required (`download` fetches the model weights), and uses a GPU if
+        one is visible. Safe to resume after being killed, and safe to split across
+        several concurrent invocations via `task_id`/`n_tasks`.
+
+        Parameters
+        ----------
+        config : Path
+            Path to the configuration YAML file.
+        task_id : int
+            This invocation's index among `n_tasks` concurrent invocations.
+            Defaults to 0.
+        n_tasks : int
+            Total number of concurrent invocations splitting this job's items
+            between them. Defaults to 1 (no splitting).
+        device : str | None
+            Torch device, e.g. 'cuda' or 'cpu'. Defaults to None, which uses a GPU
+            if one is available.
+        verbose : bool
+            Enable verbose (DEBUG) logging. Defaults to False.
+        """
+        _setup_logging(level=logging.DEBUG if verbose else logging.INFO)
+        from gfetch.cli.ocm import ocm as ocm_cmd
+
+        ocm_cmd(config, satellite_key, task_id=task_id, n_tasks=n_tasks, device=device)
+
+
 for _satellite_key, _satellite_name in BUILTIN_SATELLITES.items():
     _sub_app = cyclopts.App(
         name=_satellite_key,
         help=f"{_satellite_name} via the raster search/download/mosaic pipeline.",
     )
     _register_raster_commands(_sub_app, _satellite_key)
+    if _satellite_name == "sentinel-2":
+        _register_ocm_command(_sub_app, _satellite_key)
     app.command(_sub_app)
 
 

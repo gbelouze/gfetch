@@ -18,6 +18,7 @@ from gfetch import countries as countries_module
 from gfetch.cli.config import Config, load
 from gfetch.cli.mosaic import mosaic as mosaic_cmd
 from gfetch.mosaic import group_by_utm_zone
+from gfetch.ocm import ocm_path
 from gfetch.write import SKIPPED_SHARDS_ATTR, region_is_written, store_is_complete
 
 # Fixed regardless of the real CRS, so every test gets an exact, hand-picked pixel grid
@@ -278,3 +279,31 @@ def test_mosaic_skips_shards_outside_the_country_polygon(
         "indices": [[0, 0], [0, 1], [1, 1]],
     }
     assert store_is_complete(path, ["red"])
+
+
+def test_mosaic_with_ocm_refuses_until_every_mask_exists(tmp_path: Path, monkeypatch) -> None:
+    cfg_path = _write_config(tmp_path / "config.yaml", ocm=True, bands=["red", "green", "nir"])
+    cfg = load(cfg_path, "s2")
+    _write_fake_items(cfg)
+    monkeypatch.setattr("gfetch.cli.mosaic.zone_geobox", _fake_zone_geobox)
+    seen: list[tuple[list[pystac.Item], object]] = []
+    fake_build = _fake_build_mosaic([])
+
+    def recording_build(zone_items, geobox, bands, *, mask_band, **kwargs):
+        seen.append((zone_items, mask_band))
+        return fake_build(zone_items, geobox, bands, **kwargs)
+
+    monkeypatch.setattr("gfetch.cli.mosaic.build_mosaic", recording_build)
+
+    mosaic_cmd(cfg_path, "s2")
+    assert seen == []
+
+    mask = ocm_path(cfg.cache_dir, "fake")
+    mask.parent.mkdir(parents=True)
+    mask.touch()
+    mosaic_cmd(cfg_path, "s2")
+
+    assert seen
+    for zone_items, mask_band in seen:
+        assert mask_band == "ocm"
+        assert [item.assets["ocm"].href for item in zone_items] == [str(mask)]

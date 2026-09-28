@@ -115,3 +115,28 @@ def test_vrt_clean_and_coverage_dispatch_with_correct_satellite_key(
         ("clean", Path("config.yaml"), "landsat8"),
         ("coverage", Path("config.yaml"), "landsat8"),
     ]
+
+
+def test_ocm_is_an_s2_only_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple] = []
+
+    def fake_ocm(
+        config_path: Path,
+        satellite_key: str,
+        *,
+        task_id: int = 0,
+        n_tasks: int = 1,
+        device: str | None = None,
+    ) -> None:
+        calls.append((config_path, satellite_key, task_id, n_tasks, device))
+
+    monkeypatch.setattr("gfetch.cli.ocm.ocm", fake_ocm)
+
+    app(
+        ["s2", "ocm", "config.yaml", "--task-id", "1", "--n-tasks", "2", "--device", "cuda"],
+        result_action="return_value",
+    )
+
+    assert calls == [(Path("config.yaml"), "s2", 1, 2, "cuda")]
+    with pytest.raises(SystemExit):
+        app(["s1", "ocm", "config.yaml"], result_action="return_value", exit_on_error=True)
