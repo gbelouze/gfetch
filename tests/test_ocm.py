@@ -7,10 +7,11 @@ import pystac
 import pytest
 import rasterio
 from affine import Affine
+from rasterio.crs import CRS
 from rasterio.transform import from_origin
 
 from gfetch import ocm as ocm_module
-from gfetch.ocm import ocm_grid, with_ocm_asset, write_ocm
+from gfetch.ocm import ocm_grid, with_ocm_asset, write_mask, write_ocms
 
 _TRANSFORM = from_origin(600000, 9500020, 10, 10)
 
@@ -69,26 +70,39 @@ def test_with_ocm_asset_derives_its_grid_from_red() -> None:
     assert "ocm" not in item.assets
 
 
-def test_write_ocm_writes_classes_with_nodata_at_20m(tmp_path: Path, monkeypatch) -> None:
-    data = np.full((8, 8), 1000, dtype="uint16")
-    data[:2, :2] = 0  # one 20 m pixel of no-data in `nir` only
-    red = _write_band(tmp_path / "red.tif", np.full((8, 8), 1000, dtype="uint16"))
-    green = _write_band(tmp_path / "green.tif", np.full((8, 8), 1000, dtype="uint16"))
-    nir = _write_band(tmp_path / "nir.tif", data)
-    item = _item({"red": red, "green": green, "nir": nir})
-    seen: list[np.ndarray] = []
+def _bands_item(tmp_path: Path, nir: np.ndarray) -> pystac.Item:
+    full = np.full(nir.shape, 1000, dtype="uint16")
+    return _item(
+        {
+            "red": _write_band(tmp_path / "red.tif", full),
+            "green": _write_band(tmp_path / "green.tif", full),
+            "nir": _write_band(tmp_path / "nir.tif", nir),
+        }
+    )
+
+
+def test_write_ocms_writes_classes_with_nodata_at_20m(tmp_path: Path, monkeypatch) -> None:
+    nir = np.full((8, 8), 1000, dtype="uint16")
+    nir[:2, :2] = 0  # one 20 m pixel of no-data in `nir` only
+    item = _bands_item(tmp_path, nir)
+    seen: list[dict] = []
 
     def predict_from_array(array: np.ndarray, **kwargs: object) -> np.ndarray:
-        seen.append(array)
+        seen.append({"shape": array.shape, **kwargs})
         return np.full((1, *array.shape[1:]), 2, dtype="uint8")
 
     fake = SimpleNamespace(predict_from_array=predict_from_array)
     monkeypatch.setattr(ocm_module, "_omnicloudmask", lambda: fake)
     path = tmp_path / "ocm.tif"
 
-    write_ocm(item, path, model_dir=tmp_path / "models")
+    done = list(
+        write_ocms([(item, path)], models=["m"], device="cpu", dtype="float32", batch_size=3)
+    )
 
-    assert seen[0].shape == (3, 4, 4)
+    assert done == [item]
+    assert seen[0]["shape"] == (3, 4, 4)
+    assert seen[0]["custom_models"] == ["m"]
+    assert seen[0]["batch_size"] == 3
     with rasterio.open(path) as src:
         assert src.nodata == 255
         assert src.res == (20, 20)
@@ -104,20 +118,32 @@ def test_write_ocm_writes_classes_with_nodata_at_20m(tmp_path: Path, monkeypatch
     ]
 
 
-def test_write_ocm_leaves_no_partial_file_on_failure(tmp_path: Path, monkeypatch) -> None:
-    bands = {
-        key: _write_band(tmp_path / f"{key}.tif", np.full((4, 4), 1000, dtype="uint16"))
-        for key in ("red", "green", "nir")
-    }
-    monkeypatch.setattr(ocm_module, "predict", lambda *a, **k: np.zeros((2, 2), dtype="uint8"))
+def test_write_ocms_yields_every_item_in_order(tmp_path: Path, monkeypatch) -> None:
+    items = []
+    for i in range(5):
+        (tmp_path / str(i)).mkdir()
+        items.append(_bands_item(tmp_path / str(i), np.full((4, 4), 1000, dtype="uint16")))
+        items[-1].id = str(i)
+    monkeypatch.setattr(
+        ocm_module, "predict", lambda bands, **k: np.zeros(bands.shape[1:], dtype="uint8")
+    )
+    jobs = [(item, tmp_path / item.id / "ocm.tif") for item in items]
 
+    done = list(write_ocms(jobs, models=[], device="cpu", dtype="float32", batch_size=1))
+
+    assert [item.id for item in done] == ["0", "1", "2", "3", "4"]
+    assert all(path.exists() for _, path in jobs)
+
+
+def test_write_mask_leaves_no_partial_file_on_failure(tmp_path: Path, monkeypatch) -> None:
     def failing_replace(src: object, dst: object) -> None:
         raise OSError("disk full")
 
     monkeypatch.setattr(ocm_module.os, "replace", failing_replace)
-    path = tmp_path / "ocm.tif"
 
     with pytest.raises(OSError, match="disk full"):
-        write_ocm(_item(bands), path, model_dir=tmp_path)
+        write_mask(
+            tmp_path / "ocm.tif", np.zeros((2, 2), dtype="uint8"), _TRANSFORM, CRS.from_epsg(32736)
+        )
 
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["green.tif", "nir.tif", "red.tif"]
+    assert list(tmp_path.iterdir()) == []

@@ -202,6 +202,8 @@ def _register_ocm_command(sub_app: cyclopts.App, satellite_key: str) -> None:
         task_id: int = 0,
         n_tasks: int = 1,
         device: str | None = None,
+        dtype: str | None = None,
+        batch_size: int = 8,
         verbose: bool = False,
     ) -> None:
         """
@@ -226,13 +228,27 @@ def _register_ocm_command(sub_app: cyclopts.App, satellite_key: str) -> None:
         device : str | None
             Torch device, e.g. 'cuda' or 'cpu'. Defaults to None, which uses a GPU
             if one is available.
+        dtype : str | None
+            Inference dtype, e.g. 'float32' or 'float16'. Defaults to None, which
+            uses 'float16' on a GPU and 'float32' otherwise.
+        batch_size : int
+            Number of 1000x1000 patches per forward pass, bounded by GPU memory.
+            Defaults to 8.
         verbose : bool
             Enable verbose (DEBUG) logging. Defaults to False.
         """
         _setup_logging(level=logging.DEBUG if verbose else logging.INFO)
         from gfetch.cli.ocm import ocm as ocm_cmd
 
-        ocm_cmd(config, satellite_key, task_id=task_id, n_tasks=n_tasks, device=device)
+        ocm_cmd(
+            config,
+            satellite_key,
+            task_id=task_id,
+            n_tasks=n_tasks,
+            device=device,
+            dtype=dtype,
+            batch_size=batch_size,
+        )
 
 
 for _satellite_key, _satellite_name in BUILTIN_SATELLITES.items():

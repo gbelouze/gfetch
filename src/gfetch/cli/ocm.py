@@ -4,7 +4,7 @@ from pathlib import Path
 import pystac
 
 from gfetch.cli.config import load
-from gfetch.ocm import ocm_path, set_num_threads, write_ocm
+from gfetch.ocm import load_models, ocm_path, resolve_device, set_num_threads, write_ocms
 from gfetch.utils.progress import count_bar, temporary_task
 from gfetch.utils.system import available_cpus
 
@@ -18,6 +18,8 @@ def ocm(
     task_id: int = 0,
     n_tasks: int = 1,
     device: str | None = None,
+    dtype: str | None = None,
+    batch_size: int = 8,
 ) -> None:
     """
     Compute an OmniCloudMask mask for each of this job's cached items.
@@ -40,6 +42,12 @@ def ocm(
     device : str | None
         Torch device, e.g. 'cuda' or 'cpu'. Defaults to None, which uses a GPU if
         one is available.
+    dtype : str | None
+        Inference dtype, e.g. 'float32' or 'float16'. Defaults to None, which uses
+        'float16' on a GPU and 'float32' otherwise.
+    batch_size : int
+        Number of 1000x1000 patches per forward pass, bounded by GPU memory.
+        Defaults to 8.
     """
     cfg = load(config_path, satellite_key)
     if not cfg.ocm:
@@ -54,16 +62,23 @@ def ocm(
     items = list(pystac.ItemCollection.from_file(cfg.cached_items_path))
     my_items = items[task_id::n_tasks]
     log.info(f"Task {task_id}/{n_tasks}: {len(my_items)}/{len(items)} item(s) assigned")
+    jobs = [(item, ocm_path(cfg.cache_dir, item.id)) for item in my_items]
+    pending = [(item, path) for item, path in jobs if not path.exists()]
+    log.info(f"{len(jobs) - len(pending)} mask(s) already computed, {len(pending)} to go")
 
-    with (
-        count_bar() as progress,
-        temporary_task(progress, "Computing OmniCloudMask", total=len(my_items)) as task,
-    ):
-        for item in my_items:
-            path = ocm_path(cfg.cache_dir, item.id)
-            if path.exists():
-                log.debug(f"{item.id}: mask already computed, skipping")
-            else:
-                write_ocm(item, path, model_dir=cfg.ocm_model_path, device=device)
-            progress.advance(task)
+    if pending:
+        device = resolve_device(device)
+        if dtype is None:
+            dtype = "float16" if device.startswith("cuda") else "float32"
+        log.info(f"Running OmniCloudMask on {device} in {dtype}, batch size {batch_size}")
+        models = load_models(cfg.ocm_model_path, device=device, dtype=dtype)
+        with (
+            count_bar() as progress,
+            temporary_task(progress, "Computing OmniCloudMask", total=len(pending)) as task,
+        ):
+            for item in write_ocms(
+                pending, models=models, device=device, dtype=dtype, batch_size=batch_size
+            ):
+                log.debug(f"{item.id}: mask written")
+                progress.advance(task)
     log.info(f"OmniCloudMask masks ready for {len(my_items)} item(s)")

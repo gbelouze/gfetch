@@ -35,13 +35,22 @@ def _write_cached_items(cfg: Config, ids: list[str]) -> None:
     pystac.ItemCollection(items).save_object(str(cfg.cached_items_path))
 
 
-def _fake_write_ocm(written: list[str]):
-    def write(item: pystac.Item, path: Path, **kwargs: object) -> None:
-        written.append(item.id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
+def _fake_write_ocms(written: list[str]):
+    def write(jobs: list[tuple[pystac.Item, Path]], **kwargs: object):
+        for item, path in jobs:
+            written.append(item.id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+            yield item
 
     return write
+
+
+def _patch_ocm(monkeypatch, written: list[str]) -> None:
+    monkeypatch.setattr("gfetch.cli.ocm.write_ocms", _fake_write_ocms(written))
+    monkeypatch.setattr("gfetch.cli.ocm.load_models", lambda *a, **k: [])
+    monkeypatch.setattr("gfetch.cli.ocm.resolve_device", lambda device: "cpu")
+    monkeypatch.setattr("gfetch.cli.ocm.set_num_threads", lambda n: None)
 
 
 def test_ocm_skips_existing_masks_and_splits_items_across_tasks(
@@ -54,8 +63,7 @@ def test_ocm_skips_existing_masks_and_splits_items_across_tasks(
     done.parent.mkdir(parents=True)
     done.touch()
     written: list[str] = []
-    monkeypatch.setattr("gfetch.cli.ocm.write_ocm", _fake_write_ocm(written))
-    monkeypatch.setattr("gfetch.cli.ocm.set_num_threads", lambda n: None)
+    _patch_ocm(monkeypatch, written)
 
     ocm_cmd(cfg_path, "s2", task_id=0, n_tasks=2)
     assert written == ["a"]
@@ -68,7 +76,7 @@ def test_ocm_does_nothing_unless_enabled(tmp_path: Path, monkeypatch) -> None:
     cfg_path = _write_config(tmp_path / "config.yaml", ocm=False)
     _write_cached_items(load(cfg_path, "s2"), ["a"])
     written: list[str] = []
-    monkeypatch.setattr("gfetch.cli.ocm.write_ocm", _fake_write_ocm(written))
+    _patch_ocm(monkeypatch, written)
 
     ocm_cmd(cfg_path, "s2")
 

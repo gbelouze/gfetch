@@ -127,16 +127,21 @@ def test_ocm_is_an_s2_only_command(monkeypatch: pytest.MonkeyPatch) -> None:
         task_id: int = 0,
         n_tasks: int = 1,
         device: str | None = None,
+        dtype: str | None = None,
+        batch_size: int = 8,
     ) -> None:
-        calls.append((config_path, satellite_key, task_id, n_tasks, device))
+        calls.append((config_path, satellite_key, task_id, n_tasks, device, dtype, batch_size))
 
     monkeypatch.setattr("gfetch.cli.ocm.ocm", fake_ocm)
 
     app(
-        ["s2", "ocm", "config.yaml", "--task-id", "1", "--n-tasks", "2", "--device", "cuda"],
+        [
+            *("s2", "ocm", "config.yaml", "--task-id", "1", "--n-tasks", "2"),
+            *("--device", "cuda", "--dtype", "float16", "--batch-size", "8"),
+        ],
         result_action="return_value",
     )
 
-    assert calls == [(Path("config.yaml"), "s2", 1, 2, "cuda")]
+    assert calls == [(Path("config.yaml"), "s2", 1, 2, "cuda", "float16", 8)]
     with pytest.raises(SystemExit):
         app(["s1", "ocm", "config.yaml"], result_action="return_value", exit_on_error=True)

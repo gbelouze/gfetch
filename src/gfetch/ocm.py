@@ -10,6 +10,12 @@ import copy
 import logging
 import os
 import tempfile
+import time
+from collections import deque
+from collections.abc import Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +23,7 @@ import numpy as np
 import pystac
 import rasterio
 from affine import Affine
+from rasterio.crs import CRS
 from rasterio.enums import Resampling
 
 from gfetch.profiles import OCM_BAND, OCM_INPUT_BANDS, OCM_NODATA
@@ -25,13 +32,18 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "OCM_RESOLUTION",
+    "OcmInput",
     "fetch_models",
+    "load_models",
     "ocm_grid",
     "ocm_path",
     "predict",
+    "read_input",
+    "resolve_device",
     "set_num_threads",
     "with_ocm_asset",
-    "write_ocm",
+    "write_mask",
+    "write_ocms",
 ]
 
 # OmniCloudMask is trained on 10-50 m imagery; 20 m matches SCL's own grid and costs
@@ -168,65 +180,128 @@ def set_num_threads(n: int) -> None:
     torch.set_num_threads(n)
 
 
-def predict(
-    red: np.ndarray,
-    green: np.ndarray,
-    nir: np.ndarray,
-    *,
-    model_dir: Path,
-    device: str | None = None,
-) -> np.ndarray:
+def resolve_device(device: str | None) -> str:
     """
-    Predict an OmniCloudMask cloud/shadow mask from red, green and NIR reflectances.
+    Pick the torch device inference runs on.
 
     Parameters
     ----------
-    red : np.ndarray
-        Red band, 2D, with 0 as no-data.
-    green : np.ndarray
-        Green band, same shape as `red`.
-    nir : np.ndarray
-        NIR band, same shape as `red`.
-    model_dir : Path
-        Directory holding the model weights, see `fetch_models`. Weights missing
-        from it are downloaded, which needs internet access.
     device : str | None
         Torch device, e.g. 'cuda' or 'cpu'. Defaults to None, which uses a GPU if
         one is available.
 
     Returns
     -------
+    str
+        `device` if given, else 'cuda' when available, else 'cpu'.
+    """
+    if device is not None:
+        return device
+    _omnicloudmask()
+    import torch  # pyrefly: ignore[missing-import]
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def load_models(model_dir: Path, *, device: str, dtype: str) -> list[Any]:
+    """
+    Load OmniCloudMask's model ensemble onto `device`, once for a whole run.
+
+    Parameters
+    ----------
+    model_dir : Path
+        Directory holding the weights, see `fetch_models`. Weights missing from it
+        are downloaded, which needs internet access.
+    device : str
+        Torch device, see `resolve_device`.
+    dtype : str
+        Inference dtype, e.g. 'float32' or 'float16'.
+
+    Returns
+    -------
+    list[Any]
+        The ensemble's torch modules, to pass to `predict`.
+    """
+    _omnicloudmask()
+    import torch  # pyrefly: ignore[missing-import]
+    from omnicloudmask.cloud_mask import collect_models  # pyrefly: ignore[missing-import]
+
+    if device.startswith("cuda"):
+        # Every batch has the same patch shape, so cuDNN's per-shape autotuning pays off.
+        torch.backends.cudnn.benchmark = True
+    return collect_models(
+        custom_models=None,
+        inference_device=torch.device(device),
+        inference_dtype=getattr(torch, dtype),
+        source="hugging_face",
+        destination_model_dir=model_dir,
+    )
+
+
+def predict(
+    bands: np.ndarray,
+    *,
+    models: list[Any],
+    device: str,
+    dtype: str,
+    batch_size: int,
+) -> np.ndarray:
+    """
+    Predict an OmniCloudMask cloud/shadow mask from red, green and NIR reflectances.
+
+    Parameters
+    ----------
+    bands : np.ndarray
+        Red, green and NIR bands stacked as `(3, height, width)`, with 0 as no-data.
+    models : list[Any]
+        Model ensemble, see `load_models`.
+    device : str
+        Torch device the models live on.
+    dtype : str
+        Inference dtype the models were loaded with.
+    batch_size : int
+        Number of patches per forward pass.
+
+    Returns
+    -------
     np.ndarray
-        `uint8` classes, same shape as `red`: 0 clear, 1 thick cloud, 2 thin cloud,
+        `uint8` classes, `(height, width)`: 0 clear, 1 thick cloud, 2 thin cloud,
         3 cloud shadow, `OCM_NODATA` wherever any input band is 0.
     """
     ocm = _omnicloudmask()
     classes = ocm.predict_from_array(
-        np.stack([red, green, nir]).astype(np.float32),
+        bands.astype(np.float32),
+        custom_models=models,
         inference_device=device,
-        destination_model_dir=model_dir,
+        inference_dtype=dtype,
+        batch_size=batch_size,
     )[0].astype(np.uint8)
-    classes[(red == 0) | (green == 0) | (nir == 0)] = OCM_NODATA
+    classes[(bands == 0).any(axis=0)] = OCM_NODATA
     return classes
 
 
-def write_ocm(item: pystac.Item, path: Path, *, model_dir: Path, device: str | None = None) -> None:
-    """
-    Compute a cached item's OmniCloudMask mask and write it to `path`, atomically.
+@dataclass(frozen=True)
+class OcmInput:
+    """An item's `OCM_INPUT_BANDS`, read at `OCM_RESOLUTION`."""
 
-    The mask is computed at `OCM_RESOLUTION`, from the item's `OCM_INPUT_BANDS`
-    assets averaged down to that resolution.
+    bands: np.ndarray
+    transform: Affine
+    crs: CRS
+
+
+def read_input(item: pystac.Item) -> OcmInput:
+    """
+    Read a cached item's `OCM_INPUT_BANDS`, averaged down to `OCM_RESOLUTION`.
 
     Parameters
     ----------
     item : pystac.Item
         Cached item whose `OCM_INPUT_BANDS` assets point at local files.
-    path : Path
-        Output GeoTIFF, see `ocm_path`.
-    model_dir : Path
-        Directory holding the model weights, see `fetch_models`.
-    device : str | None
-        Torch device, see `predict`. Defaults to None.
+
+    Returns
+    -------
+    OcmInput
+        The stacked bands and their grid.
     """
     hrefs = [item.assets[band].get_absolute_href() for band in OCM_INPUT_BANDS]
     with rasterio.open(hrefs[0]) as src:
@@ -236,8 +311,24 @@ def write_ocm(item: pystac.Item, path: Path, *, model_dir: Path, device: str | N
     for href in hrefs:
         with rasterio.open(href) as src:
             bands.append(src.read(1, out_shape=shape, resampling=Resampling.average))
-    classes = predict(*bands, model_dir=model_dir, device=device)
+    return OcmInput(np.stack(bands), transform, crs)
 
+
+def write_mask(path: Path, classes: np.ndarray, transform: Affine, crs: CRS) -> None:
+    """
+    Write a mask to `path`, atomically.
+
+    Parameters
+    ----------
+    path : Path
+        Output GeoTIFF, see `ocm_path`.
+    classes : np.ndarray
+        Mask, see `predict`.
+    transform : Affine
+        The mask's affine transform.
+    crs : CRS
+        The mask's CRS.
+    """
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}-", suffix=".tif")
     os.close(fd)
     try:
@@ -245,8 +336,8 @@ def write_ocm(item: pystac.Item, path: Path, *, model_dir: Path, device: str | N
             tmp,
             "w",
             driver="GTiff",
-            height=shape[0],
-            width=shape[1],
+            height=classes.shape[0],
+            width=classes.shape[1],
             count=1,
             dtype="uint8",
             nodata=OCM_NODATA,
@@ -262,4 +353,71 @@ def write_ocm(item: pystac.Item, path: Path, *, model_dir: Path, device: str | N
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
-    log.debug(f"{item.id}: wrote {path}")
+
+
+def write_ocms(
+    jobs: Iterable[tuple[pystac.Item, Path]],
+    *,
+    models: list[Any],
+    device: str,
+    dtype: str,
+    batch_size: int,
+    prefetch: int = 2,
+) -> Iterator[pystac.Item]:
+    """
+    Compute and write each item's mask, overlapping I/O with inference.
+
+    Up to `prefetch` items are read in background threads while the current one is
+    on the GPU, and each mask is written in a background thread too: reading and
+    writing GeoTIFFs mostly runs in GDAL, which releases the GIL.
+
+    Parameters
+    ----------
+    jobs : Iterable[tuple[pystac.Item, Path]]
+        Cached items, each with its output path (see `ocm_path`).
+    models : list[Any]
+        Model ensemble, see `load_models`.
+    device : str
+        Torch device the models live on.
+    dtype : str
+        Inference dtype the models were loaded with.
+    batch_size : int
+        Number of patches per forward pass.
+    prefetch : int
+        Number of items read ahead. Defaults to 2.
+
+    Yields
+    ------
+    pystac.Item
+        Each item, once its mask is written.
+    """
+    jobs = iter(jobs)
+    with (
+        ThreadPoolExecutor(max_workers=prefetch) as readers,
+        ThreadPoolExecutor(max_workers=1) as writer,
+    ):
+        reads: deque[tuple[pystac.Item, Path, Future[OcmInput]]] = deque(
+            (item, path, readers.submit(read_input, item)) for item, path in islice(jobs, prefetch)
+        )
+        written: tuple[pystac.Item, Future[None]] | None = None
+        while reads:
+            item, path, read = reads.popleft()
+            for next_item, next_path in islice(jobs, 1):
+                reads.append((next_item, next_path, readers.submit(read_input, next_item)))
+            start = time.perf_counter()
+            data = read.result()
+            waited = time.perf_counter() - start
+            classes = predict(
+                data.bands, models=models, device=device, dtype=dtype, batch_size=batch_size
+            )
+            log.debug(
+                f"{item.id}: waited {waited:.1f}s on reading, "
+                f"predicted in {time.perf_counter() - start - waited:.1f}s"
+            )
+            if written is not None:
+                written[1].result()
+                yield written[0]
+            written = (item, writer.submit(write_mask, path, classes, data.transform, data.crs))
+        if written is not None:
+            written[1].result()
+            yield written[0]
