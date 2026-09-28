@@ -1500,3 +1500,12 @@ that state was reached, and should be read chronologically, not as reference mat
     `<output_dir>/ocm_models`): checked in OCM 1.7.1's source that `get_models`
     doesn't touch the network when the file is already there.
   - `omnicloudmask` (torch, timm) is an optional `ocm` extra.
+
+- **2026-09-28** — **Found gfetch's store layout too slow for training reads**; see
+  `claude/tech-stack.md`'s "Training reads: stacked bands, larger chunks" section.
+  - sprout's dataloader was the bottleneck of training on gfetch stores: a 384 px crop
+    over 16 bands makes 784 chunk requests with 64 px chunks, one array per band.
+  - Copying 10% of the 2020 Mozambique/Tanzania stores into one `(band, y, x)` array
+    per store with 256 px chunks cut the read from 339 ms to 60 ms per sample on Jean
+    Zay; training steps went from 1.02 s to 0.36 s (with other, sprout-side fixes).
+  - sprout already reads that layout. Next: write it from `mosaic`.

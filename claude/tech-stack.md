@@ -788,6 +788,50 @@ Run as its own stage so it can go to GPU nodes: CPU inference cost is unmeasured
 (the only timing so far, ~3 s per 40 km window at 20 m, was on an Apple GPU).
 POC and comparison: `poc/omnicloudmask_s2.py`, `claude/tasks.md` (2026-09-28).
 
+## Training reads: stacked bands, larger chunks (added 2026-09-28)
+
+sprout's `ZarrDataModule` trains on gfetch stores directly: each sample reads a
+chunk-aligned window around a random crop, whose side is the smallest multiple of the
+chunk size strictly larger than the crop. With gfetch's defaults (64x64 chunks, one
+`(y, x)` array per band, shards of 128 chunks) and a 384 px crop over s1 + s2 (4 + 12
+bands), a sample reads a 448 px window: 49 chunks per band, **784 chunk requests per
+sample**. Their count, not their bytes, is the cost: each is a separate byte-range read
+of a shard file plus a zstd decode, and Lustre adds latency to every read.
+
+Measured on Jean Zay (Lustre, V100, batch 12, 8 dataloader workers on 10 CPUs), one
+sample read in a single process (`scripts/bench_zarr_loader.py` in the `jz` repo):
+
+| layout | zarr read | whole sample | training step (profiler) |
+|---|---|---|---|
+| gfetch default: 64 px chunks, one array per band | 339 ms | 420 ms | 1.02 s, 0.32 s of it waiting for data |
+| one `(band, y, x)` array per store, `(n_bands, 256, 256)` chunks, `(n_bands, 4096, 4096)` shards | 60 ms | 127 ms | 0.36 s, 13 ms waiting for data |
+
+The GPU is now the limit. On a local SSD the same change takes the read from 121 ms to
+16 ms, so the per-request overhead is not only Lustre's.
+
+The stacked layout as sprout reads it (both layouts are accepted, bands being
+addressed by name either way):
+
+- one float32 array per store (any name), `dimension_names` `("band", "y", "x")`, whose
+  `band_names` attribute lists the band of each index, e.g. `["vv_ascending", ...]`;
+- chunks spanning all bands, so that a window is one request per spatial chunk;
+- `grid_mapping`, `x`/`y`, `spatial_ref` unchanged; `gfetch:skipped_shards` still indexes
+  the `("y", "x")` shard grid, a shard spanning all bands.
+
+Stores in this layout were so far produced by copying gfetch output
+(`scripts/migrate_zarr_stacked.py` in the `jz` repo, which can also copy a random
+fraction of the shards). **Open questions for writing it from `mosaic`:**
+
+- The write unit becomes a shard of every band at once: `4 * n_bands * shard**2` bytes,
+  1 GB for 12 bands at 4096 px, 4 GB at gfetch's current 8192 px shards. Bands are
+  currently composited and written independently.
+- Chunk size is a trade-off with the crop size of the consumer: 256 px chunks make a
+  384 px crop read a 512 px window (1.8x the crop's pixels, still far cheaper than
+  49 small chunks per band). It should stay configurable.
+- Band names: sprout reads the `band_names` attribute. xarray's convention would be a
+  string `band` coordinate variable; writing both would be the safe option.
+- GDAL/QGIS reading of a 3D array (as a multi-band raster, or not) is unverified.
+
 ## Future: disk-bounded streaming download+mosaic (deferred, not designed for v1)
 
 Added 2026-09-22, from a user design discussion — **not built, not scheduled**; recorded
