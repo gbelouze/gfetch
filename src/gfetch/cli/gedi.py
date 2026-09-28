@@ -45,9 +45,11 @@ def gedi(config_path: Path, product: str) -> None:
     Fetch one GEDI product's footprints matching a configuration's AOI/time range
     and write them to GeoParquet.
 
-    Resumable: each tile's footprints are saved under `<output>.tiles/` as soon as
-    they're fetched, and a rerun reuses them. That directory is removed once the
-    output is written.
+    Does nothing if the output already exists: it's written atomically, so its
+    existence means a previous run completed. Delete it to refetch, e.g. after
+    changing the config. Resumable otherwise: each tile's footprints are saved under
+    `<output>.tiles/` as soon as they're fetched, and a rerun reuses them. That
+    directory is removed once the output is written.
 
     Parameters
     ----------
@@ -57,6 +59,9 @@ def gedi(config_path: Path, product: str) -> None:
         `'l2a'` or `'l4a'`, read from the config's `gedi_<product>:` section.
     """
     cfg = load(config_path, product)
+    if cfg.output.exists():
+        log.info(f"{cfg.output} already exists, skipping; delete it to refetch")
+        return
 
     start = cfg.time_range.start if cfg.time_range is not None else None
     end = cfg.time_range.end if cfg.time_range is not None else None

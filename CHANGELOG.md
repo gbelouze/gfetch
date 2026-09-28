@@ -50,6 +50,7 @@ Each release can have sections: "Added", "Changed", "Deprecated", "Removed", "Fi
 
 ### Changed
 
+- `gfetch gedi l2a|l4a` does nothing when its output parquet already exists (written atomically, so it's complete); delete it to refetch.
 - `gfetch s2 ocm` loads the OmniCloudMask models once per run instead of once per item, runs batched inference (`--batch-size`, default 8) in float16 on GPU (`--dtype`, float32 on CPU), and reads the next items' bands and writes finished masks in background threads while the GPU works. `--verbose` logs, per item, the time spent waiting on reads and on prediction.
 - `gfetch s1` defaults to Planetary Computer's terrain-corrected `sentinel-1-rtc` (float32 backscatter) instead of Earth Search's `sentinel-1-grd` (uint16 amplitude), whose geolocation is off by up to several hundred meters over relief. `source: planetary-computer` now always resolves Sentinel-1 to RTC; `source: earthsearch` still gives GRD. `source` now defaults per satellite (`gfetch.profiles.SatelliteProfile.default_source`, via `gfetch.cli.config.resolve_source`) when a config sets none; a top-level `source:` still applies to every satellite.
 - `patch_chunks` is removed in favour of `shard_factor`: a config still setting it fails to load. `shard_factor: 1` keeps an unsharded store, compatible with stores written before.

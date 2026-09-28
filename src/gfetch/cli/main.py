@@ -446,6 +446,8 @@ def _gedi_l2a(config: Path, verbose: bool = False) -> None:
     Fetch GEDI L2A (elevation, relative height) footprints matching a
     configuration's AOI/time range, from its `gedi_l2a:` section.
 
+    Skips if the output already exists; delete it to refetch.
+
     Parameters
     ----------
     config : Path
@@ -464,6 +466,8 @@ def _gedi_l4a(config: Path, verbose: bool = False) -> None:
     """
     Fetch GEDI L4A (aboveground biomass density) footprints matching a
     configuration's AOI/time range, from its `gedi_l4a:` section.
+
+    Skips if the output already exists; delete it to refetch.
 
     Parameters
     ----------

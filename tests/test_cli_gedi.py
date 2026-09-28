@@ -62,6 +62,19 @@ def test_gedi_cmd_passes_config_to_fetch(tmp_path: Path, monkeypatch: pytest.Mon
     assert not captured["tile_dir"].exists()
 
 
+def test_gedi_cmd_skips_existing_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(*args: object, **kwargs: object) -> gpd.GeoDataFrame:
+        raise AssertionError("should not fetch")
+
+    monkeypatch.setattr(gedi_module, "fetch_gedi_l2a", fail)
+    config_path = _write_config(tmp_path / "config.yaml")
+    (tmp_path / "l2a.parquet").write_bytes(b"previous run")
+
+    gedi_cmd(config_path, "l2a")
+
+    assert (tmp_path / "l2a.parquet").read_bytes() == b"previous run"
+
+
 def test_gedi_cmd_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     captured = {}
 
