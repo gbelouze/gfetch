@@ -345,6 +345,17 @@ class Config:
         """
         return self.output_dir / "cached_items.json"
 
+    @property
+    def coverage_path(self) -> Path:
+        """
+        Returns
+        -------
+        Path
+            GeoParquet written by the `coverage` stage: the item counts per mosaic
+            shard.
+        """
+        return self.output_dir / "coverage.parquet"
+
     def zarr_path(self, crs: CRS) -> Path:
         """
         Output Zarr store path for one UTM zone's mosaic, written by the `write`

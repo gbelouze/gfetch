@@ -55,6 +55,7 @@ uv run pre-commit install
 uv run gfetch init config.yaml   # scaffold a config template, then edit its AOI/time range
 uv run gfetch search config.yaml     # internet-connected: find matching STAC items
 uv run gfetch download config.yaml   # internet-connected: download assets to a local cache
+uv run gfetch coverage config.yaml   # optional, offline: items per mosaic shard, to GeoParquet
 uv run gfetch mosaic config.yaml     # compute-only: load, cloud-mask, composite, write to Zarr
 ```
 

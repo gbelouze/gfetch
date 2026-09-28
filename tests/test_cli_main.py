@@ -82,7 +82,7 @@ def test_gedi_commands_dispatch_with_correct_product(monkeypatch: pytest.MonkeyP
     assert calls == [(Path("config.yaml"), "l2a"), (Path("config.yaml"), "l4a")]
 
 
-def test_vrt_and_clean_dispatch_with_correct_satellite_key(
+def test_vrt_clean_and_coverage_dispatch_with_correct_satellite_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple] = []
@@ -93,17 +93,25 @@ def test_vrt_and_clean_dispatch_with_correct_satellite_key(
     def fake_clean(config_path: Path, satellite_key: str) -> None:
         calls.append(("clean", config_path, satellite_key))
 
+    def fake_coverage(config_path: Path, satellite_key: str) -> None:
+        calls.append(("coverage", config_path, satellite_key))
+
     monkeypatch.setattr("gfetch.cli.finalize.vrt", fake_vrt)
     monkeypatch.setattr("gfetch.cli.finalize.clean", fake_clean)
+    monkeypatch.setattr("gfetch.cli.coverage.coverage", fake_coverage)
 
     app(["s2", "vrt", "config.yaml"], result_action="return_value")
     app(["s1", "clean", "config.yaml"], result_action="return_value")
+    app(["s1", "coverage", "config.yaml"], result_action="return_value")
     app(["custom", "vrt", "landsat8", "config.yaml"], result_action="return_value")
     app(["custom", "clean", "landsat8", "config.yaml"], result_action="return_value")
+    app(["custom", "coverage", "landsat8", "config.yaml"], result_action="return_value")
 
     assert calls == [
         ("vrt", Path("config.yaml"), "s2"),
         ("clean", Path("config.yaml"), "s1"),
+        ("coverage", Path("config.yaml"), "s1"),
         ("vrt", Path("config.yaml"), "landsat8"),
         ("clean", Path("config.yaml"), "landsat8"),
+        ("coverage", Path("config.yaml"), "landsat8"),
     ]

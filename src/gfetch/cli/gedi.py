@@ -8,8 +8,8 @@ from gfetch.gedi import (
     GEDI_L4A_DEFAULT_FIELDS,
     fetch_gedi_l2a,
     fetch_gedi_l4a,
-    write_geoparquet,
 )
+from gfetch.utils.geoparquet import write_geoparquet
 from gfetch.utils.progress import count_bar
 
 log = logging.getLogger(__name__)

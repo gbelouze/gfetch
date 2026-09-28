@@ -1098,6 +1098,56 @@ decisions below) captured in `claude/tasks.md`'s dated entry, not repeated here.
   bypassing `source.collection()`). Full fast suite (107 tests) and
   `pre-commit run --all-files` pass.
 
+## `coverage` stage: per-shard item counts (added 2026-09-27)
+
+`gfetch <satellite> coverage <config>` (and `gfetch custom coverage <name> <config>`)
+writes `output_dir / "coverage.parquet"`: one GeoParquet row per mosaic shard, saying
+how many items `mosaic` will composite there. It's for information only: it shows
+sparse or empty shards (e.g. an orbit state with no passes) before the mosaic compute
+is spent. It needs only `items.json`, so it runs offline straight after `search`,
+before or after `download`. Single-process, no `task_id`/`n_tasks`.
+
+**Shard grid: second source of truth, on purpose.** `mosaic` gets its shards from
+the Zarr store (`write_regions`), which only exists after `prepare_template` has
+built a mosaic graph over the whole zone. `coverage` recomputes the grid instead,
+from `zone_geobox` + `resolve_chunks`/`resolve_shards`: a regular tiling of the
+geobox from pixel (0, 0), edge shards clipped (same as `_storage_units` on a store
+whose shape is the geobox's). If the two ever disagree, `coverage` is slightly off,
+which is acceptable for an informational output. `mosaic` keeps relying on the
+store. `tests/test_coverage.py` checks `shard_regions` against `write_regions`,
+sharded and unsharded.
+
+**Per-shard item selection is shared with `mosaic`.** The footprint test
+lives in `gfetch.mosaic.FootprintIndex` (a shapely `STRtree` over item footprints,
+built once per zone by `coverage`, once per shard by `mosaic`), without the
+first-item fallback. `mosaic`'s `_items_intersecting` applies the fallback on top,
+and `coverage` reports 0 for such a shard. Items are first grouped by
+`group_by_utm_zone`, as in `mosaic`. `FootprintIndex` returns items in their
+original order, since odc-stac fuses same-group items in the order it's given them.
+
+**Columns** (all counts per shard, after the footprint test):
+
+- `n_items`: raw STAC items.
+- `n_timesteps`: length of the time axis odc-stac builds with
+  `groupby="solar_day"`, which is what drives a shard's memory. odc-stac groups by
+  `(nominal_datetime + int(lon / 15) h).date()`, where `nominal_datetime` is
+  `datetime`, else `start_datetime`, else `end_datetime`. When a geobox is given,
+  `lon` is the **geobox's** centroid longitude (the shard's, as `mosaic` loads per
+  shard), not each item's (checked in `odc/stac/_stac_load.py` and `model.py`,
+  odc-stac as installed 2026-09-27). `coverage` recomputes this from item
+  properties, without calling odc-stac's private helpers.
+- `n_ascending`, `n_descending`: items per `sat:orbit_state`, only when the job's
+  `orbit_state` setting splits orbit states into separate bands. A 0 means that
+  band is all-NaN on the shard.
+- `epsg`, `y`, `x`: the shard's zone and pixel offsets, as in `mosaic`'s log labels
+  (`EPSG:32633 shard (y=0, x=8192)`), so a row can be traced to its log lines.
+- `skipped`: True for shards outside the AOI's exact shape (`outside_aoi`), which
+  `mosaic` never computes. They're kept in the file, flagged, so it shows the full
+  grid.
+- `geometry`: the shard's extent, in EPSG:4326, for all zones in one file.
+
+Valid-pixel counts after cloud masking are out of scope: they need pixel reads.
+
 ## Explicitly rejected dependencies
 
 | Library/service | Reason |

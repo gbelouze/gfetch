@@ -1457,3 +1457,20 @@ that state was reached, and should be read chronologically, not as reference mat
     applies to every satellite, so a config with `source: earthsearch` at the top
     still gets GRD for `s1`. PC's `sentinel-1` now maps to RTC, so PC GRD is only
     reachable through a `custom:` section.
+
+- **2026-09-27** — **Added `gfetch <satellite> coverage`**; see
+  `claude/tech-stack.md`'s "`coverage` stage" section for the full design.
+  - Writes a single GeoParquet (EPSG:4326) with one row per shard, holding the
+    item counts `mosaic` will use: `n_items`, `n_timesteps` (solar-day groups, the
+    user's main target), and `n_ascending`/`n_descending` when orbit states are
+    split. Shards outside the AOI shape are kept, flagged `skipped`.
+  - The shard grid is recomputed from geobox + shard size rather than read from the
+    Zarr store, since the store only exists after an expensive `prepare_template`.
+    Accepted as a second source of truth because the output is informational;
+    `mosaic` keeps relying on the store.
+  - Checked in odc-stac's source: `solar_day` offsets by the loaded geobox's
+    centroid longitude, not each item's, so solar-day counts are per shard.
+  - Built the same day. `write_geoparquet` moved from `gfetch.gedi` to
+    `gfetch.utils.geoparquet`, since `gfetch.gedi` imports sliderule at module
+    level. Verified live: an S1 RTC `as_bands` search (14 items, 2 shards) gives
+    12/7 items, 8/7 solar days, 9+3/3+4 ascending+descending per shard.

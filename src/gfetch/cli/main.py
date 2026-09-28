@@ -40,7 +40,7 @@ def init(output: Path | None = None, force: bool = False) -> None:
 
 def _register_raster_commands(sub_app: cyclopts.App, satellite_key: str) -> None:
     """
-    Register `search`/`download`/`mosaic` on a built-in satellite's sub-app.
+    Register the raster pipeline's commands on a built-in satellite's sub-app.
 
     Parameters
     ----------
@@ -90,6 +90,27 @@ def _register_raster_commands(sub_app: cyclopts.App, satellite_key: str) -> None
         from gfetch.cli.download import download as download_cmd
 
         download_cmd(config, satellite_key)
+
+    @sub_app.command(name="coverage")
+    def _coverage(config: Path, verbose: bool = False) -> None:
+        """
+        Write a GeoParquet of how many items `mosaic` will composite in each shard.
+
+        One row per shard, with its item and solar-day timestep counts (and per
+        orbit state, when orbit states are split into bands). Reads only the
+        `search` results, no pixel data: safe to run offline, before `download`.
+
+        Parameters
+        ----------
+        config : Path
+            Path to the configuration YAML file.
+        verbose : bool
+            Enable verbose (DEBUG) logging. Defaults to False.
+        """
+        _setup_logging(level=logging.DEBUG if verbose else logging.INFO)
+        from gfetch.cli.coverage import coverage as coverage_cmd
+
+        coverage_cmd(config, satellite_key)
 
     @sub_app.command(name="mosaic")
     def _mosaic(config: Path, task_id: int = 0, n_tasks: int = 1, verbose: bool = False) -> None:
@@ -225,6 +246,31 @@ def _custom_download(name: str, config: Path, verbose: bool = False) -> None:
     from gfetch.cli.download import download as download_cmd
 
     download_cmd(config, name)
+
+
+@custom_app.command(name="coverage")
+def _custom_coverage(name: str, config: Path, verbose: bool = False) -> None:
+    """
+    Write a GeoParquet of how many items `mosaic` will composite in each shard of a
+    `custom` satellite job.
+
+    One row per shard, with its item and solar-day timestep counts (and per orbit
+    state, when orbit states are split into bands). Reads only the `search`
+    results, no pixel data: safe to run offline, before `download`.
+
+    Parameters
+    ----------
+    name : str
+        Which entry under `config`'s `custom:` section to load.
+    config : Path
+        Path to the configuration YAML file.
+    verbose : bool
+        Enable verbose (DEBUG) logging. Defaults to False.
+    """
+    _setup_logging(level=logging.DEBUG if verbose else logging.INFO)
+    from gfetch.cli.coverage import coverage as coverage_cmd
+
+    coverage_cmd(config, name)
 
 
 @custom_app.command(name="mosaic")

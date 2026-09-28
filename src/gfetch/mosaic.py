@@ -57,6 +57,7 @@ _FOOTPRINT_PAD_PX = 2
 
 __all__ = [
     "ORBIT_STATES",
+    "FootprintIndex",
     "composite",
     "group_by_utm_zone",
     "load",
@@ -356,9 +357,58 @@ def _pin_mask_band_resampling(
     return per_band
 
 
+class FootprintIndex:
+    """
+    Spatial index answering which items a geobox's pixels can draw from.
+
+    An item's EPSG:4326 `geometry` only approximates its footprint, so a geobox is
+    padded by `_FOOTPRINT_PAD_PX` pixels before testing, see that constant. Items
+    without a `geometry` are assumed to cover every geobox.
+
+    Parameters
+    ----------
+    items : Sequence[pystac.Item]
+        Candidate items.
+    """
+
+    def __init__(self, items: Sequence[pystac.Item]) -> None:
+        self._items = list(items)
+        self._unlocated: list[int] = []
+        self._located: list[int] = []
+        footprints = []
+        for i, item in enumerate(self._items):
+            if item.geometry is None:
+                self._unlocated.append(i)
+            else:
+                self._located.append(i)
+                footprints.append(shapely.geometry.shape(item.geometry))
+        self._tree = shapely.STRtree(footprints)
+
+    def intersecting(self, geobox: GeoBox) -> list[pystac.Item]:
+        """
+        List the items whose footprint intersects `geobox`.
+
+        Parameters
+        ----------
+        geobox : GeoBox
+            Target pixel grid.
+
+        Returns
+        -------
+        list[pystac.Item]
+            Items whose `geometry` intersects `geobox` padded by `_FOOTPRINT_PAD_PX`
+            pixels, plus every item without a `geometry`, in their original order.
+            odc-stac fuses same-group items in the order it's given them.
+        """
+        extent = geobox.pad(_FOOTPRINT_PAD_PX).extent.to_crs("EPSG:4326", wrapdateline=True)
+        hits = self._tree.query(extent.geom, predicate="intersects")
+        kept = sorted([*self._unlocated, *(self._located[i] for i in hits)])
+        return [self._items[i] for i in kept]
+
+
 def _items_intersecting(items: Sequence[pystac.Item], geobox: GeoBox) -> list[pystac.Item]:
     """
-    Keep only the items whose footprint intersects `geobox`.
+    Keep only the items whose footprint intersects `geobox`, see `FootprintIndex`.
 
     odc-stac builds the time axis from every item it's given, so a shard loaded with its
     whole zone's items carries every time step of the zone. Steps no item covers are
@@ -374,16 +424,10 @@ def _items_intersecting(items: Sequence[pystac.Item], geobox: GeoBox) -> list[py
     Returns
     -------
     list[pystac.Item]
-        Items whose `geometry` intersects `geobox` padded by `_FOOTPRINT_PAD_PX`
-        pixels, plus any item without a `geometry`. If none do, the first item alone,
-        which loads a single all-nodata time step.
+        `FootprintIndex(items).intersecting(geobox)`. If that's empty, the first item
+        alone, which loads a single all-nodata time step.
     """
-    extent = geobox.pad(_FOOTPRINT_PAD_PX).extent.to_crs("EPSG:4326", wrapdateline=True)
-    kept = [
-        item
-        for item in items
-        if item.geometry is None or Geometry(item.geometry, "EPSG:4326").intersects(extent)
-    ]
+    kept = FootprintIndex(items).intersecting(geobox)
     log.debug(f"{len(kept)}/{len(items)} item(s) intersect the geobox")
     return kept if kept else list(items[:1])
 

@@ -26,6 +26,7 @@ from shapely.geometry.base import BaseGeometry
 from sliderule import gedi, sliderule
 from sliderule.session import Session
 
+from gfetch.utils.geoparquet import write_geoparquet
 from gfetch.utils.progress import temporary_task
 
 log = logging.getLogger(__name__)
@@ -59,7 +60,6 @@ __all__ = [
     "fetch_gedi_l2a",
     "fetch_gedi_l4a",
     "split_bbox",
-    "write_geoparquet",
 ]
 
 # gedi02ap already returns a fixed, reduced set of L2A fields (not the full ~100
@@ -665,32 +665,6 @@ def fetch_gedi_l4a(
         params,
         progress,
     )
-
-
-def write_geoparquet(gdf: gpd.GeoDataFrame, path: Path) -> None:
-    """
-    Write a GeoDataFrame to GeoParquet atomically.
-
-    Written under a hidden temporary name in the same directory, then renamed into
-    place, so `path` existing means the write completed.
-
-    Parameters
-    ----------
-    gdf : gpd.GeoDataFrame
-        Data to write.
-    path : Path
-        Destination file, overwritten if present.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    os.close(fd)
-    tmp = Path(tmp_name)
-    try:
-        gdf.to_parquet(tmp)
-        tmp.replace(path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
 
 
 def _tile_path(tile_dir: Path, tile: tuple[float, float, float, float]) -> Path:

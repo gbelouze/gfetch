@@ -12,6 +12,7 @@ Each release can have sections: "Added", "Changed", "Deprecated", "Removed", "Fi
 
 ### Added
 
+- `gfetch <satellite> coverage` (and `gfetch custom coverage`): writes `<output_dir>/coverage.parquet`, one EPSG:4326 row per mosaic shard with the items `mosaic` will composite there: `n_items`, `n_timesteps` (solar days), `n_ascending`/`n_descending` with `orbit_state: as_bands`, and a `skipped` flag for shards outside the AOI shape. Reads only the search results, so it runs offline before `download`. The shard grid is recomputed from the zone geobox, not read from the Zarr store.
 - Sharded Zarr output (`shard_factor:` config, chunks per shard along each side, default 32): one file per shard instead of per chunk. Each shard is also `mosaic`'s unit of work and resume, listed from the store's own shard grid (`gfetch.write.write_regions`). Reading a sharded store with GDAL/QGIS needs GDAL 3.13+.
 - `compute_chunk_factor:` config (default 1): `mosaic` computes in dask chunks of that many store chunks per side, separately from the store's own `chunks`. Must divide `shard_factor`.
 - `n_compute_workers` accepts a `[min, max]` range: `mosaic` then tunes the dask thread count per shard while it runs (`gfetch.utils.tuning.WorkerTuner`): min, max and middle first, then the best count predicted by fitting `a + b/w + c*w` to the observed seconds per byte processed, plus exploration noise.
