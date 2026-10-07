@@ -5,6 +5,7 @@ import pystac
 import shapely
 
 from gfetch.cli.config import ORBIT_STATE_AS_BANDS, Config, load, resolve_source
+from gfetch.cli.stores import stores_complete
 from gfetch.mosaic import ORBIT_STATES
 from gfetch.search import search as search_items
 from gfetch.sources import get_source
@@ -48,6 +49,9 @@ def search(config_path: Path, satellite_key: str) -> None:
     Search a STAC source for items matching a configuration's AOI/time range, and
     write the results as this job's `search` -> `download` hand-off file.
 
+    Does nothing if every Zarr store listed from the existing search results is
+    complete. Delete the stores to rerun, e.g. after changing the config.
+
     Parameters
     ----------
     config_path : Path
@@ -57,6 +61,9 @@ def search(config_path: Path, satellite_key: str) -> None:
         its `custom:` section. See `gfetch.cli.config.load`.
     """
     cfg = load(config_path, satellite_key)
+    if stores_complete(cfg):
+        log.info(f"Every mosaic store in {cfg.output_dir} is complete, skipping search")
+        return
     source = get_source(resolve_source(cfg))
     query = _build_query(cfg)
     log.debug(f"query={query}")

@@ -12,6 +12,7 @@ Each release can have sections: "Added", "Changed", "Deprecated", "Removed", "Fi
 
 ### Changed
 
+- `gfetch <satellite> search` and `download` do nothing once every Zarr store listed from the existing search results is complete, so rerunning a finished job after `clean` no longer downloads the whole cache again. The check is the one `clean` uses (`gfetch.cli.stores.stores_complete`) and ignores config changes: delete the stores to rerun.
 - `gfetch mosaic` writes each store's bands as one `(band, y, x)` float32 array, `bands`, chunked across every band, with a `band_names` attribute and a `band` coordinate naming them (`gfetch.write.stack_bands`). A training read of a window is one request per spatial chunk instead of one per band and spatial chunk (339 ms to 60 ms per sample on Jean Zay). Stores written in the one-array-per-band layout are refused (`gfetch.write.validate_bands`), and must be deleted or migrated. GDAL opens a store directly as a multi-band raster.
 - Default `chunks` is 256 px (was 64), `shard_factor` 16 (was 128, so shards are 4096 px), `compute_chunk_factor` 4 (was 16, still 1024 px bricks).
 - `gfetch.vrt.write_vrt(store)` reads its bands from the stacked array and no longer takes `variables`; `gfetch.finalize.remove_cache` no longer takes `variables`.
