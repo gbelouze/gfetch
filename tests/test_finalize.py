@@ -5,7 +5,7 @@ import pytest
 import xarray as xr
 
 from gfetch.finalize import remove_cache
-from gfetch.write import prepare_template, write_region
+from gfetch.write import prepare_template, stack_bands, write_region
 
 
 @pytest.fixture
@@ -21,6 +21,7 @@ def dataset() -> xr.Dataset:
 
 
 def _store(path: Path, ds: xr.Dataset, *, complete: bool = True) -> Path:
+    ds = stack_bands(ds, ["red", "green"])
     prepare_template(ds.chunk({"x": 8, "y": 20}), path)
     write_region(ds.isel(x=slice(0, 8)), path, {"x": slice(0, 8), "y": slice(None)})
     if complete:
@@ -44,7 +45,7 @@ def test_remove_cache_removes_everything_once_stores_complete(
     cached_items.write_text("{}")
     stores = [_store(tmp_path / "a.zarr", dataset), _store(tmp_path / "b.zarr", dataset)]
 
-    remove_cache(cache, stores, ["red", "green"], cached_items_path=cached_items)
+    remove_cache(cache, stores, cached_items_path=cached_items)
 
     assert not cache.exists()
     assert not cached_items.exists()
@@ -63,7 +64,7 @@ def test_remove_cache_refuses_when_a_store_is_incomplete(
     ]
 
     with pytest.raises(ValueError, match=r"b\.zarr.*missing\.zarr"):
-        remove_cache(cache, stores, ["red", "green"], cached_items_path=cached_items)
+        remove_cache(cache, stores, cached_items_path=cached_items)
 
     assert (cache / "item-a" / "red.tif").exists()
     assert cached_items.exists()
@@ -73,6 +74,6 @@ def test_remove_cache_refuses_without_stores(tmp_path: Path) -> None:
     cache = _cache(tmp_path / "cache")
 
     with pytest.raises(ValueError, match="No stores"):
-        remove_cache(cache, [], ["red"])
+        remove_cache(cache, [])
 
     assert cache.exists()

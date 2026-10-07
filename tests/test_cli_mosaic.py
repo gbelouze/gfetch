@@ -19,7 +19,13 @@ from gfetch.cli.config import Config, load
 from gfetch.cli.mosaic import mosaic as mosaic_cmd
 from gfetch.mosaic import group_by_utm_zone
 from gfetch.ocm import ocm_path
-from gfetch.write import SKIPPED_SHARDS_ATTR, region_is_written, store_is_complete
+from gfetch.write import (
+    BAND_NAMES_ATTR,
+    SKIPPED_SHARDS_ATTR,
+    STACKED_VARIABLE,
+    region_is_written,
+    store_is_complete,
+)
 
 # Fixed regardless of the real CRS, so every test gets an exact, hand-picked pixel grid
 # instead of depending on real UTM reprojection arithmetic. It lies inside
@@ -130,9 +136,42 @@ def test_mosaic_builds_the_template_at_shard_size(tmp_path: Path, monkeypatch) -
     assert all((patch["y"], patch["x"]) == (4, 4) for patch in patches)
     items = list(pystac.ItemCollection.from_file(cfg.cached_items_path))
     (crs,) = group_by_utm_zone(items, cfg.resolved_aoi.bbox)
-    za = zarr.open_array(store=cfg.zarr_path(crs) / "red")
-    assert za.chunks == (4, 4)
-    assert za.shards == (8, 8)
+    za = zarr.open_array(store=cfg.zarr_path(crs) / STACKED_VARIABLE)
+    assert za.chunks == (1, 4, 4)
+    assert za.shards == (1, 8, 8)
+
+
+def test_mosaic_stacks_bands_into_one_array(tmp_path: Path, monkeypatch) -> None:
+    cfg_path = _write_config(tmp_path / "config.yaml", bands=["red", "green"])
+    cfg = load(cfg_path, "s2")
+    _write_fake_items(cfg)
+    monkeypatch.setattr("gfetch.cli.mosaic.zone_geobox", _fake_zone_geobox)
+    monkeypatch.setattr("gfetch.cli.mosaic.build_mosaic", _fake_build_mosaic([]))
+
+    mosaic_cmd(cfg_path, "s2")
+
+    items = list(pystac.ItemCollection.from_file(cfg.cached_items_path))
+    (crs,) = group_by_utm_zone(items, cfg.resolved_aoi.bbox)
+    path = cfg.zarr_path(crs)
+    group = zarr.open_group(store=path, mode="r")
+    assert sorted(group.array_keys()) == sorted(["band", STACKED_VARIABLE, "spatial_ref", "x", "y"])
+    za = group[STACKED_VARIABLE]
+    assert isinstance(za, zarr.Array)
+    assert za.attrs[BAND_NAMES_ATTR] == ["red", "green"]
+    assert (za.chunks, za.shards) == ((2, 4, 4), (2, 8, 8))
+    assert store_is_complete(path, [STACKED_VARIABLE])
+
+
+def test_mosaic_refuses_a_store_with_other_bands(tmp_path: Path, monkeypatch) -> None:
+    cfg_path = _write_config(tmp_path / "config.yaml", bands=["red", "green"])
+    _write_fake_items(load(cfg_path, "s2"))
+    monkeypatch.setattr("gfetch.cli.mosaic.zone_geobox", _fake_zone_geobox)
+    monkeypatch.setattr("gfetch.cli.mosaic.build_mosaic", _fake_build_mosaic([]))
+    mosaic_cmd(cfg_path, "s2")
+
+    _write_config(tmp_path / "config.yaml", bands=["green", "red"])
+    with pytest.raises(ValueError, match="on-disk bands"):
+        mosaic_cmd(cfg_path, "s2")
 
 
 def test_mosaic_resumes_by_skipping_already_written_patches(tmp_path: Path, monkeypatch) -> None:
@@ -176,7 +215,7 @@ def test_mosaic_splits_disjoint_patches_across_tasks(tmp_path: Path, monkeypatch
     items = list(pystac.ItemCollection.from_file(cfg.cached_items_path))
     (crs,) = group_by_utm_zone(items, cfg.resolved_aoi.bbox)
     path = cfg.zarr_path(crs)
-    assert region_is_written(path, {"y": slice(0, 16), "x": slice(0, 16)}, ["red"])
+    assert region_is_written(path, {"y": slice(0, 16), "x": slice(0, 16)}, [STACKED_VARIABLE])
 
 
 @pytest.mark.parametrize("from_cache", [True, False])
@@ -248,10 +287,10 @@ def test_mosaic_computes_in_bricks_of_several_store_chunks(tmp_path: Path, monke
     assert all(c["y"] == 8 and c["x"] == 8 for c in requested_chunks)
     items = list(pystac.ItemCollection.from_file(cfg.cached_items_path))
     (crs,) = group_by_utm_zone(items, cfg.resolved_aoi.bbox)
-    za = zarr.open_array(store=cfg.zarr_path(crs) / "red")
-    assert za.chunks == (4, 4)
-    assert za.shards == (8, 8)
-    assert store_is_complete(cfg.zarr_path(crs), ["red"])
+    za = zarr.open_array(store=cfg.zarr_path(crs) / STACKED_VARIABLE)
+    assert za.chunks == (1, 4, 4)
+    assert za.shards == (1, 8, 8)
+    assert store_is_complete(cfg.zarr_path(crs), [STACKED_VARIABLE])
 
 
 def test_mosaic_skips_shards_outside_the_country_polygon(
@@ -278,7 +317,7 @@ def test_mosaic_skips_shards_outside_the_country_polygon(
         "dimensions": ["y", "x"],
         "indices": [[0, 0], [0, 1], [1, 1]],
     }
-    assert store_is_complete(path, ["red"])
+    assert store_is_complete(path, [STACKED_VARIABLE])
 
 
 def test_mosaic_with_ocm_refuses_until_every_mask_exists(tmp_path: Path, monkeypatch) -> None:

@@ -30,9 +30,12 @@ from gfetch.sources import planetary_computer_signer
 from gfetch.utils.progress import count_bar, dask_progress, temporary_task
 from gfetch.utils.tuning import WorkerTuner
 from gfetch.write import (
+    STACKED_VARIABLE,
     prepare_template,
     region_is_written,
+    stack_bands,
     store_initialized,
+    validate_bands,
     validate_chunks,
     validate_geobox,
     write_region,
@@ -51,9 +54,10 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
     directly from the items' remote hrefs (fine for a single internet-connected
     machine; a compute-only HPC node needs the local cache). Planetary Computer hrefs
     are then signed once per shard, with tokens valid for 45 minutes: a shard taking
-    longer fails, and is recomputed on the next run. Safe to resume after
-    being killed/preempted: an already-written band of a shard is skipped, and an
-    unwritten one is computed and written as a whole. Safe for several concurrent invocations to
+    longer fails, and is recomputed on the next run. Bands are stacked into one
+    `(band, y, x)` float32 array, see `gfetch.write.stack_bands`. Safe to resume after
+    being killed/preempted: an already-written shard is skipped, and an unwritten one
+    is computed and written as a whole. Safe for several concurrent invocations to
     split the work via `task_id`/`n_tasks`, since each shard is its own file and is
     assigned to exactly one task. Shards entirely outside the AOI's exact shape (e.g.
     the country polygons) are never computed and read back as NaN. With `ocm` set, it
@@ -128,7 +132,7 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
         log_footprint: bool = True,
         on_load: Callable[[xr.Dataset], object] | None = None,
     ) -> xr.Dataset:
-        return build_mosaic(
+        ds = build_mosaic(
             zone_items,
             geobox,
             bands,
@@ -142,6 +146,7 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
             # A new signer per call, so each shard reads with freshly issued tokens.
             patch_url=planetary_computer_signer() if from_remote else None,
         )
+        return stack_bands(ds, variables)
 
     units: list[tuple[str, Path, list[pystac.Item], GeoBox, dict[str, slice]]] = []
     for crs, zone_items in zones.items():
@@ -166,11 +171,12 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
                 skip=outside_aoi(geobox, cfg.aoi_geometry),
             )
 
-        # Fails fast, before any shard is built, if this store's on-disk chunk,
+        # Fails fast, before any shard is built, if this store's on-disk bands, chunk,
         # shard or pixel grid doesn't match what this run's config expects
-        validate_chunks(path, variables, {"y": chunks["y"], "x": chunks["x"]}, shards)
+        validate_bands(path, variables)
+        validate_chunks(path, [STACKED_VARIABLE], {"y": chunks["y"], "x": chunks["x"]}, shards)
         validate_geobox(path, geobox)
-        regions = write_regions(path, variables[0])
+        regions = write_regions(path, STACKED_VARIABLE)
 
         for region in regions:
             label = f"EPSG:{crs.epsg} shard (y={region['y'].start}, x={region['x'].start})"
@@ -189,10 +195,7 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
         temporary_task(progress, "Computing shards", total=len(my_units)) as units_task,
     ):
         for i, (label, path, zone_items, unit_geobox, region) in enumerate(my_units, start=1):
-            # Each band's shard is its own file, written atomically, so a shard counts
-            # as done once every band's file exists; otherwise all its bands are
-            # recomputed and rewritten.
-            if region_is_written(path, region, variables):
+            if region_is_written(path, region, [STACKED_VARIABLE]):
                 log.info(f"{label}: already written, skipping [{i}/{len(my_units)}]")
             else:
                 n_workers = tuner.next()

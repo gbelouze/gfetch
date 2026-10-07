@@ -24,7 +24,9 @@ from gfetch.utils.memory import log_chunk_footprint
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_CHUNKS: dict[str, int] = {"x": 64, "y": 64}
+# A training read of a window fetches every chunk it touches, see `claude/tech-stack.md`'s
+# "Training reads: stacked bands, larger chunks" section.
+_DEFAULT_CHUNKS: dict[str, int] = {"x": 256, "y": 256}
 
 # `composite`'s default `median` isn't chunk-wise associative, so dask must gather an
 # entire spatial chunk's `time` axis into one chunk before it can reduce. If `time`
@@ -34,12 +36,13 @@ _DEFAULT_CHUNKS: dict[str, int] = {"x": 64, "y": 64}
 # `time` chunk from the start avoids that rechunk entirely.
 _DEFAULT_TIME_CHUNK = -1
 
-# 128x128 chunks per shard: 8192 px shards at the default chunk size. The mosaic stage
-# writes one shard per task, so a shard's output (all bands) is held in memory at once.
-_DEFAULT_SHARD_FACTOR = 128
+# 16x16 chunks per shard: 4096 px shards at the default chunk size. The mosaic stage
+# writes one shard per task, so a shard's output (all bands, float32) is held in memory
+# at once: 1 GB for 16 bands.
+_DEFAULT_SHARD_FACTOR = 16
 
-# 16x16 chunks per dask chunk: 1024 px at the default chunk size.
-_DEFAULT_COMPUTE_CHUNK_FACTOR = 16
+# 4x4 chunks per dask chunk: 1024 px at the default chunk size.
+_DEFAULT_COMPUTE_CHUNK_FACTOR = 4
 
 ORBIT_STATES: tuple[str, ...] = ("ascending", "descending")
 
@@ -85,7 +88,7 @@ def resolve_chunks(chunks: dict[str, int] | None) -> dict[str, int]:
     ----------
     chunks : dict[str, int] | None
         Dask chunk sizes as passed to `load`/`mosaic`. Defaults to None, which uses
-        `{"x": 64, "y": 64}`.
+        `{"x": 256, "y": 256}`.
 
     Returns
     -------
@@ -195,7 +198,7 @@ def load(
         mosaics over stacking every individual scene as a separate time step.
     chunks : dict[str, int] | None
         Dask chunk sizes, e.g. `{"time": 1, "x": 512, "y": 512}`. Defaults to None,
-        which chunks the spatial dims at `{"x": 64, "y": 64}`; passing `None`
+        which chunks the spatial dims at `{"x": 256, "y": 256}`; passing `None`
         through to odc-stac itself would instead load everything eagerly, without
         Dask. Regardless of this argument, `time` itself defaults to a single
         full-length chunk unless explicitly given here.

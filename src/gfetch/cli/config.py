@@ -253,15 +253,17 @@ class Config:
         `gfetch.mosaic.composite` reduction needs: a non-associative reduction (e.g.
         the default 'median') must gather its whole `time` axis into memory per
         spatial chunk, so peak memory scales with spatial chunk size regardless of
-        how `time` itself is chunked. Defaults to None, which uses `gfetch.mosaic.
-        load`'s own default of `{"x": 64, "y": 64}`.
+        how `time` itself is chunked. Also the output store's chunk size: a reader
+        fetches every chunk a window touches, whole, in one request per chunk.
+        Defaults to None, which uses `gfetch.mosaic.load`'s own default of `{"x":
+        256, "y": 256}`.
     compute_chunk_factor : int | None
         Number of `chunks` per dask chunk (the `mosaic` stage's processing brick)
         along each of `x` and `y`. Must divide `shard_factor`. Larger bricks mean
         fewer, larger dask tasks: more memory in use, less scheduling overhead.
         Memory per brick in flight is roughly brick side² x time steps x bands x 2
         bytes, since the median holds the brick's whole time axis. Defaults to None,
-        which uses `gfetch.mosaic.resolve_compute_chunks`' default of 16 (1024 px
+        which uses `gfetch.mosaic.resolve_compute_chunks`' default of 4 (1024 px
         bricks at the default `chunks`).
     shard_factor : int | None
         Number of `chunks` per Zarr shard of the `mosaic` output, along each of `x`
@@ -271,7 +273,8 @@ class Config:
         otherwise. Its output (all bands) is held in memory at once. `1` disables
         sharding (one file per chunk). Reading a sharded store with GDAL (and QGIS)
         needs GDAL 3.13+. Defaults to None, which uses
-        `gfetch.mosaic.resolve_shards`' default of 128.
+        `gfetch.mosaic.resolve_shards`' default of 16 (4096 px shards at the default
+        `chunks`).
     """
 
     time_range: TimeRangeConfig

@@ -1509,3 +1509,19 @@ that state was reached, and should be read chronologically, not as reference mat
     per store with 256 px chunks cut the read from 339 ms to 60 ms per sample on Jean
     Zay; training steps went from 1.02 s to 0.36 s (with other, sprout-side fixes).
   - sprout already reads that layout. Next: write it from `mosaic`.
+
+- **2026-09-28** — **`mosaic` writes bands stacked into one `(band, y, x)` float32
+  array**; see `claude/tech-stack.md`'s "Training reads: stacked bands, larger chunks"
+  section for the layout and defaults.
+  - `gfetch.write.stack_bands` stacks the mosaic before `prepare_template`/`write_region`;
+    `validate_bands` refuses per-band stores and stores with other bands.
+  - `write_region` now drops every variable sharing no dimension with the region (the
+    `band` coordinate, besides the grid mapping); `gfetch:skipped_shards` leaves `band`
+    out so it keeps indexing `("y", "x")`, as sprout expects.
+  - Defaults moved to 256 px chunks, 4096 px shards, 1024 px compute bricks.
+  - Verified with GDAL 3.13.3: a sharded stacked store opens as a multi-band raster with
+    CRS and `DIM_band_VALUE` names, an unwritten shard reads as nodata; the VRT gives the
+    band descriptions.
+  - Not measured: `mosaic`'s own write time/memory with every band in one shard task
+    (`benchmark/sharding_write.py`'s "sharded, all bands per write" row, at 6-12 bands,
+    is the closest data point).

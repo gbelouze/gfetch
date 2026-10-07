@@ -818,19 +818,33 @@ addressed by name either way):
 - `grid_mapping`, `x`/`y`, `spatial_ref` unchanged; `gfetch:skipped_shards` still indexes
   the `("y", "x")` shard grid, a shard spanning all bands.
 
-Stores in this layout were so far produced by copying gfetch output
+Stores in this layout were first produced by copying gfetch output
 (`scripts/migrate_zarr_stacked.py` in the `jz` repo, which can also copy a random
-fraction of the shards). **Open questions for writing it from `mosaic`:**
+fraction of the shards).
 
-- The write unit becomes a shard of every band at once: `4 * n_bands * shard**2` bytes,
-  1 GB for 12 bands at 4096 px, 4 GB at gfetch's current 8192 px shards. Bands are
-  currently composited and written independently.
-- Chunk size is a trade-off with the crop size of the consumer: 256 px chunks make a
-  384 px crop read a 512 px window (1.8x the crop's pixels, still far cheaper than
-  49 small chunks per band). It should stay configurable.
-- Band names: sprout reads the `band_names` attribute. xarray's convention would be a
-  string `band` coordinate variable; writing both would be the safe option.
-- GDAL/QGIS reading of a 3D array (as a multi-band raster, or not) is unverified.
+**Decision (2026-09-28)**: `mosaic` writes the stacked layout, and only it.
+
+- One `bands` array per store (`gfetch.write.STACKED_VARIABLE`), `(band, y, x)`,
+  **float32** for every band (`gfetch.write.stack_bands`). The composite is already
+  floating point (NaN marks nodata), so the only cost is float64 inputs losing precision.
+- Band names written twice: the `band_names` attribute (what sprout reads) and a string
+  `band` coordinate, which GDAL reports as each band's `DIM_band_VALUE` metadata.
+- Chunks span every band: `(n_bands, chunk, chunk)`, shards `(n_bands, shard, shard)`.
+  A shard of every band is one file and `mosaic`'s unit of work and resume, so resume is
+  per shard, no longer per band shard.
+- `gfetch:skipped_shards` keeps indexing the `("y", "x")` grid: `band` is left out, a
+  shard spanning every band.
+- New defaults: 256 px chunks (was 64), 16 chunks per shard, i.e. 4096 px shards (was 128,
+  i.e. 8192 px), compute bricks of 4 chunks, i.e. 1024 px (unchanged in pixels). A shard's
+  output is `4 * n_bands * 4096**2` bytes, 1 GB for 16 bands, vs 4 GB at 8192 px.
+- A store in the per-band layout is refused by `gfetch.write.validate_bands` (delete and
+  rewrite it, or migrate it with the `jz` script); so is one stacking other bands than the
+  config's, in another order included.
+- GDAL (3.12 bundled with rasterio, 3.13.3 system) opens the store, or its `bands` array
+  directory, as one multi-band raster with the CRS, verified 2026-09-28. `gfetch vrt` now
+  only adds band descriptions: each VRT band reads `SourceBand` i of `mosaic.zarr/bands`.
+- `bands` sorts before `spatial_ref`, so the GDAL consolidated-metadata bug (see
+  "Consolidated metadata and GDAL") would drop its CRS: stores must stay unconsolidated.
 
 ## Future: disk-bounded streaming download+mosaic (deferred, not designed for v1)
 

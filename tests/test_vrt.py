@@ -10,12 +10,12 @@ from odc.geo.geobox import GeoBox
 from odc.geo.xr import xr_coords
 
 from gfetch.vrt import vrt_path, write_vrt
-from gfetch.write import prepare_template, write, write_region
+from gfetch.write import prepare_template, stack_bands, write, write_region
 
 _GEOBOX = GeoBox.from_bbox((500000, 4000000, 500160, 4000080), crs="EPSG:32631", resolution=10)
 
 
-def _dataset() -> xr.Dataset:
+def _bands() -> xr.Dataset:
     ds = xr.Dataset(
         {
             name: (("y", "x"), np.full(_GEOBOX.shape, value, dtype="float32"))
@@ -27,11 +27,15 @@ def _dataset() -> xr.Dataset:
     return ds
 
 
-def test_write_vrt_stacks_variables_as_bands(tmp_path: Path) -> None:
-    store = tmp_path / "mosaic_epsg32631.zarr"
-    write(_dataset().chunk({"y": 4, "x": 4}), store)
+def _dataset(variables: list[str] | None = None) -> xr.Dataset:
+    return stack_bands(_bands(), variables if variables is not None else ["red", "green"])
 
-    dest = write_vrt(store, ["green", "red"])
+
+def test_write_vrt_names_stacked_bands(tmp_path: Path) -> None:
+    store = tmp_path / "mosaic_epsg32631.zarr"
+    write(_dataset(["green", "red"]).chunk({"y": 4, "x": 4}), store)
+
+    dest = write_vrt(store)
 
     assert dest == vrt_path(store) == tmp_path / "mosaic_epsg32631.vrt"
     with rasterio.open(dest) as src:
@@ -41,14 +45,14 @@ def test_write_vrt_stacks_variables_as_bands(tmp_path: Path) -> None:
         assert src.transform == _GEOBOX.affine
         assert src.nodatavals == (pytest.approx(np.nan, nan_ok=True),) * 2
         green, red = src.read()
-    np.testing.assert_array_equal(green, _dataset()["green"].values)
+    np.testing.assert_array_equal(green, _bands()["green"].values)
     assert (red == 1.0).all()
 
 
 def test_write_vrt_survives_moving_with_its_store(tmp_path: Path) -> None:
     store = tmp_path / "a" / "mosaic.zarr"
-    write(_dataset().chunk({"y": 4, "x": 4}), store)
-    write_vrt(store, ["red"])
+    write(_dataset(["red"]).chunk({"y": 4, "x": 4}), store)
+    write_vrt(store)
 
     moved = tmp_path / "b"
     shutil.move(store.parent, moved)
@@ -59,11 +63,11 @@ def test_write_vrt_survives_moving_with_its_store(tmp_path: Path) -> None:
 
 def test_write_vrt_reads_unwritten_region_as_nodata(tmp_path: Path) -> None:
     store = tmp_path / "mosaic.zarr"
-    ds = _dataset()
+    ds = _dataset(["red"])
     prepare_template(ds.chunk({"y": 8, "x": 8}), store)
     write_region(ds.isel(x=slice(0, 8)), store, {"x": slice(0, 8), "y": slice(None)})
 
-    write_vrt(store, ["red"])
+    write_vrt(store)
 
     with rasterio.open(vrt_path(store)) as src:
         red = src.read(1)
@@ -78,7 +82,7 @@ def test_write_vrt_declares_sharded_store_inner_chunks_as_blocks(tmp_path: Path)
         _dataset().chunk({"y": 8, "x": 8}), store, shards={"y": 8, "x": 8}, chunks={"y": 4, "x": 4}
     )
 
-    write_vrt(store, ["red"])
+    write_vrt(store)
 
     props = ET.parse(vrt_path(store)).getroot().find("VRTRasterBand/SimpleSource/SourceProperties")
     assert props is not None
@@ -91,9 +95,9 @@ def test_write_vrt_refuses_store_without_crs(tmp_path: Path) -> None:
         {"red": (("y", "x"), np.ones((4, 4), dtype="float32"))},
         coords={"y": np.arange(4), "x": np.arange(4)},
     )
-    write(ds, store)
+    write(stack_bands(ds, ["red"]), store)
 
     with pytest.raises(ValueError, match="no CRS"):
-        write_vrt(store, ["red"])
+        write_vrt(store)
 
     assert not vrt_path(store).exists()

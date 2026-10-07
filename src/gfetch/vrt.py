@@ -1,8 +1,8 @@
-"""GDAL VRT descriptors presenting a Zarr mosaic store as a single multi-band raster.
+"""GDAL VRT descriptors presenting a Zarr mosaic store as a named multi-band raster.
 
-GDAL's Zarr driver exposes each band array as its own subdataset, so QGIS shows a
-store one band at a time. A VRT stacks them into one dataset, without copying any
-pixel data.
+GDAL's Zarr driver already opens a store's `(band, y, x)` array as a multi-band raster,
+but leaves its bands unnamed (their names only appear as `DIM_band_VALUE` metadata). A
+VRT names them, without copying any pixel data.
 """
 
 import logging
@@ -10,13 +10,15 @@ import math
 import os
 import tempfile
 import xml.etree.ElementTree as ET
-from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import odc.geo.xr  # noqa: F401  registers the `.odc` accessor
 import xarray as xr
 import zarr
+
+from gfetch.write import BAND_NAMES_ATTR, STACKED_VARIABLE
 
 log = logging.getLogger(__name__)
 
@@ -75,13 +77,13 @@ def _nodata(fill_value: object) -> str | None:
     return str(value)
 
 
-def write_vrt(store: Path, variables: Sequence[str]) -> Path:
+def write_vrt(store: Path) -> Path:
     """
-    Write a VRT next to `store` stacking its `variables` as the bands of one raster.
+    Write a VRT next to `store` exposing its stacked bands as one named raster.
 
-    Each band's source is the array directory itself (e.g. `mosaic.zarr/B04`),
-    relative to the VRT, so the VRT stays valid when moved or copied together with
-    its store. Georeferencing comes from the store's `x`/`y` coordinates and is
+    Each band's source is its index in the stacked array's directory (e.g.
+    `mosaic.zarr/bands`), relative to the VRT, so the VRT stays valid when moved or
+    copied together with its store. Georeferencing comes from the store's `x`/`y` coordinates and is
     written into the VRT, so it doesn't depend on GDAL resolving the store's grid
     mapping. Reading the VRT needs a GDAL that can read the store, i.e. GDAL >= 3.13
     for a sharded one. The store may still be incomplete: unwritten shards read as
@@ -90,10 +92,8 @@ def write_vrt(store: Path, variables: Sequence[str]) -> Path:
     Parameters
     ----------
     store : Path
-        Zarr store directory, already initialized via
-        `gfetch.write.prepare_template`.
-    variables : Sequence[str]
-        Data variables to expose, in band order. Each must be a 2D `(y, x)` array.
+        Zarr store directory holding a `gfetch.write.STACKED_VARIABLE` array, already
+        initialized via `gfetch.write.prepare_template`.
 
     Returns
     -------
@@ -103,7 +103,7 @@ def write_vrt(store: Path, variables: Sequence[str]) -> Path:
     Raises
     ------
     ValueError
-        If the store has no recoverable CRS, or a variable's dtype has no GDAL
+        If the store has no recoverable CRS, or its array's dtype has no GDAL
         equivalent.
     """
     geobox = xr.open_zarr(store, consolidated=False).odc.geobox
@@ -119,26 +119,30 @@ def write_vrt(store: Path, variables: Sequence[str]) -> Path:
     ET.SubElement(root, "GeoTransform").text = ", ".join(
         repr(v) for v in (a.c, a.a, a.b, a.f, a.d, a.e)
     )
-    group = zarr.open_group(store, mode="r")
-    for i, name in enumerate(variables, start=1):
-        za = group[name]
-        assert isinstance(za, zarr.Array), f"{name} is not an array"
-        assert za.shape == (height, width), f"{name} isn't on the store's (y, x) grid"
-        dtype = _GDAL_DTYPES.get(str(za.dtype))
-        if dtype is None:
-            msg = f"{store}: {name}'s dtype {za.dtype} has no GDAL equivalent"
-            log.error(msg)
-            raise ValueError(msg)
+    za = zarr.open_group(store, mode="r")[STACKED_VARIABLE]
+    assert isinstance(za, zarr.Array), f"{STACKED_VARIABLE} is not an array"
+    names = [str(name) for name in cast("list[str]", za.attrs[BAND_NAMES_ATTR])]
+    assert za.shape == (len(names), height, width), (
+        f"{STACKED_VARIABLE} isn't a (band, y, x) array on the store's grid"
+    )
+    dtype = _GDAL_DTYPES.get(str(za.dtype))
+    if dtype is None:
+        msg = f"{store}: {STACKED_VARIABLE}'s dtype {za.dtype} has no GDAL equivalent"
+        log.error(msg)
+        raise ValueError(msg)
+    nodata = _nodata(za.metadata.fill_value)
+    _, block_y, block_x = za.chunks
+    for i, name in enumerate(names, start=1):
         band = ET.SubElement(root, "VRTRasterBand", dataType=dtype, band=str(i))
         ET.SubElement(band, "Description").text = name
-        nodata = _nodata(za.metadata.fill_value)
         if nodata is not None:
             ET.SubElement(band, "NoDataValue").text = nodata
         source = ET.SubElement(band, "SimpleSource")
-        ET.SubElement(source, "SourceFilename", relativeToVRT="1").text = f"{store.name}/{name}"
-        ET.SubElement(source, "SourceBand").text = "1"
-        block_y, block_x = za.chunks
-        # Lets GDAL defer opening each band's array until its pixels are read.
+        ET.SubElement(
+            source, "SourceFilename", relativeToVRT="1"
+        ).text = f"{store.name}/{STACKED_VARIABLE}"
+        ET.SubElement(source, "SourceBand").text = str(i)
+        # Lets GDAL defer opening the array until its pixels are read.
         ET.SubElement(
             source,
             "SourceProperties",
@@ -160,5 +164,5 @@ def write_vrt(store: Path, variables: Sequence[str]) -> Path:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    log.info(f"Wrote {dest} ({len(variables)} band(s) from {store.name})")
+    log.info(f"Wrote {dest} ({len(names)} band(s) from {store.name})")
     return dest

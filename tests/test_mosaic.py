@@ -161,7 +161,7 @@ def test_outside_aoi_disjoint_from_geobox_skips_everything() -> None:
 
 
 def test_resolve_chunks_defaults() -> None:
-    assert resolve_chunks(None) == {"x": 64, "y": 64, "time": -1}
+    assert resolve_chunks(None) == {"x": 256, "y": 256, "time": -1}
 
 
 def test_resolve_chunks_keeps_user_overrides_and_adds_time() -> None:
@@ -183,8 +183,10 @@ def test_resolve_compute_chunks_scales_spatial_chunks() -> None:
     }
 
 
-def test_resolve_compute_chunks_defaults_to_16_chunks_per_side() -> None:
-    assert resolve_compute_chunks({"x": 64, "y": 64, "time": -1}, None, {"x": 8192, "y": 8192}) == {
+def test_resolve_compute_chunks_defaults_to_4_chunks_per_side() -> None:
+    assert resolve_compute_chunks(
+        {"x": 256, "y": 256, "time": -1}, None, {"x": 4096, "y": 4096}
+    ) == {
         "x": 1024,
         "y": 1024,
         "time": -1,
@@ -199,8 +201,8 @@ def test_resolve_compute_chunks_rejects_bricks_not_dividing_the_write_unit(
         resolve_compute_chunks({"x": 256, "y": 256, "time": -1}, factor, shards)
 
 
-def test_resolve_shards_defaults_to_128_chunks_per_side() -> None:
-    assert resolve_shards(None, {"x": 64, "y": 32, "time": -1}) == {"y": 4096, "x": 8192}
+def test_resolve_shards_defaults_to_16_chunks_per_side() -> None:
+    assert resolve_shards(None, {"x": 256, "y": 128, "time": -1}) == {"y": 2048, "x": 4096}
 
 
 def test_resolve_shards_scales_chunks_by_factor() -> None:

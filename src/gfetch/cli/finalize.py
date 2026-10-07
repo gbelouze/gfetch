@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pystac
 
-from gfetch.cli.config import Config, load, resolve_output_variables
+from gfetch.cli.config import Config, load
 from gfetch.finalize import remove_cache
 from gfetch.mosaic import group_by_utm_zone
 from gfetch.utils.progress import count_bar
@@ -52,12 +52,11 @@ def vrt(config_path: Path, satellite_key: str) -> None:
     stores = _zone_stores(cfg)
     if stores is None:
         return
-    variables = resolve_output_variables(cfg)
     for store in stores:
         if not store_initialized(store):
             log.warning(f"{store} not found, run `gfetch mosaic` first. Skipping.")
             continue
-        write_vrt(store, variables)
+        write_vrt(store)
 
 
 def clean(config_path: Path, satellite_key: str) -> None:
@@ -80,7 +79,6 @@ def clean(config_path: Path, satellite_key: str) -> None:
         remove_cache(
             cfg.cache_dir,
             stores,
-            resolve_output_variables(cfg),
             cached_items_path=cfg.cached_items_path,
             progress=progress,
         )

@@ -15,7 +15,7 @@ from gfetch.cli.finalize import clean as clean_cmd
 from gfetch.cli.finalize import vrt as vrt_cmd
 from gfetch.mosaic import group_by_utm_zone
 from gfetch.vrt import vrt_path
-from gfetch.write import prepare_template, write
+from gfetch.write import prepare_template, stack_bands, write
 
 
 def _setup_job(tmp_path: Path, *, complete: bool = True) -> tuple[Path, Config, Path]:
@@ -52,6 +52,7 @@ def _setup_job(tmp_path: Path, *, complete: bool = True) -> tuple[Path, Config, 
         {"red": (("y", "x"), np.ones((8, 8), dtype="float32"))},
         coords=xr_coords(GeoBox.from_bbox((0, 0, 80, 80), crs=crs, resolution=10)),
     ).chunk({"y": 4, "x": 4})
+    ds = stack_bands(ds, ["red"])
     if complete:
         write(ds, store)
     else:

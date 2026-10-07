@@ -14,7 +14,7 @@ from pathlib import Path
 from rich.progress import Progress
 
 from gfetch.utils.progress import temporary_task
-from gfetch.write import store_is_complete
+from gfetch.write import STACKED_VARIABLE, store_is_complete
 
 log = logging.getLogger(__name__)
 
@@ -24,7 +24,6 @@ __all__ = ["remove_cache"]
 def remove_cache(
     cache_dir: Path,
     stores: Sequence[Path],
-    variables: Sequence[str],
     *,
     cached_items_path: Path | None = None,
     progress: Progress | None = None,
@@ -45,8 +44,6 @@ def remove_cache(
         Download cache directory, one subdirectory per item.
     stores : Sequence[Path]
         Every Zarr store built from `cache_dir` (e.g. one per UTM zone).
-    variables : Sequence[str]
-        Data variables (e.g. the mosaic's bands) each store must have fully written.
     cached_items_path : Path | None
         Hand-off file listing the cached items, deleted along with the cache.
         Defaults to None (no such file).
@@ -61,7 +58,7 @@ def remove_cache(
     """
     if not stores:
         raise ValueError("No stores given, refusing to remove the cache unchecked")
-    incomplete = [s for s in stores if not store_is_complete(s, variables)]
+    incomplete = [s for s in stores if not store_is_complete(s, [STACKED_VARIABLE])]
     if incomplete:
         msg = f"Store(s) {[str(s) for s in incomplete]} incomplete, not removing {cache_dir}"
         log.error(msg)

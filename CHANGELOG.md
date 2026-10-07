@@ -10,6 +10,12 @@ Each release can have sections: "Added", "Changed", "Deprecated", "Removed", "Fi
 
 ## pre-release
 
+### Changed
+
+- `gfetch mosaic` writes each store's bands as one `(band, y, x)` float32 array, `bands`, chunked across every band, with a `band_names` attribute and a `band` coordinate naming them (`gfetch.write.stack_bands`). A training read of a window is one request per spatial chunk instead of one per band and spatial chunk (339 ms to 60 ms per sample on Jean Zay). Stores written in the one-array-per-band layout are refused (`gfetch.write.validate_bands`), and must be deleted or migrated. GDAL opens a store directly as a multi-band raster.
+- Default `chunks` is 256 px (was 64), `shard_factor` 16 (was 128, so shards are 4096 px), `compute_chunk_factor` 4 (was 16, still 1024 px bricks).
+- `gfetch.vrt.write_vrt(store)` reads its bands from the stacked array and no longer takes `variables`; `gfetch.finalize.remove_cache` no longer takes `variables`.
+
 ### Added
 
 - OmniCloudMask cloud masking for Sentinel-2 (`ocm: true` under `s2:`, `ocm` extra): `gfetch s2 download` also fetches the model weights, the new `gfetch s2 ocm` computes a 20 m cloud/shadow mask per cached item (`<cache>/<item>/ocm.tif`, GPU if available, splittable with `--task-id`/`--n-tasks`), and `gfetch s2 mosaic` masks thick cloud, thin cloud and shadow with it instead of SCL. Needs `nir` in `bands`.

@@ -4,6 +4,11 @@ Default output target is plain Zarr (not Icechunk) with pre-planned, non-overlap
 per-worker chunk regions, safe on any POSIX filesystem, including shared HPC storage.
 See `claude/tech-stack.md`'s "HPC / distributed execution" section for why.
 
+`gfetch mosaic` stacks a store's bands into one `(band, y, x)` float32 array (see
+`stack_bands`), so that a training read of a window is one request per spatial chunk
+instead of one per band and spatial chunk. See `claude/tech-stack.md`'s "Training
+reads: stacked bands, larger chunks" section.
+
 Stores are written without consolidated metadata: GDAL's Zarr driver (hence QGIS)
 drops the CRS of any band listed before its grid mapping variable in a consolidated
 listing, see `claude/tech-stack.md`'s "Consolidated metadata and GDAL" section. Open
@@ -32,11 +37,16 @@ from gfetch.utils.memory import log_chunk_footprint
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "BAND_DIM",
+    "BAND_NAMES_ATTR",
     "SKIPPED_SHARDS_ATTR",
+    "STACKED_VARIABLE",
     "prepare_template",
     "region_is_written",
+    "stack_bands",
     "store_initialized",
     "store_is_complete",
+    "validate_bands",
     "validate_chunks",
     "validate_geobox",
     "write",
@@ -48,8 +58,15 @@ _ZarrMode = Literal["a", "a-", "r", "r+", "w", "w-"]
 
 # Root group attribute listing the storage units (shards, or chunks if unsharded) that
 # are never written and read back as fill value, as
-# `{"dimensions": [dim, ...], "indices": [[index along each dim], ...]}`.
+# `{"dimensions": [dim, ...], "indices": [[index along each dim], ...]}`. `BAND_DIM` is
+# never listed: a storage unit spans every band.
 SKIPPED_SHARDS_ATTR = "gfetch:skipped_shards"
+
+STACKED_VARIABLE = "bands"
+BAND_DIM = "band"
+# Attribute of the stacked array naming each band, in order. Also held by the `band`
+# coordinate, which GDAL reads as each band's `DIM_band_VALUE` metadata.
+BAND_NAMES_ATTR = "band_names"
 
 
 def _restore_grid_mapping(ds: xr.Dataset) -> xr.Dataset:
@@ -88,6 +105,32 @@ def _restore_grid_mapping(ds: xr.Dataset) -> xr.Dataset:
     for var in ds.data_vars.values():
         var.encoding.setdefault("grid_mapping", crs_coord)
     return ds
+
+
+def stack_bands(ds: xr.Dataset, variables: Sequence[str]) -> xr.Dataset:
+    """
+    Stack a dataset's `(y, x)` bands into a single `(band, y, x)` float32 array.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Dataset with one `(y, x)` data variable per band, e.g. a mosaic from
+        `gfetch.mosaic.mosaic`.
+    variables : Sequence[str]
+        Data variables to stack, in band order.
+
+    Returns
+    -------
+    xr.Dataset
+        One `STACKED_VARIABLE` data variable, cast to float32, with a `band`
+        coordinate and a `BAND_NAMES_ATTR` attribute naming its bands, and a single
+        dask chunk along `band`.
+    """
+    stacked = ds[list(variables)].to_dataarray(dim=BAND_DIM).astype("float32")
+    if stacked.chunks is not None:
+        stacked = stacked.chunk({BAND_DIM: -1})
+    stacked.attrs = {BAND_NAMES_ATTR: [str(v) for v in variables]}
+    return stacked.to_dataset(name=STACKED_VARIABLE).assign_attrs(ds.attrs)
 
 
 def write(ds: xr.Dataset, path: Path, *, mode: _ZarrMode = "w") -> None:
@@ -200,6 +243,42 @@ def validate_chunks(
                         f"configuration - delete {path} and let it be recreated, or fix "
                         "the configuration to match the existing store."
                     )
+
+
+def validate_bands(path: Path, variables: Sequence[str]) -> None:
+    """
+    Check that an already-initialized store stacks exactly `variables`, in order.
+
+    Parameters
+    ----------
+    path : Path
+        Zarr store path, already initialized via `prepare_template`.
+    variables : Sequence[str]
+        Band names this run expects, as passed to `stack_bands`.
+
+    Raises
+    ------
+    ValueError
+        If the store has no `STACKED_VARIABLE` array (e.g. it holds one array per
+        band), or its bands differ from `variables`.
+    """
+    group = zarr.open_group(store=path, mode="r")
+    if STACKED_VARIABLE not in group:
+        msg = (
+            f"{path} has no {STACKED_VARIABLE!r} array: it was likely written by an older "
+            f"gfetch version, with one array per band - delete {path} and let it be recreated."
+        )
+        log.error(msg)
+        raise ValueError(msg)
+    actual = list(cast("list[str]", group[STACKED_VARIABLE].attrs.get(BAND_NAMES_ATTR, [])))
+    if actual != list(variables):
+        msg = (
+            f"{path}: on-disk bands {actual} differ from this run's {list(variables)}. The "
+            "store was likely created by an earlier run under a different configuration - "
+            f"delete {path} and let it be recreated, or fix the configuration to match."
+        )
+        log.error(msg)
+        raise ValueError(msg)
 
 
 def validate_geobox(path: Path, geobox: GeoBox) -> None:
@@ -357,9 +436,9 @@ def write_region(ds: xr.Dataset, path: Path, region: dict[str, slice]) -> None:
         # Computing stays at the original, smaller chunk size.
         ds = ds.chunk({dim: -1 for dim in region if dim in ds.dims})
     # xarray's region-write rejects any variable lacking a dimension in common with
-    # `region`; scalar coordinates like a CRS grid mapping variable must be dropped,
-    # since they were already written once by prepare_template.
-    ds = ds.drop_vars([c for c in ds.coords if c not in ds.dims])
+    # `region`, e.g. a CRS grid mapping variable or the `band` coordinate; they were
+    # already written once by prepare_template.
+    ds = ds.drop_vars([n for n, v in ds.variables.items() if not set(v.dims) & set(region)])
     # zarr-python skips writing chunks that are entirely fill value (e.g. an all-NaN
     # nodata shard) by default, which `region_is_written` couldn't tell apart from a
     # chunk that was never written.
@@ -413,10 +492,12 @@ def _record_skipped(store: Path, variable: str, skip: Callable[[dict[str, slice]
     za = group[variable]
     assert isinstance(za, zarr.Array), f"{variable} is not an array"
     assert isinstance(za.metadata, ArrayV3Metadata), f"{variable} is not Zarr v3"
+    all_dims = list(za.metadata.dimension_names or ())
+    positions = [i for i, dim in enumerate(all_dims) if dim != BAND_DIM]
     units = _storage_units(za)
-    skipped = [list(index) for index, region in units if skip(region)]
+    skipped = [[index[i] for i in positions] for index, region in units if skip(region)]
     group.attrs[SKIPPED_SHARDS_ATTR] = {
-        "dimensions": list(za.metadata.dimension_names or ()),
+        "dimensions": [all_dims[i] for i in positions],
         "indices": skipped,
     }
     log.info(f"Skipping {len(skipped)}/{len(units)} storage unit(s)")
@@ -471,10 +552,16 @@ def write_regions(store: Path, variable: str) -> list[dict[str, slice]]:
     assert isinstance(za, zarr.Array), f"{variable} is not an array"
     assert isinstance(za.metadata, ArrayV3Metadata), f"{variable} is not Zarr v3"
     skipped_dims, skipped = _skipped_units(store)
-    assert not skipped or skipped_dims == list(za.metadata.dimension_names or ()), (
-        f"{variable}'s dimensions differ from {SKIPPED_SHARDS_ATTR}'s {skipped_dims}"
+    dims = list(za.metadata.dimension_names or ())
+    assert set(skipped_dims) <= set(dims), (
+        f"{variable}'s dimensions {dims} lack some of {SKIPPED_SHARDS_ATTR}'s {skipped_dims}"
     )
-    return [region for index, region in _storage_units(za) if index not in skipped]
+    positions = [dims.index(dim) for dim in skipped_dims]
+    return [
+        region
+        for index, region in _storage_units(za)
+        if tuple(index[i] for i in positions) not in skipped
+    ]
 
 
 def region_is_written(path: Path, region: dict[str, slice], variables: Sequence[str]) -> bool:

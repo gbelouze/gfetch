@@ -9,11 +9,15 @@ from odc.geo.geobox import GeoBox
 from odc.geo.xr import xr_coords
 
 from gfetch.write import (
+    BAND_NAMES_ATTR,
     SKIPPED_SHARDS_ATTR,
+    STACKED_VARIABLE,
     prepare_template,
     region_is_written,
+    stack_bands,
     store_initialized,
     store_is_complete,
+    validate_bands,
     validate_chunks,
     validate_geobox,
     write,
@@ -425,3 +429,82 @@ def test_prepare_template_keeps_a_shard_sized_graph(tmp_path: Path, monkeypatch)
     za = zarr.open_array(store=path / "red")
     assert za.chunks == (4, 4)
     assert za.shards == (32, 32)
+
+
+@pytest.fixture
+def bands() -> xr.Dataset:
+    rng = np.random.default_rng(0)
+    return xr.Dataset(
+        {
+            "red": (("y", "x"), rng.random((16, 16)).astype("float64")),
+            "green": (("y", "x"), rng.random((16, 16)).astype("float32")),
+        },
+        coords={"y": np.arange(16), "x": np.arange(16), "spatial_ref": 0},
+    )
+
+
+def test_stack_bands_orders_names_and_casts_to_float32(bands: xr.Dataset) -> None:
+    stacked = stack_bands(bands.chunk({"y": 4, "x": 4}), ["green", "red"])
+
+    da = stacked[STACKED_VARIABLE]
+    assert da.dims == ("band", "y", "x")
+    assert da.dtype == np.float32
+    assert da.attrs[BAND_NAMES_ATTR] == ["green", "red"]
+    assert list(da["band"].values) == ["green", "red"]
+    assert da.chunks is not None
+    assert da.chunks[0] == (2,)
+    np.testing.assert_array_equal(da.sel(band="red").values, bands["red"].astype("float32"))
+
+
+def test_stacked_region_writes_round_trip(tmp_path: Path, bands: xr.Dataset) -> None:
+    stacked = stack_bands(bands.chunk({"y": 4, "x": 4}), ["red", "green"])
+    path = tmp_path / "stacked.zarr"
+    prepare_template(stacked, path, shards={"y": 8, "x": 8})
+
+    za = zarr.open_array(store=path / STACKED_VARIABLE)
+    assert (za.chunks, za.shards) == ((2, 4, 4), (2, 8, 8))
+    regions = write_regions(path, STACKED_VARIABLE)
+    assert len(regions) == 4
+    for region in regions:
+        write_region(stacked.isel(region), path, region)
+
+    assert store_is_complete(path, [STACKED_VARIABLE])
+    reopened = xr.open_zarr(path, consolidated=False)[STACKED_VARIABLE].load()
+    xr.testing.assert_equal(reopened, stacked[STACKED_VARIABLE].load())
+
+
+def test_stacked_skipped_shards_index_only_the_spatial_grid(
+    tmp_path: Path, bands: xr.Dataset
+) -> None:
+    stacked = stack_bands(bands.chunk({"y": 4, "x": 4}), ["red", "green"])
+    path = tmp_path / "stacked.zarr"
+    prepare_template(
+        stacked, path, shards={"y": 8, "x": 8}, skip=lambda region: region["x"].start == 8
+    )
+
+    attrs = zarr.open_group(store=path, mode="r").attrs[SKIPPED_SHARDS_ATTR]
+    assert attrs == {"dimensions": ["y", "x"], "indices": [[0, 1], [1, 1]]}
+    regions = write_regions(path, STACKED_VARIABLE)
+    assert [(r["y"].start, r["x"].start) for r in regions] == [(0, 0), (8, 0)]
+    for region in regions:
+        write_region(stacked.isel(region), path, region)
+    assert store_is_complete(path, [STACKED_VARIABLE])
+
+
+def test_validate_bands_raises_on_other_bands(tmp_path: Path, bands: xr.Dataset) -> None:
+    path = tmp_path / "stacked.zarr"
+    prepare_template(stack_bands(bands.chunk({"y": 4, "x": 4}), ["red", "green"]), path)
+
+    validate_bands(path, ["red", "green"])
+    with pytest.raises(ValueError, match="on-disk bands"):
+        validate_bands(path, ["green", "red"])
+
+
+def test_validate_bands_raises_on_a_store_with_one_array_per_band(
+    tmp_path: Path, bands: xr.Dataset
+) -> None:
+    path = tmp_path / "per_band.zarr"
+    prepare_template(bands.chunk({"y": 4, "x": 4}), path)
+
+    with pytest.raises(ValueError, match="one array per band"):
+        validate_bands(path, ["red", "green"])
