@@ -6,12 +6,14 @@ from unittest import mock
 import aiohttp
 import pystac
 import pytest
+import stac_asset.http_client
 from multidict import CIMultiDict, CIMultiDictProxy
 from rich.progress import Progress
 from stac_asset import DownloadError
+from stac_asset.messages import ErrorAssetDownload
 from yarl import URL
 
-from gfetch.download import _s3_uri_to_public_https, download_items
+from gfetch.download import _AssetDownload, _DownloadStats, _s3_uri_to_public_https, download_items
 
 
 def _make_item(item_id: str, assets: dict[str, Path | str]) -> pystac.Item:
@@ -124,13 +126,17 @@ def test_download_items_retry_does_not_corrupt_item(
     real_download_item = download_mod.download_item
     call_count = 0
 
-    async def flaky_download_item(item, directory, *, config, keep_non_downloaded):
+    async def flaky_download_item(item, directory, *, config, keep_non_downloaded, messages):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
             raise TimeoutError("simulated transient failure")
         return await real_download_item(
-            item, directory, config=config, keep_non_downloaded=keep_non_downloaded
+            item,
+            directory,
+            config=config,
+            keep_non_downloaded=keep_non_downloaded,
+            messages=messages,
         )
 
     monkeypatch.setattr(download_mod, "download_item", flaky_download_item)
@@ -257,7 +263,7 @@ def _failing_download_item(
     real_download_item = download_mod.download_item
     calls: list[list[str]] = []
 
-    async def fake_download_item(item, directory, *, config, keep_non_downloaded):
+    async def fake_download_item(item, directory, *, config, keep_non_downloaded, messages):
         calls.append(list(config.include))
         errors: list[Exception] = [
             _http_error(item.assets[key].href, failures[key].pop(0))
@@ -265,9 +271,15 @@ def _failing_download_item(
             if failures.get(key)
         ]
         if errors:
+            for error in errors:
+                await messages.put(ErrorAssetDownload(key="", href="", path=directory, error=error))
             raise DownloadError(errors)
         return await real_download_item(
-            item, directory, config=config, keep_non_downloaded=keep_non_downloaded
+            item,
+            directory,
+            config=config,
+            keep_non_downloaded=keep_non_downloaded,
+            messages=messages,
         )
 
     monkeypatch.setattr(download_mod, "download_item", fake_download_item)
@@ -327,3 +339,79 @@ def test_download_items_retries_other_http_errors(
 
     assert calls == [["vv"], ["vv"]]
     assert list(result.assets) == ["vv"]
+
+
+def test_stac_asset_session_aborts_stalled_reads() -> None:
+    async def session_timeout() -> aiohttp.ClientTimeout:
+        # The constructor stac_asset's HttpClient.from_config() calls.
+        async with stac_asset.http_client.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=300)
+        ) as session:
+            return session.timeout
+
+    timeout = asyncio.run(session_timeout())
+
+    assert timeout.total == 300
+    assert timeout.sock_read == 10
+    assert timeout.sock_connect == 10
+
+
+def test_download_items_logs_asset_summary(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    for key in ("vv", "vh"):
+        (source_dir / f"{key}.tif").write_bytes(key.encode() * 500)
+    item = _make_item("item-1", {k: source_dir / f"{k}.tif" for k in ("vv", "vh")})
+
+    with caplog.at_level("INFO", logger="gfetch.download"):
+        asyncio.run(download_items([item], tmp_path / "cache", ["vv", "vh"]))
+
+    assert "Downloaded 2 asset(s), 2.0 kB in" in caplog.text
+    assert "Time per asset: p10" in caplog.text
+    assert "Speed per asset: min" in caplog.text
+    assert "Slowest asset(s): item-1/" in caplog.text
+
+
+def test_download_items_logs_failed_attempts_by_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    src = source_dir / "vv.tif"
+    src.write_bytes(b"VV")
+    item = _make_item("item-1", {"vv": src})
+    _failing_download_item(monkeypatch, {"vv": [500, 503]})
+
+    asyncio.run(download_items([item], tmp_path / "cache", ["vv"]))
+
+    assert "item-1: attempt 1/5 failed (DownloadError: ClientResponseError" in caplog.text
+    assert "2 asset download attempt(s) failed: ClientResponseError x2" in caplog.text
+
+
+def test_download_stats_summary(caplog: pytest.LogCaptureFixture) -> None:
+    stats = _DownloadStats(
+        downloads=[
+            _AssetDownload(f"item-{i}/vv", seconds=float(i), n_bytes=1_000_000)
+            for i in range(1, 102)
+        ]
+    )
+
+    with caplog.at_level("INFO", logger="gfetch.download"):
+        stats.log_summary(wall_seconds=50.5, n_slowest=2)
+
+    assert "Downloaded 101 asset(s), 101.0 MB in 0:00:50 (2.0 MB/s overall)" in caplog.text
+    assert "Time per asset: p10 11.0s, p50 51.0s, p90 91.0s, p99 100.0s, max 101.0s" in caplog.text
+    assert "Speed per asset: min 9.9 kB/s, p1 10.0 kB/s" in caplog.text
+    assert "Slowest asset(s): item-101/vv 101.0s for 1.0 MB, item-100/vv 100.0s" in caplog.text
+
+
+def test_download_stats_summary_single_asset(caplog: pytest.LogCaptureFixture) -> None:
+    stats = _DownloadStats(downloads=[_AssetDownload("item-1/vv", 2.5, 5_000_000)])
+
+    with caplog.at_level("INFO", logger="gfetch.download"):
+        stats.log_summary(wall_seconds=2.5)
+
+    assert "Time per asset: p10 2.5s, p50 2.5s, p90 2.5s, p99 2.5s, max 2.5s" in caplog.text
+    assert "p50 2.0 MB/s" in caplog.text
