@@ -1525,3 +1525,27 @@ that state was reached, and should be read chronologically, not as reference mat
   - Not measured: `mosaic`'s own write time/memory with every band in one shard task
     (`benchmark/sharding_write.py`'s "sharded, all bands per write" row, at 6-12 bands,
     is the closest data point).
+
+- **2026-10-08** — **Added `gfetch utils rechunk`**; see `claude/tech-stack.md`'s
+  "`gfetch utils`: store maintenance commands" section.
+  - Trigger: the Mozambania 2021 S2 mosaic (job 780970) ran with the old 64 px chunks /
+    8192 px shards, at 22-40 min per shard, about 7 h per array task.
+  - **Found: unknown top-level config keys are silently dropped.** The jz configs had
+    `compute_factor: 16`, but the field is `compute_chunk_factor`, so `mosaic` used the
+    default factor 4 on 64 px chunks: 256 px dask bricks, likely why its shards were slow
+    (scheduler/GDAL-open overhead per task). Sections are validated strictly; the
+    generic top level isn't, by design (GEDI-only keys live there). Open: warn on
+    top-level keys known to no loader.
+  - jz configs (`mozambania/v6/*/download_gfetch/config.yaml`) moved to 256 px chunks,
+    `shard_factor: 16`, `compute_chunk_factor: 4`.
+  - Extended the same day to per-band (pre-2026-10-07) stores, stacking them, and
+    rebuilt on `mosaic`'s own writer so the output can't drift from what `mosaic` writes
+    (verified by comparing every `zarr.json`). `--bands` gives the order, which per-band
+    stores don't record.
+  - Found on the way: cyclopts gives a list option one token per flag by default, so
+    `--bands red green` sent `green` to the store paths; fixed with `consume_multiple`.
+  - Added `gfetch utils check`, reusing `rechunk`'s template builder as the reference.
+    Test store builders moved to `tests/conftest.py` (`Stores` fixture), shared by
+    `test_rechunk.py` and `test_check.py`; `tests` added to pyrefly's `search-path` so
+    `from conftest import ...` type-checks.
+

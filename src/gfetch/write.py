@@ -42,6 +42,7 @@ __all__ = [
     "SKIPPED_SHARDS_ATTR",
     "STACKED_VARIABLE",
     "prepare_template",
+    "region_is_skipped",
     "region_is_written",
     "stack_bands",
     "store_initialized",
@@ -562,6 +563,44 @@ def write_regions(store: Path, variable: str) -> list[dict[str, slice]]:
         for index, region in _storage_units(za)
         if tuple(index[i] for i in positions) not in skipped
     ]
+
+
+def region_is_skipped(store: Path, variable: str, region: dict[str, slice]) -> bool:
+    """
+    Check whether every storage unit of `variable` overlapping `region` is skipped.
+
+    Parameters
+    ----------
+    store : Path
+        Zarr store path holding `variable`.
+    variable : str
+        Array whose storage grid `SKIPPED_SHARDS_ATTR` indexes.
+    region : dict[str, slice]
+        Mapping from dimension name to slice. A dimension missing from `region` is
+        taken in full.
+
+    Returns
+    -------
+    bool
+        True if the store records skipped units and every unit overlapping `region`
+        is among them.
+    """
+    skipped_dims, skipped = _skipped_units(store)
+    if not skipped:
+        return False
+    za = zarr.open_group(store=store, mode="r")[variable]
+    assert isinstance(za, zarr.Array), f"{variable} is not an array"
+    assert isinstance(za.metadata, ArrayV3Metadata), f"{variable} is not Zarr v3"
+    dims = list(za.metadata.dimension_names or ())
+    write_sizes = za.shards or za.chunks
+    ranges = []
+    for dim in skipped_dims:
+        axis = dims.index(dim)
+        sl = region.get(dim, slice(None))
+        start = sl.start if sl.start is not None else 0
+        stop = sl.stop if sl.stop is not None else za.shape[axis]
+        ranges.append(range(start // write_sizes[axis], -(-stop // write_sizes[axis])))
+    return all(index in skipped for index in itertools.product(*ranges))
 
 
 def region_is_written(path: Path, region: dict[str, slice], variables: Sequence[str]) -> bool:

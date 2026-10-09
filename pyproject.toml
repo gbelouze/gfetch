@@ -29,7 +29,7 @@ project-includes = [
     "**/*.ipynb",
 ]
 disable-search-path-heuristics = true
-search-path = [".", "benchmark"]
+search-path = [".", "benchmark", "tests"]
 
 [project.scripts]
 gfetch = "gfetch.cli.main:app"

@@ -846,6 +846,68 @@ fraction of the shards).
 - `bands` sorts before `spatial_ref`, so the GDAL consolidated-metadata bug (see
   "Consolidated metadata and GDAL") would drop its CRS: stores must stay unconsolidated.
 
+## `gfetch utils`: store maintenance commands (added 2026-10-08)
+
+A namespace for commands that act on gfetch's outputs, not on a job: they take store
+paths, not a config. First command: `gfetch utils rechunk`, after the 2026-09-28 default
+change left the 2021 S2 store (and possibly others) in the 64 px / 8192 px layout.
+Rewriting a store is pure I/O; re-mosaicking it is about 30 nodes x 7 h per year.
+
+**Decision (2026-10-08)**, `gfetch utils rechunk STORE... [--chunk] [--shard-factor]
+[--bands]` (`gfetch.rechunk.rechunk`): brings a complete store to the layout `mosaic`
+writes now, stacked or per-band source alike.
+
+- **Output identical to `mosaic`'s.** The source is opened with xarray (encodings dropped,
+  the grid mapping set back as a coordinate, a stacked `bands` split back into one
+  variable per band), and each new shard is written through `mosaic`'s own
+  `stack_bands`/`prepare_template`/`write_region`. A test converts a per-band store and
+  compares every `zarr.json` and the data against a store written the `mosaic` way: equal.
+  Copying arrays with zarr directly was tried first, and missed `write_region`'s
+  `write_empty_chunks=True`: all-NaN shards went unwritten, so the store never completed.
+- **Band order**: a per-band store doesn't record it (unconsolidated metadata, no
+  order attribute), so `--bands` is required for one, in `mosaic`'s order
+  (`resolve_output_variables`: config `bands`, `_ascending` then `_descending` per band
+  with `orbit_state: as_bands`). A stacked store keeps its order unless `--bands`
+  reorders it. The set must match the store's bands exactly.
+- Store paths plus flags, defaulting to `mosaic`'s defaults (`resolve_chunks`,
+  `resolve_shards`); `shard == chunk` gives an unsharded store, as `shard_factor: 1` does.
+- Replaces the store in place by default, so configs and sprout paths stay valid;
+  `--output` writes elsewhere instead (one store only). The new store is built as
+  `.<name>.rechunk`, then swapped through `.<name>.rechunk-old`. Each rename succeeds for
+  one caller only, and a run that finds `<name>` gone but `-old` present finishes the swap.
+- Unit of work: one storage unit of the *new* store. It reads whatever source window it
+  needs, so the new grid needn't align with the old one, and writes disjoint files: safe
+  across `--task-id/--n-tasks` array tasks, resumable via `region_is_written`. Whichever
+  task observes the new store complete does the swap.
+- Threads (`--n-workers`, default `available_cpus`), as for `download`.
+- `gfetch:skipped_shards` is recomputed: a new unit is skipped iff every source unit it
+  overlaps was (`gfetch.write.region_is_skipped`). Always written, possibly empty, as
+  `mosaic` does.
+- Refuses an incomplete source store: finish (or delete) it first.
+
+Prior art considered: `jz/src/scripts/migrate_zarr_stacked.py` (per-band to stacked, 10%
+sample for the 2026-09-28 benchmark). Not reused: it samples shards, sorts bands
+alphabetically (which `validate_bands` then rejects), needs S1/S2 grids to match, and
+doesn't write the `band` coordinate.
+
+**Decision (2026-10-08)**, `gfetch utils check STORE... [--chunk] [--shard-factor]
+[--bands]` (`gfetch.check.check_store`): verifies a store has the form `mosaic` writes,
+logs one ✓/✗ line per check, exits 1 if any store fails (to gate a pipeline step).
+
+- The reference is `mosaic`'s writer, not a list of rules: `rechunk`'s `write_template`
+  builds, in a temp dir, the template `mosaic` would write for the store's own grid,
+  bands and layout, and every `zarr.json` is compared (dtype, fill value, codecs,
+  dimension names, attributes, the `band` coordinate). Built at the store's own layout so
+  a layout mismatch is reported once, by the layout check.
+- Checked separately, since the template is derived from the store itself and can't
+  vouch for them: Zarr v3 group, unconsolidated metadata, stacked bands (per-band stores
+  fail here, pointing to `rechunk`), band order (`--bands`), chunk/shard size (defaults
+  to `mosaic`'s), a `grid_mapping` naming an array with `crs_wkt`, a well-formed
+  `gfetch:skipped_shards` with indices inside the shard grid, every non-skipped shard
+  written (with the unwritten count).
+- Reads metadata only, plus one existence check per shard; no pixel data, so a full
+  country-scale store checks in seconds.
+
 ## Future: disk-bounded streaming download+mosaic (deferred, not designed for v1)
 
 Added 2026-09-22, from a user design discussion — **not built, not scheduled**; recorded

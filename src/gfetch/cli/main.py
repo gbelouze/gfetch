@@ -1,7 +1,9 @@
 """Main entry point for the gfetch CLI."""
 
 import logging
+import sys
 from pathlib import Path
+from typing import Annotated
 
 import cyclopts
 
@@ -487,6 +489,123 @@ def _gedi_l4a(config: Path, verbose: bool = False) -> None:
 
 
 app.command(gedi_app)
+
+
+utils_app = cyclopts.App(name="utils", help="Maintenance commands on gfetch's outputs.")
+
+
+@utils_app.command(name="rechunk")
+def _utils_rechunk(
+    stores: Annotated[list[Path], cyclopts.Parameter(negative=())],
+    *,
+    chunk: int | None = None,
+    shard_factor: int | None = None,
+    bands: Annotated[
+        list[str] | None, cyclopts.Parameter(negative=(), consume_multiple=True)
+    ] = None,
+    output: Path | None = None,
+    task_id: int = 0,
+    n_tasks: int = 1,
+    n_workers: int | None = None,
+    verbose: bool = False,
+) -> None:
+    """
+    Rewrite Zarr stores in the layout `mosaic` writes, e.g. after its defaults changed.
+
+    Stacks a per-band store's bands into one `(band, y, x)` array, and rewrites
+    stacked and per-band stores alike at the given chunk and shard size, through the
+    same writer as `mosaic`. Each store must be completely written. By default the
+    new store is built next to the old one and replaces it once complete. Safe to resume
+    after being killed, and to split across several concurrent invocations via
+    `task_id`/`n_tasks` (e.g. a SLURM job array).
+
+    Parameters
+    ----------
+    stores : Annotated[list[Path], cyclopts.Parameter(negative=())]
+        Zarr stores to rechunk.
+    chunk : int | None
+        Chunk side along `y` and `x`, in pixels. Defaults to None, which uses
+        `mosaic`'s default (256).
+    shard_factor : int | None
+        Number of chunks per shard along `y` and `x`; 1 disables sharding. Defaults to
+        None, which uses `mosaic`'s default (16).
+    bands : Annotated[list[str] | None, cyclopts.Parameter(negative=(), consume_multiple=True)]
+        Band order of the new stores, as `mosaic` orders them: the config's `bands`,
+        with `orbit_state: as_bands` each band's `_ascending` then `_descending`
+        variant. Required for per-band stores. Defaults to None, which keeps a
+        stacked store's order.
+    output : Path | None
+        Write the new store here instead of replacing the old one. Only with a single
+        store. Defaults to None.
+    task_id : int
+        This invocation's index among `n_tasks` concurrent invocations. Defaults
+        to 0.
+    n_tasks : int
+        Total number of concurrent invocations splitting each store's shards
+        between them. Defaults to 1 (no splitting).
+    n_workers : int | None
+        Number of copying threads. Defaults to None, which uses the CPUs available
+        to this process.
+    verbose : bool
+        Enable verbose (DEBUG) logging. Defaults to False.
+    """
+    _setup_logging(level=logging.DEBUG if verbose else logging.INFO)
+    from gfetch.cli.utils import rechunk as rechunk_cmd
+
+    rechunk_cmd(
+        stores,
+        chunk=chunk,
+        shard_factor=shard_factor,
+        bands=bands,
+        output=output,
+        task_id=task_id,
+        n_tasks=n_tasks,
+        n_workers=n_workers,
+    )
+
+
+@utils_app.command(name="check")
+def _utils_check(
+    stores: Annotated[list[Path], cyclopts.Parameter(negative=())],
+    *,
+    chunk: int | None = None,
+    shard_factor: int | None = None,
+    bands: Annotated[
+        list[str] | None, cyclopts.Parameter(negative=(), consume_multiple=True)
+    ] = None,
+    verbose: bool = False,
+) -> None:
+    """
+    Check that Zarr stores have the form `mosaic` writes; exit with 1 if any doesn't.
+
+    Checks each store is an unconsolidated Zarr v3 group with stacked bands, the
+    expected chunk and shard size, a CRS, metadata identical to what `mosaic` would
+    write for its grid and bands, a well-formed skipped-shards record, and every shard
+    written. Reads metadata only, plus one existence check per shard.
+
+    Parameters
+    ----------
+    stores : Annotated[list[Path], cyclopts.Parameter(negative=())]
+        Zarr stores to check.
+    chunk : int | None
+        Expected chunk side along `y` and `x`, in pixels. Defaults to None, which uses
+        `mosaic`'s default (256).
+    shard_factor : int | None
+        Expected number of chunks per shard along `y` and `x`; 1 for an unsharded
+        store. Defaults to None, which uses `mosaic`'s default (16).
+    bands : Annotated[list[str] | None, cyclopts.Parameter(negative=(), consume_multiple=True)]
+        Expected band names, in order. Defaults to None, which accepts any.
+    verbose : bool
+        Enable verbose (DEBUG) logging. Defaults to False.
+    """
+    _setup_logging(level=logging.DEBUG if verbose else logging.INFO)
+    from gfetch.cli.utils import check as check_cmd
+
+    if not check_cmd(stores, chunk=chunk, shard_factor=shard_factor, bands=bands):
+        sys.exit(1)
+
+
+app.command(utils_app)
 
 
 if __name__ == "__main__":

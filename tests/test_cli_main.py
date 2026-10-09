@@ -145,3 +145,19 @@ def test_ocm_is_an_s2_only_command(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls == [(Path("config.yaml"), "s2", 1, 2, "cuda", "float16", 8)]
     with pytest.raises(SystemExit):
         app(["s1", "ocm", "config.yaml"], result_action="return_value", exit_on_error=True)
+
+
+def test_utils_rechunk_separates_bands_from_stores(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple] = []
+
+    def fake_rechunk(stores: list[Path], **kwargs: object) -> None:
+        calls.append((stores, kwargs["bands"], kwargs["chunk"]))
+
+    monkeypatch.setattr("gfetch.cli.utils.rechunk", fake_rechunk)
+
+    app(
+        ["utils", "rechunk", "a.zarr", "b.zarr", "--bands", "red", "green", "--chunk", "128"],
+        result_action="return_value",
+    )
+
+    assert calls == [([Path("a.zarr"), Path("b.zarr")], ["red", "green"], 128)]
