@@ -195,8 +195,11 @@ def write_template(
 def _copy_region(
     source: xr.Dataset, dst: Path, bands: Sequence[str], region: dict[str, slice]
 ) -> None:
-    window = source[list(bands)].isel({d: region[d] for d in SPATIAL_DIMS}).load()
-    write_region(stack_bands(window, bands), dst, region)
+    # Not bound to a name, so the per-band copy is freed once stacked, before the write.
+    window = stack_bands(
+        source[list(bands)].isel({d: region[d] for d in SPATIAL_DIMS}).load(), bands
+    )
+    write_region(window, dst, region)
 
 
 def _swap(path: Path, new: Path, old: Path) -> None:
@@ -259,7 +262,7 @@ def rechunk(
         Total number of concurrent invocations splitting the store's units between
         them. Defaults to 1 (no splitting).
     n_workers : int
-        Number of threads copying units. Each holds about three units' worth of every
+        Number of threads copying units. Each holds up to two units' worth of every
         band in memory. Defaults to 1.
     progress : Progress | None
         Progress bar to report copied units on. Defaults to None (no progress bar).

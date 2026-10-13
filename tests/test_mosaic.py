@@ -201,8 +201,8 @@ def test_resolve_compute_chunks_rejects_bricks_not_dividing_the_write_unit(
         resolve_compute_chunks({"x": 256, "y": 256, "time": -1}, factor, shards)
 
 
-def test_resolve_shards_defaults_to_16_chunks_per_side() -> None:
-    assert resolve_shards(None, {"x": 256, "y": 128, "time": -1}) == {"y": 2048, "x": 4096}
+def test_resolve_shards_defaults_to_32_chunks_per_side() -> None:
+    assert resolve_shards(None, {"x": 256, "y": 128, "time": -1}) == {"y": 4096, "x": 8192}
 
 
 def test_resolve_shards_scales_chunks_by_factor() -> None:

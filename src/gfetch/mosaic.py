@@ -36,10 +36,10 @@ _DEFAULT_CHUNKS: dict[str, int] = {"x": 256, "y": 256}
 # `time` chunk from the start avoids that rechunk entirely.
 _DEFAULT_TIME_CHUNK = -1
 
-# 16x16 chunks per shard: 4096 px shards at the default chunk size. The mosaic stage
+# 32x32 chunks per shard: 8192 px shards at the default chunk size. The mosaic stage
 # writes one shard per task, so a shard's output (all bands, float32) is held in memory
-# at once: 1 GB for 16 bands.
-_DEFAULT_SHARD_FACTOR = 16
+# at once: 4.3 GB for 16 bands.
+_DEFAULT_SHARD_FACTOR = 32
 
 # 4x4 chunks per dask chunk: 1024 px at the default chunk size.
 _DEFAULT_COMPUTE_CHUNK_FACTOR = 4

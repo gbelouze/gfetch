@@ -273,7 +273,7 @@ class Config:
         otherwise. Its output (all bands) is held in memory at once. `1` disables
         sharding (one file per chunk). Reading a sharded store with GDAL (and QGIS)
         needs GDAL 3.13+. Defaults to None, which uses
-        `gfetch.mosaic.resolve_shards`' default of 16 (4096 px shards at the default
+        `gfetch.mosaic.resolve_shards`' default of 32 (8192 px shards at the default
         `chunks`).
     """
 

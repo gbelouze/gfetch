@@ -127,7 +127,7 @@ def stack_bands(ds: xr.Dataset, variables: Sequence[str]) -> xr.Dataset:
         coordinate and a `BAND_NAMES_ATTR` attribute naming its bands, and a single
         dask chunk along `band`.
     """
-    stacked = ds[list(variables)].to_dataarray(dim=BAND_DIM).astype("float32")
+    stacked = ds[list(variables)].to_dataarray(dim=BAND_DIM).astype("float32", copy=False)
     if stacked.chunks is not None:
         stacked = stacked.chunk({BAND_DIM: -1})
     stacked.attrs = {BAND_NAMES_ATTR: [str(v) for v in variables]}

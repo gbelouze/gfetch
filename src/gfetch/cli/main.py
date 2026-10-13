@@ -528,7 +528,7 @@ def _utils_rechunk(
         `mosaic`'s default (256).
     shard_factor : int | None
         Number of chunks per shard along `y` and `x`; 1 disables sharding. Defaults to
-        None, which uses `mosaic`'s default (16).
+        None, which uses `mosaic`'s default (32).
     bands : Annotated[list[str] | None, cyclopts.Parameter(negative=(), consume_multiple=True)]
         Band order of the new stores, as `mosaic` orders them: the config's `bands`,
         with `orbit_state: as_bands` each band's `_ascending` then `_descending`
@@ -592,7 +592,7 @@ def _utils_check(
         `mosaic`'s default (256).
     shard_factor : int | None
         Expected number of chunks per shard along `y` and `x`; 1 for an unsharded
-        store. Defaults to None, which uses `mosaic`'s default (16).
+        store. Defaults to None, which uses `mosaic`'s default (32).
     bands : Annotated[list[str] | None, cyclopts.Parameter(negative=(), consume_multiple=True)]
         Expected band names, in order. Defaults to None, which accepts any.
     verbose : bool
