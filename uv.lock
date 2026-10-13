@@ -1077,6 +1077,7 @@ dependencies = [
     { name = "sliderule" },
     { name = "stac-asset" },
     { name = "tqdm" },
+    { name = "urllib3" },
     { name = "zarr" },
 ]
 
@@ -1110,6 +1111,7 @@ requires-dist = [
     { name = "sliderule", specifier = ">=5.6.1" },
     { name = "stac-asset", specifier = ">=0.4.7" },
     { name = "tqdm", specifier = ">=4.70.1" },
+    { name = "urllib3", specifier = ">=2" },
     { name = "zarr", specifier = ">=3.4.0" },
 ]
 provides-extras = ["ocm"]

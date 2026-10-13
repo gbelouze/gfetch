@@ -20,6 +20,7 @@ dependencies = [
     "sliderule>=5.6.1",
     "stac-asset>=0.4.7",
     "tqdm>=4.70.1",
+    "urllib3>=2",
     "zarr>=3.4.0",
 ]
 

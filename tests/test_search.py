@@ -4,6 +4,9 @@ from dataclasses import dataclass
 import pystac
 import pystac_client
 import pytest
+from pystac_client.stac_api_io import StacApiIO
+from requests.adapters import HTTPAdapter
+from urllib3.exceptions import MaxRetryError
 
 from gfetch.search import _dedupe_sentinel2_processing_baseline, search
 from gfetch.sources import get_source
@@ -78,7 +81,7 @@ def test_search_uses_explicit_collection_bypassing_source_registry(
     monkeypatch.setattr(
         pystac_client.Client,
         "open",
-        staticmethod(lambda url: _FakeCatalog(requested_collections)),
+        staticmethod(lambda url, **kwargs: _FakeCatalog(requested_collections)),
     )
 
     source = get_source("earthsearch")
@@ -93,6 +96,33 @@ def test_search_uses_explicit_collection_bypassing_source_registry(
     assert requested_collections == [["my-explicit-collection"]]
 
 
+def test_search_retries_failed_requests_for_about_five_minutes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened: list[StacApiIO] = []
+
+    def fake_open(url: str, *, stac_io: StacApiIO) -> _FakeCatalog:
+        opened.append(stac_io)
+        return _FakeCatalog([])
+
+    monkeypatch.setattr(pystac_client.Client, "open", staticmethod(fake_open))
+
+    search(get_source("earthsearch"), "sentinel-2", (2.0, 48.0, 2.1, 48.1), "2024-01-01/2024-06-01")
+
+    adapter = opened[0].session.get_adapter("https://example.com")
+    assert isinstance(adapter, HTTPAdapter)
+    retry = adapter.max_retries
+    assert retry.is_retry("POST", 500)
+    total_wait = 0.0
+    while True:
+        try:
+            retry = retry.increment("POST", "/search", error=ConnectionError())
+        except MaxRetryError:
+            break
+        total_wait += retry.get_backoff_time()
+    assert 240 <= total_wait <= 360
+
+
 def test_search_intersects_drops_bbox_from_the_actual_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -104,7 +134,7 @@ def test_search_intersects_drops_bbox_from_the_actual_request(
     monkeypatch.setattr(
         pystac_client.Client,
         "open",
-        staticmethod(lambda url: _FakeCatalog([], requested_kwargs)),
+        staticmethod(lambda url, **kwargs: _FakeCatalog([], requested_kwargs)),
     )
 
     source = get_source("earthsearch")
@@ -227,7 +257,7 @@ def test_search_falls_back_within_earthsearch_c1_2022_gap(
     monkeypatch.setattr(
         pystac_client.Client,
         "open",
-        staticmethod(lambda url: _FakeCatalog(requested_collections)),
+        staticmethod(lambda url, **kwargs: _FakeCatalog(requested_collections)),
     )
 
     with caplog.at_level("WARNING"):

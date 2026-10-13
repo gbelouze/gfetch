@@ -1549,3 +1549,17 @@ that state was reached, and should be read chronologically, not as reference mat
     `test_rechunk.py` and `test_check.py`; `tests` added to pyrefly's `search-path` so
     `from conftest import ...` type-checks.
 
+
+- **2026-10-13** — **`search` retries with backoff for about 5 minutes.** A Jean Zay
+  `archive` job died opening Earth Search's catalog: `ProxyError('Tunnel connection
+  failed: 500 Internal Server Error')` from the IDRIS compute-node proxy (same flaky
+  pool as the 2026-09-22 GEDI entry). pystac-client's default `max_retries=5` has no
+  backoff, so all 5 retries fired within one second. `search` now passes a `StacApiIO`
+  with a urllib3 `Retry` (10 tries, waits up to 60 s, retries 5xx and POST).
+  - `download` left as is for now: it retries per item (5 tries, ~10 s total), and a
+    whole-batch failure is recoverable by rerunning, since assets resume from their
+    `.complete` files.
+  - `search` now skips as soon as `items.json` exists, instead of only once every mosaic
+    store is complete: the 2024 job had items from an interactive run and searched (and
+    hit the proxy) again for nothing. Re-searching mid-download could also swap the item
+    set under a partial cache. Delete `items.json` to rerun after a config change.

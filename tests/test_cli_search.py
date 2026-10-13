@@ -1,10 +1,13 @@
 from pathlib import Path
 from typing import Any
 
+import pystac
 import pytest
+import yaml
 
-from gfetch.cli.config import AOIConfig, Config, TimeRangeConfig
+from gfetch.cli.config import AOIConfig, Config, TimeRangeConfig, load
 from gfetch.cli.search import _build_query
+from gfetch.cli.search import search as search_cmd
 
 
 def _config(**overrides: Any) -> Config:
@@ -45,3 +48,40 @@ def test_build_query_orbit_state_as_bands_searches_both() -> None:
 def test_build_query_invalid_orbit_state_raises() -> None:
     with pytest.raises(ValueError, match="orbit_state"):
         _build_query(_config(orbit_state="sideways"))
+
+
+def _write_config(tmp_path: Path) -> Path:
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        yaml.dump(
+            {
+                "aoi": {"left": 2.2, "bottom": 48.7, "right": 2.21, "top": 48.71},
+                "time_range": {"start": "2024-01-01", "end": "2024-06-01"},
+                "output_dir": str(tmp_path / "out"),
+            }
+        )
+    )
+    return cfg_path
+
+
+def test_search_writes_items_when_none_exist(tmp_path: Path, monkeypatch) -> None:
+    cfg_path = _write_config(tmp_path)
+    monkeypatch.setattr("gfetch.cli.search.search_items", lambda *args, **kwargs: [])
+
+    search_cmd(cfg_path, "s2")
+
+    assert load(cfg_path, "s2").items_path.exists()
+
+
+def test_search_skips_when_items_exist(tmp_path: Path, monkeypatch) -> None:
+    cfg_path = _write_config(tmp_path)
+    cfg = load(cfg_path, "s2")
+    cfg.output_dir.mkdir(parents=True)
+    pystac.ItemCollection([]).save_object(str(cfg.items_path))
+
+    def no_search(*args: object, **kwargs: object) -> None:
+        raise AssertionError("search must be skipped")
+
+    monkeypatch.setattr("gfetch.cli.search.search_items", no_search)
+
+    search_cmd(cfg_path, "s2")

@@ -59,7 +59,7 @@ def _register_raster_commands(sub_app: cyclopts.App, satellite_key: str) -> None
         Search a STAC source for items matching a configuration's AOI/time range.
 
         Internet-connected stage; safe to run on an HPC login/data-transfer node.
-        Skips if every mosaic store is already complete; delete them to rerun.
+        Skips if its search results (`items.json`) exists; delete it to rerun.
 
         Parameters
         ----------
@@ -281,7 +281,7 @@ def _custom_search(name: str, config: Path, verbose: bool = False) -> None:
     Search a STAC source for items matching a `custom` satellite's AOI/time range.
 
     Internet-connected stage; safe to run on an HPC login/data-transfer node.
-    Skips if every mosaic store is already complete; delete them to rerun.
+    Skips if its search results (`items.json`) exists; delete it to rerun.
 
     Parameters
     ----------

@@ -5,12 +5,25 @@ import logging
 
 import pystac
 import pystac_client
+from pystac_client.stac_api_io import StacApiIO
+from urllib3.util.retry import Retry
 
 from gfetch.sources import StacSource, resolve_collection
 
 log = logging.getLogger(__name__)
 
 __all__ = ["search"]
+
+# Waits 0, 2, 4, ..., 32, then 60 s between attempts: about 5 minutes in total, to ride
+# out HPC egress proxies failing intermittently. Item search is a POST, which urllib3
+# doesn't retry unless `allowed_methods` lets it.
+_RETRY = Retry(
+    total=10,
+    backoff_factor=1,
+    backoff_max=60,
+    status_forcelist=(500, 502, 503, 504),
+    allowed_methods=None,
+)
 
 
 def _dedupe_sentinel2_processing_baseline(items: list[pystac.Item]) -> list[pystac.Item]:
@@ -128,7 +141,7 @@ def search(
         f"Searching {source.name} collection {collection!r} for bbox={bbox} datetime={datetime}"
     )
     log.debug(f"Opening STAC catalog at {source.api_url}")
-    catalog = pystac_client.Client.open(source.api_url)
+    catalog = pystac_client.Client.open(source.api_url, stac_io=StacApiIO(max_retries=_RETRY))
     result = catalog.search(
         collections=[collection],
         bbox=None if intersects is not None else bbox,
