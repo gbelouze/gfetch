@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import geopandas as gpd
 import pytest
 import shapely
 import yaml
@@ -8,6 +9,7 @@ from odc.geo.crs import CRS
 from gfetch import countries as countries_module
 from gfetch.cli.config import (
     load,
+    read_geofile_aoi,
     resolve_bands,
     resolve_cloud_mask,
     resolve_compute_workers,
@@ -209,6 +211,74 @@ def test_aoi_geometry_is_the_aoi_box(tmp_path: Path) -> None:
     cfg = load(_write_config(tmp_path / "config.yaml"), "s2")
 
     assert cfg.aoi_geometry.equals(shapely.box(2.2, 48.7, 2.5, 49.0))
+
+
+def _write_geofile(path: Path, crs: str | None = "EPSG:32631") -> Path:
+    # Two disjoint 1 km squares in UTM 31N, near Paris.
+    squares = [shapely.box(450_000, 5_400_000, 451_000, 5_401_000)]
+    squares.append(shapely.box(455_000, 5_405_000, 456_000, 5_406_000))
+    gpd.GeoDataFrame(geometry=squares, crs=crs).to_file(path)
+    return path
+
+
+def test_read_geofile_aoi_reprojects_and_unions_features(tmp_path: Path) -> None:
+    geofile = _write_geofile(tmp_path / "aoi.gpkg")
+
+    geometry = read_geofile_aoi(geofile)
+
+    expected = gpd.read_file(geofile).to_crs(4326).geometry.union_all()
+    assert geometry.geom_type == "MultiPolygon"
+    assert geometry.equals(expected)
+
+
+@pytest.mark.filterwarnings("ignore:'crs' was not provided:UserWarning")
+def test_read_geofile_aoi_without_crs_raises(tmp_path: Path) -> None:
+    geofile = _write_geofile(tmp_path / "aoi.gpkg", crs=None)
+
+    with pytest.raises(ValueError, match="has no CRS"):
+        read_geofile_aoi(geofile)
+
+
+def test_geofile_resolves_aoi_to_its_bbox_and_geometry(tmp_path: Path) -> None:
+    geofile = _write_geofile(tmp_path / "aoi.gpkg")
+    config_path = _write_config(tmp_path / "config.yaml", aoi=None, geofile_aoi_path=str(geofile))
+
+    cfg = load(config_path, "s2")
+
+    expected = read_geofile_aoi(geofile)
+    assert cfg.resolved_aoi.bbox == pytest.approx(expected.bounds)
+    assert cfg.aoi_geometry.equals(expected)
+
+
+def test_relative_geofile_aoi_path_is_made_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_geofile(tmp_path / "aoi.gpkg")
+    config_path = _write_config(tmp_path / "config.yaml", aoi=None, geofile_aoi_path="aoi.gpkg")
+    monkeypatch.chdir(tmp_path)
+
+    cfg = load(config_path, "s2")
+
+    assert cfg.geofile_aoi_path == tmp_path.absolute() / "aoi.gpkg"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"countries": ["Mozambique"]},
+        {"aoi": None, "countries": ["Mozambique"]},
+    ],
+    ids=["with-aoi", "with-aoi-and-countries", "with-countries"],
+)
+def test_geofile_with_another_aoi_raises(tmp_path: Path, overrides: dict[str, object]) -> None:
+    geofile = _write_geofile(tmp_path / "aoi.gpkg")
+    config_path = _write_config(
+        tmp_path / "config.yaml", geofile_aoi_path=str(geofile), **overrides
+    )
+
+    with pytest.raises(ValueError, match="exactly one"):
+        load(config_path, "s2")
 
 
 def test_both_aoi_and_countries_raises(tmp_path: Path) -> None:

@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import geopandas as gpd
 import pytest
 import shapely
 import yaml
@@ -116,6 +117,18 @@ def test_countries_resolves_aoi_to_union_bbox(
     cfg = load(config_path, "l2a")
 
     assert cfg.resolved_aoi.bbox == (29.0, -27.0, 41.0, -1.0)
+
+
+def test_geofile_resolves_aoi_to_its_bbox_and_geometry(tmp_path: Path) -> None:
+    geofile = tmp_path / "aoi.gpkg"
+    polygon = shapely.Polygon([(2.2, 48.7), (2.5, 48.7), (2.2, 49.0)])
+    gpd.GeoDataFrame(geometry=[polygon], crs="EPSG:4326").to_file(geofile)
+    config_path = _write_config(tmp_path / "config.yaml", aoi=None, geofile_aoi_path=str(geofile))
+
+    cfg = load(config_path, "l2a")
+
+    assert cfg.resolved_aoi.bbox == pytest.approx((2.2, 48.7, 2.5, 49.0))
+    assert cfg.aoi_geometry.equals(polygon)
 
 
 def test_both_aoi_and_countries_raises(tmp_path: Path) -> None:

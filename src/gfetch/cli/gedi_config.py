@@ -37,11 +37,16 @@ class GediConfig:
         section, this defaults to `<generic output_dir>/gedi/<product>.parquet` if
         not set explicitly.
     aoi : AOIConfig | None
-        Area of interest. Exactly one of `aoi`/`countries` must be given.
+        Area of interest. Exactly one of `aoi`/`geofile_aoi_path`/`countries` must be
+        given.
+    geofile_aoi_path : Path | None
+        Vector file to derive the AOI from instead of giving `aoi` directly - see
+        `gfetch.cli.config.resolve_aoi`. Exactly one of `aoi`/`geofile_aoi_path`/
+        `countries` must be given.
     countries : list[str] | None
         Country names to derive the AOI from instead of giving `aoi` directly - see
-        `gfetch.cli.config.resolve_aoi`. Exactly one of `aoi`/`countries` must be
-        given.
+        `gfetch.cli.config.resolve_aoi`. Exactly one of `aoi`/`geofile_aoi_path`/
+        `countries` must be given.
     time_range : TimeRangeConfig | None
         Time range to fetch. Defaults to None, which processes every GEDI
         granule intersecting `aoi` across the whole mission archive
@@ -61,6 +66,7 @@ class GediConfig:
 
     output: Path
     aoi: AOIConfig | None = None
+    geofile_aoi_path: Path | None = None
     countries: list[str] | None = None
     time_range: TimeRangeConfig | None = None
     fields: list[str] | None = None
@@ -69,6 +75,8 @@ class GediConfig:
 
     def __post_init__(self) -> None:
         self.output = Path(self.output).expanduser().absolute()
+        if self.geofile_aoi_path is not None:
+            self.geofile_aoi_path = Path(self.geofile_aoi_path).expanduser().absolute()
 
     @property
     def resolved_aoi(self) -> AOIConfig:
@@ -76,10 +84,11 @@ class GediConfig:
         Returns
         -------
         AOIConfig
-            `aoi`, resolved by `load()` (from `countries`, if `aoi` wasn't given
-            directly) - never None on a `GediConfig` returned by `load()`. `aoi`
-            itself stays `AOIConfig | None` at the schema level so OmegaConf
-            accepts a config that gives `countries` instead.
+            `aoi`, resolved by `load()` (from `geofile_aoi_path` or `countries`, if
+            `aoi` wasn't given directly) - never None on a `GediConfig` returned by
+            `load()`. `aoi` itself stays `AOIConfig | None` at the schema level so
+            OmegaConf accepts a config that gives `geofile_aoi_path`/`countries`
+            instead.
         """
         assert self.aoi is not None, "aoi not yet resolved - build this GediConfig via load()"
         return self.aoi
@@ -93,7 +102,7 @@ class GediConfig:
             The exact AOI shape in EPSG:4326, see
             `gfetch.cli.config.resolve_aoi_geometry`.
         """
-        return resolve_aoi_geometry(self.resolved_aoi, self.countries)
+        return resolve_aoi_geometry(self.resolved_aoi, self.geofile_aoi_path, self.countries)
 
 
 @dataclass
@@ -140,8 +149,8 @@ def load(path: Path, product: str) -> GediConfig:
     GediConfig
         Fully validated configuration object, a `GediL2AConfig` for `'l2a'`.
         Raises `ValueError` if the file has a bare `gedi:` section, or (from
-        `gfetch.cli.config.resolve_aoi`) if neither/both of `aoi`/`countries` are
-        given.
+        `gfetch.cli.config.resolve_aoi`) if not exactly one of `aoi`/
+        `geofile_aoi_path`/`countries` is given.
     """
     log.debug(f"Loading GEDI {product} config from {path}")
     config_cls = GEDI_PRODUCTS[product]
@@ -168,6 +177,6 @@ def load(path: Path, product: str) -> GediConfig:
     merged = OmegaConf.merge(structured, overrides)
     OmegaConf.resolve(merged)
     cfg: GediConfig = OmegaConf.to_object(merged)  # type: ignore[assignment]
-    cfg.aoi = resolve_aoi(cfg.aoi, cfg.countries, context=str(path))
+    cfg.aoi = resolve_aoi(cfg.aoi, cfg.geofile_aoi_path, cfg.countries, context=str(path))
     log.debug(f"Resolved output={cfg.output}")
     return cfg

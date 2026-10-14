@@ -367,14 +367,11 @@ def prepare_template(
         must share one storage grid. Defaults to None (every unit is written).
     """
     ds = _restore_grid_mapping(ds)
+    if shards is None and chunks is not None:
+        ds = ds.chunk({dim: size for dim, size in chunks.items() if dim in ds.dims})
     encoding = {}
-    if shards is None:
-        if chunks is not None:
-            ds = ds.chunk({dim: size for dim, size in chunks.items() if dim in ds.dims})
-    else:
-        # The inner chunks go straight into the encoding, never through `ds.chunk`:
-        # dask builds a rechunk's tasks eagerly, one per output chunk, which over a
-        # whole UTM zone at small chunk sizes is tens of millions of tasks.
+    if shards is not None or chunks is not None:
+        # Explicit, so a dimension shorter than one chunk keeps the configured chunk size.
         store_chunks = chunks if chunks is not None else {}
         for name, var in ds.data_vars.items():
             dask_chunks = tuple(c[0] for c in var.chunks) if var.chunks is not None else var.shape
@@ -382,17 +379,18 @@ def prepare_template(
                 store_chunks.get(str(dim), chunk)
                 for dim, chunk in zip(var.dims, dask_chunks, strict=True)
             )
-            encoding[name] = {
-                "chunks": var_chunks,
-                "shards": tuple(
+            encoding[name] = {"chunks": var_chunks}
+            if shards is not None:
+                encoding[name]["shards"] = tuple(
                     shards.get(str(dim), chunk)
                     for dim, chunk in zip(var.dims, var_chunks, strict=True)
-                ),
-            }
+                )
             # `to_zarr`'s `encoding` replaces `var.encoding` instead of merging into it.
             if "grid_mapping" in var.encoding:
                 encoding[name]["grid_mapping"] = var.encoding["grid_mapping"]
-        # xarray requires dask chunks aligned to shards; nothing is computed here.
+    if shards is not None:
+        # xarray requires dask chunks aligned to shards; nothing is computed here. Never
+        # rechunk to the inner chunks: dask builds one task per output chunk, eagerly.
         ds = ds.chunk({dim: size for dim, size in shards.items() if dim in ds.dims})
     if store_initialized(path):
         log.debug(f"{path} already initialized, skipping template write")

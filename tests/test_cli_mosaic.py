@@ -141,6 +141,29 @@ def test_mosaic_builds_the_template_at_shard_size(tmp_path: Path, monkeypatch) -
     assert za.shards == (1, 8, 8)
 
 
+@pytest.mark.parametrize("shard_factor", [1, 2])
+def test_mosaic_on_an_aoi_shorter_than_one_chunk(
+    tmp_path: Path, monkeypatch, shard_factor: int
+) -> None:
+    cfg_path = _write_config(tmp_path / "config.yaml", shard_factor=shard_factor)
+    cfg = load(cfg_path, "s2")
+    _write_fake_items(cfg)
+    # 16x2 px: one row of 4x4 chunks, each only 2 px tall.
+    geobox = GeoBox.from_bbox((245440, 6224940, 245456, 6224942), crs="EPSG:3857", resolution=1.0)
+    monkeypatch.setattr("gfetch.cli.mosaic.zone_geobox", lambda *args: geobox)
+    monkeypatch.setattr("gfetch.cli.mosaic.build_mosaic", _fake_build_mosaic([]))
+
+    mosaic_cmd(cfg_path, "s2")
+
+    items = list(pystac.ItemCollection.from_file(cfg.cached_items_path))
+    (crs,) = group_by_utm_zone(items, cfg.resolved_aoi.bbox)
+    path = cfg.zarr_path(crs)
+    za = zarr.open_array(store=path / STACKED_VARIABLE)
+    assert za.shape == (1, 2, 16)
+    assert za.chunks == (1, 4, 4)
+    assert store_is_complete(path, [STACKED_VARIABLE])
+
+
 def test_mosaic_stacks_bands_into_one_array(tmp_path: Path, monkeypatch) -> None:
     cfg_path = _write_config(tmp_path / "config.yaml", bands=["red", "green"])
     cfg = load(cfg_path, "s2")
