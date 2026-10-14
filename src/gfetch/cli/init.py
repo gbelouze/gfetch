@@ -46,3 +46,7 @@ def init(output: Path | None = None, force: bool = False) -> None:
     log.info("Configuration template created!")
     log.info(f"  Path: {output_path.absolute()}")
     log.info("  Edit the file to customize your dataset configuration.")
+    log.info(
+        "  `aoi` can be replaced by `geofile_aoi_path: <vector file>` or "
+        "`countries: [<name>, ...]`."
+    )

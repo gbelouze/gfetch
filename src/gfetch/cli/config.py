@@ -4,7 +4,6 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any
 
-import geopandas as gpd
 import shapely
 from odc.geo.crs import CRS
 from omegaconf import DictConfig, OmegaConf
@@ -22,6 +21,7 @@ __all__ = [
     "Config",
     "TimeRangeConfig",
     "load",
+    "read_geofile_aoi",
     "resolve_aoi",
     "resolve_aoi_geometry",
     "resolve_bands",
@@ -40,27 +40,6 @@ RESERVED_SECTION_KEYS = frozenset({"s1", "s2", "gedi_l2a", "gedi_l4a", "custom"}
 # CLI satellite key -> canonical `gfetch.profiles`/`gfetch.sources` satellite name,
 # force-set by `load` regardless of what a config's section itself contains.
 BUILTIN_SATELLITES: dict[str, str] = {"s1": "sentinel-1", "s2": "sentinel-2"}
-
-
-@dataclass
-class GeoFileAOIConfig:
-    """
-    Area of Intrest configuration, as a geo file in ESPG: 4326
-
-    Attributes
-    ----------
-    path : Path
-        Path to the geofile (must be readable by geopandas.read_file)
-    """
-
-    path: Path
-
-    @cached_property
-    def geometry(self) -> BaseGeometry:
-        gdf = gpd.read_file(self.path)
-        if gdf.crs is None:
-            raise ValueError(f"{self.path} has no CRS")
-        return shapely.make_valid(gdf.to_crs(4326).geometry.union_all())
 
 
 @dataclass
@@ -96,29 +75,58 @@ class AOIConfig:
         return (self.left, self.bottom, self.right, self.top)
 
 
+def read_geofile_aoi(path: Path) -> BaseGeometry:
+    """
+    Read an AOI from a vector file, as the union of all its features.
+
+    Parameters
+    ----------
+    path : Path
+        Vector file readable by `geopandas.read_file` (GeoPackage, GeoJSON,
+        Shapefile, ...), in any CRS.
+
+    Returns
+    -------
+    BaseGeometry
+        The (made valid) union of every feature's geometry, in EPSG:4326.
+
+    Raises
+    ------
+    ValueError
+        If the file has no CRS.
+    """
+    import geopandas as gpd
+
+    gdf = gpd.read_file(path)
+    if gdf.crs is None:
+        raise ValueError(f"{path} has no CRS")
+    return shapely.make_valid(gdf.to_crs(4326).geometry.union_all())
+
+
 def resolve_aoi(
     aoi: AOIConfig | None,
-    geofile_aoi: GeoFileAOIConfig | None,
+    geofile_aoi_path: Path | None,
     countries: list[str] | None,
     *,
     context: str,
 ) -> AOIConfig:
     """
     Resolve a job's effective AOI: either `aoi` as given, or the bounding box of
-    the union of `countries`' boundaries (via `gfetch.countries.
-    resolve_country_polygon`) - mirrors geefetch's `aoi.country` field, which is
-    likewise resolved to a bounding box for the actual data request (its own use of
-    the exact polygon shape is a coarse, tile-level filter downstream, never a
-    per-pixel clip). Exactly one of `aoi`/`countries` must be given.
+    the geofile at `geofile_aoi_path` (via `read_geofile_aoi`) or of the union of
+    `countries`' boundaries (via `gfetch.countries.resolve_country_polygon`) -
+    mirrors geefetch's `aoi.country` field, which is likewise resolved to a bounding
+    box for the actual data request (its own use of the exact polygon shape is a
+    coarse, tile-level filter downstream, never a per-pixel clip). Exactly one of
+    `aoi`/`geofile_aoi_path`/`countries` must be given.
 
     Parameters
     ----------
     aoi : AOIConfig | None
         Explicit AOI, if given directly.
-    geofile_aoi : GeoFileAOIConfig | None
-        Geofile containing areas of intrest within each row.
+    geofile_aoi_path : Path | None
+        Vector file to derive the AOI from, see `read_geofile_aoi`.
     countries : list[str] | None
-        Country names to derive the AOI from, if `aoi` wasn't given directly.
+        Country names to derive the AOI from.
     context : str
         Description of what's being resolved (e.g. the config path), used only to
         make the "exactly one of" error message identify which load failed.
@@ -126,36 +134,32 @@ def resolve_aoi(
     Returns
     -------
     AOIConfig
-        `aoi` unchanged, or the bounding box of `countries`' union.
+        `aoi` unchanged, or the bounding box of the geofile's or `countries`' union.
 
     Raises
     ------
     ValueError
-        If both or neither of `aoi`/`countries` are given.
+        If not exactly one of `aoi`/`geofile_aoi_path`/`countries` is given.
     """
-
-    if sum(x is not None for x in (aoi, geofile_aoi, countries)) != 1:
+    if sum(x is not None for x in (aoi, geofile_aoi_path, countries)) != 1:
         raise ValueError(
-            f"{context}: exactly one of `aoi`, `countries` or `geofile_aoi_path` must be given."
+            f"{context}: exactly one of `aoi`, `geofile_aoi_path` or `countries` must be given."
         )
-    if (aoi is None) == (geofile_aoi is None) == (countries is None):
-        raise ValueError(f"{context}: exactly one of `aoi` or `countries` must be given.")
     if aoi is not None:
         return aoi
+    if geofile_aoi_path is not None:
+        geometry = read_geofile_aoi(geofile_aoi_path)
+    else:
+        assert countries is not None
+        from gfetch.countries import resolve_country_polygon
 
-    if geofile_aoi is not None:
-        minx, miny, maxx, maxy = geofile_aoi.geometry.bounds
-        return AOIConfig(left=minx, bottom=miny, right=maxx, top=maxy)
-
-    assert countries is not None
-    from gfetch.countries import resolve_country_polygon
-
-    min_lon, min_lat, max_lon, max_lat = resolve_country_polygon(countries).bounds
+        geometry = resolve_country_polygon(countries)
+    min_lon, min_lat, max_lon, max_lat = geometry.bounds
     return AOIConfig(left=min_lon, bottom=min_lat, right=max_lon, top=max_lat)
 
 
 def resolve_aoi_geometry(
-    aoi: AOIConfig, geofile_aoi: GeoFileAOIConfig | None, countries: list[str] | None
+    aoi: AOIConfig, geofile_aoi_path: Path | None, countries: list[str] | None
 ) -> BaseGeometry:
     """
     Resolve a job's exact AOI shape, for anything selecting data (search, GEDI tiles,
@@ -165,20 +169,19 @@ def resolve_aoi_geometry(
     ----------
     aoi : AOIConfig
         The job's resolved AOI bounding box, see `resolve_aoi`.
-    geofile_aoi : GeoFileAOIConfig | None
-        Geofile containing areas of intrest within each row. Exactly one of `aoi`/
-        `countries` / `geofile_aoi` must be given.
+    geofile_aoi_path : Path | None
+        Vector file the AOI was derived from, if any.
     countries : list[str] | None
         Country names the AOI was derived from, if any.
 
     Returns
     -------
     BaseGeometry
-        The union of `countries`' boundaries, or `aoi` as a box if `countries` is
-        None, in EPSG:4326.
+        The union of the geofile's features or of `countries`' boundaries, or `aoi`
+        as a box if neither is given, in EPSG:4326.
     """
-    if geofile_aoi is not None:
-        return geofile_aoi.geometry
+    if geofile_aoi_path is not None:
+        return read_geofile_aoi(geofile_aoi_path)
     if countries is not None:
         from gfetch.countries import resolve_country_polygon
 
@@ -226,17 +229,19 @@ class Config:
         Directory holding the search/download hand-off files, the downloaded asset
         cache, and the output Zarr store.
     aoi : AOIConfig | None
-        Area of interest. Exactly one of `aoi` / `countries` / `geofile_aoi_path` must be given.
+        Area of interest. Exactly one of `aoi`/`geofile_aoi_path`/`countries` must be
+        given.
     geofile_aoi_path : Path | None
-        Path to the geofile_aoi data. Defaults to None
-        Exactly one of `aoi` / `countries` / `geofile_aoi_path` must be given
-    geofile_aoi : GeoFileAOIConfig | None
-        Geofile containing areas of intrest within each row.
+        Vector file (GeoPackage, GeoJSON, Shapefile, ...) to derive the AOI from
+        instead of giving `aoi` directly - the AOI becomes the bounding box of the
+        union of its features, which also restricts the data selected (see
+        `read_geofile_aoi`). Exactly one of `aoi`/`geofile_aoi_path`/`countries` must
+        be given.
     countries : list[str] | None
         Country names to derive the AOI from instead of giving `aoi` directly - the
         AOI becomes the bounding box of their union (see `gfetch.countries.
         resolve_country_polygon` for name matching). Exactly one of `aoi`/
-        `countries` / `geofile_aoi_path` must be given.
+        `geofile_aoi_path`/`countries` must be given.
     satellite : str
         Satellite/profile name (e.g. 'sentinel-2'). Defaults to 'sentinel-2'.
     source : str | None
@@ -325,7 +330,7 @@ class Config:
         otherwise. Its output (all bands) is held in memory at once. `1` disables
         sharding (one file per chunk). Reading a sharded store with GDAL (and QGIS)
         needs GDAL 3.13+. Defaults to None, which uses
-        `gfetch.mosaic.resolve_shards`' default of 16 (4096 px shards at the default
+        `gfetch.mosaic.resolve_shards`' default of 32 (8192 px shards at the default
         `chunks`).
     """
 
@@ -333,7 +338,6 @@ class Config:
     output_dir: Path
     aoi: AOIConfig | None = None
     geofile_aoi_path: Path | None = None
-    geofile_aoi: GeoFileAOIConfig | None = None
     countries: list[str] | None = None
     satellite: str = "sentinel-2"
     source: str | None = None
@@ -357,8 +361,6 @@ class Config:
         self.output_dir = Path(self.output_dir).expanduser().absolute()
         if self.geofile_aoi_path is not None:
             self.geofile_aoi_path = Path(self.geofile_aoi_path).expanduser().absolute()
-            self.geofile_aoi = GeoFileAOIConfig(self.geofile_aoi_path)
-
         if self.ocm_model_dir is not None:
             self.ocm_model_dir = Path(self.ocm_model_dir).expanduser().absolute()
 
@@ -368,10 +370,11 @@ class Config:
         Returns
         -------
         AOIConfig
-            `aoi`, resolved by `load()` (from `countries`, if `aoi` wasn't given
-            directly) - never None on a `Config` returned by `load()`. `aoi` itself
-            stays `AOIConfig | None` at the schema level so OmegaConf accepts a
-            config that gives `countries` instead.
+            `aoi`, resolved by `load()` (from `geofile_aoi_path` or `countries`, if
+            `aoi` wasn't given directly) - never None on a `Config` returned by
+            `load()`. `aoi` itself stays `AOIConfig | None` at the schema level so
+            OmegaConf accepts a config that gives `geofile_aoi_path`/`countries`
+            instead.
         """
         assert self.aoi is not None, "aoi not yet resolved - build this Config via load()"
         return self.aoi
@@ -384,7 +387,7 @@ class Config:
         BaseGeometry
             The exact AOI shape in EPSG:4326, see `resolve_aoi_geometry`.
         """
-        return resolve_aoi_geometry(self.resolved_aoi, self.geofile_aoi, self.countries)
+        return resolve_aoi_geometry(self.resolved_aoi, self.geofile_aoi_path, self.countries)
 
     @property
     def cache_dir(self) -> Path:
@@ -495,8 +498,8 @@ def load(path: Path, satellite_key: str) -> Config:
     ------
     ValueError
         If `satellite_key` is neither a built-in nor a key under `custom:`, a
-        `custom` section is missing `collection`/`bands`, neither/both of
-        `aoi`/`countries` are given (see `resolve_aoi`), or `ocm` is set with a
+        `custom` section is missing `collection`/`bands`, not exactly one of
+        `aoi`/`geofile_aoi_path`/`countries` is given (see `resolve_aoi`), or `ocm` is set with a
         config it can't apply to (see `_validate_ocm`).
     """
     log.debug(f"Loading config from {path} (satellite={satellite_key!r})")
@@ -544,7 +547,7 @@ def load(path: Path, satellite_key: str) -> Config:
     OmegaConf.resolve(merged)
     cfg: Config = OmegaConf.to_object(merged)  # type: ignore[assignment]
     context = f"{path} (satellite={satellite_key!r})"
-    cfg.aoi = resolve_aoi(cfg.aoi, cfg.geofile_aoi, cfg.countries, context=context)
+    cfg.aoi = resolve_aoi(cfg.aoi, cfg.geofile_aoi_path, cfg.countries, context=context)
     _validate_ocm(cfg, context=context)
     log.debug(f"Resolved output_dir={cfg.output_dir}")
     return cfg

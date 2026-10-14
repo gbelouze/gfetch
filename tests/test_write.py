@@ -508,3 +508,16 @@ def test_validate_bands_raises_on_a_store_with_one_array_per_band(
 
     with pytest.raises(ValueError, match="one array per band"):
         validate_bands(path, ["red", "green"])
+
+
+@pytest.mark.parametrize("shards", [None, {"y": 512}], ids=["unsharded", "sharded"])
+def test_prepare_template_keeps_chunks_larger_than_their_dimension(
+    tmp_path: Path, dataset: xr.Dataset, shards: dict[str, int] | None
+) -> None:
+    path = tmp_path / "regions.zarr"
+    prepare_template(dataset, path, shards=shards, chunks={"x": 8, "y": 256})
+
+    validate_chunks(path, ["red"], {"x": 8, "y": 256}, shards)  # must not raise
+    write_region(dataset, path, {"x": slice(None), "y": slice(None)})
+    reopened = xr.open_zarr(path, consolidated=False)
+    assert np.array_equal(reopened["red"].values, dataset["red"].values)

@@ -56,7 +56,7 @@ uv run gfetch init config.yaml   # scaffold a config template, then edit its AOI
 uv run gfetch s2 search config.yaml     # internet-connected: find matching STAC items
 uv run gfetch s2 download config.yaml   # internet-connected: download assets to a local cache
 uv run gfetch s2 coverage config.yaml   # optional, offline: items per mosaic shard, to GeoParquet
-uv run gfetch mosaic config.yaml     # compute-only: load, cloud-mask, composite, write to Zarr
+uv run gfetch s2 mosaic config.yaml     # compute-only: load, cloud-mask, composite, write to Zarr
 ```
 
 For Sentinel-2, `ocm: true` under `s2:` masks clouds with
