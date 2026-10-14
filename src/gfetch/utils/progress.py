@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from dask.callbacks import Callback
+from dask.utils import key_split
 from rich.console import Console, RenderableType
 from rich.progress import (
     BarColumn,
@@ -133,6 +134,10 @@ class _RichDaskCallback(Callback):
     a stand-in for `dask.diagnostics.ProgressBar()`'s own separate text bar - letting
     a dask computation's progress live in the same `Progress` instance (and terminal
     region) as any other bar the caller is tracking.
+
+    odc-loader's `open-<band>` tasks (one per band and source item) only build a
+    reader object without any I/O, yet usually outnumber every other task, so they
+    are left out of the count.
     """
 
     def __init__(self, progress: Progress, task: TaskID) -> None:
@@ -140,13 +145,31 @@ class _RichDaskCallback(Callback):
         self._task = task
 
     def _start_state(self, dsk: Any, state: dict[str, Any]) -> None:
-        total = len(state["finished"]) + sum(len(state[k]) for k in ("ready", "waiting", "running"))
-        self._progress.update(self._task, total=total)
+        keys = [*state["finished"], *(k for s in ("ready", "waiting", "running") for k in state[s])]
+        self._progress.update(self._task, total=sum(_counted(key) for key in keys))
 
     def _posttask(
         self, key: Any, result: Any, dsk: Any, state: dict[str, Any], worker_id: Any
     ) -> None:
-        self._progress.advance(self._task)
+        if _counted(key):
+            self._progress.advance(self._task)
+
+
+def _counted(key: Any) -> bool:
+    """
+    Whether a dask task counts towards `_RichDaskCallback`'s progress.
+
+    Parameters
+    ----------
+    key : Any
+        Dask task key.
+
+    Returns
+    -------
+    bool
+        False for odc-loader's I/O-free `open-<band>` tasks, True otherwise.
+    """
+    return not key_split(key).startswith("open-")
 
 
 @contextmanager
