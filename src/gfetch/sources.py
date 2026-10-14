@@ -1,15 +1,16 @@
 """STAC source registry: maps a source name to its API endpoint and per-satellite
 collection ids.
 
-`stac-asset` auto-selects the right download client (plain HTTP, S3, Planetary
-Computer SAS-signing, ...) per asset href, so a source here needs nothing beyond its
-search endpoint and collection-id mapping. Reading assets straight from their hrefs,
-without downloading them, needs `planetary_computer_signer` for Planetary Computer.
+`stac-asset` auto-selects the right download client (plain HTTP, S3, ...) per asset
+href, so a source here needs nothing beyond its search endpoint and collection-id
+mapping. Planetary Computer hrefs need signing, by `planetary_computer_signer`, both to
+download them and to read them straight from their hrefs.
 """
 
 import datetime
 import json
 import logging
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -31,6 +32,7 @@ log = logging.getLogger(__name__)
 
 _PC_SAS_TOKEN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/token"
 _AZURE_BLOB_DOMAIN = ".blob.core.windows.net"
+_PC_TOKEN_REFRESH_MARGIN = datetime.timedelta(minutes=5)
 
 _SENTINEL2_COLLECTIONS = {
     "earthsearch": "sentinel-2-c1-l2a",
@@ -268,8 +270,10 @@ def resolve_collection(
     return collection
 
 
-@retry(urllib.error.URLError, tries=5, delay=1, backoff=2, logger=log)
-def _pc_sas_token(account: str, container: str) -> str:
+# Planetary Computer rate-limits anonymous token requests (HTTP 429). Waits 1, 2, 4, ...,
+# 32, then 60 s between attempts: about 5 minutes in total.
+@retry(urllib.error.URLError, tries=10, delay=1, backoff=2, max_delay=60, logger=log)
+def _pc_sas_token(account: str, container: str) -> tuple[str, datetime.datetime]:
     """
     Request a new, anonymous SAS token for a Planetary Computer blob container.
 
@@ -282,12 +286,13 @@ def _pc_sas_token(account: str, container: str) -> str:
 
     Returns
     -------
-    str
-        The token, as a URL query string.
+    tuple[str, datetime.datetime]
+        The token, as a URL query string, and when it expires.
     """
     url = f"{_PC_SAS_TOKEN_URL}/{account}/{container}"
     with urllib.request.urlopen(url, timeout=30) as response:
-        return json.load(response)["token"]
+        data = json.load(response)
+    return data["token"], datetime.datetime.fromisoformat(data["msft:expiry"])
 
 
 def planetary_computer_signer() -> Callable[[str], str]:
@@ -295,18 +300,20 @@ def planetary_computer_signer() -> Callable[[str], str]:
     Build a function appending a SAS token to Planetary Computer asset hrefs.
 
     Planetary Computer's STAC items hold unsigned Azure Blob Storage hrefs, which
-    Azure refuses (HTTP 409) without a token. Each signer requests its own tokens
-    the first time it meets a container, then reuses them; build a new signer for
-    each batch of reads, since a token expires 45 minutes after being issued.
-    Hrefs outside Azure Blob Storage, or already holding a query string, are
-    returned unchanged.
+    Azure refuses (HTTP 409) without a token. Each signer requests a token the first
+    time it meets a container, then reuses it until it is within
+    `_PC_TOKEN_REFRESH_MARGIN` of expiring (tokens last about 45 minutes), so one
+    signer serves a run of any length. It is thread-safe, and concurrent calls for
+    the same container share a single token request. Hrefs outside Azure Blob
+    Storage, or already holding a query string, are returned unchanged.
 
     Returns
     -------
     Callable[[str], str]
         Maps an href to its signed version, e.g. as `odc.stac.load`'s `patch_url`.
     """
-    tokens: dict[tuple[str, str], str] = {}
+    tokens: dict[tuple[str, str], tuple[str, datetime.datetime]] = {}
+    lock = threading.Lock()
 
     def sign(href: str) -> str:
         url = urlparse(href)
@@ -314,8 +321,11 @@ def planetary_computer_signer() -> Callable[[str], str]:
             return href
         account = url.netloc.removesuffix(_AZURE_BLOB_DOMAIN)
         container = url.path.lstrip("/").split("/", 1)[0]
-        if (account, container) not in tokens:
-            tokens[account, container] = _pc_sas_token(account, container)
-        return f"{href}?{tokens[account, container]}"
+        with lock:
+            cached = tokens.get((account, container))
+            now = datetime.datetime.now(datetime.UTC)
+            if cached is None or cached[1] - now < _PC_TOKEN_REFRESH_MARGIN:
+                cached = tokens[account, container] = _pc_sas_token(account, container)
+        return f"{href}?{cached[0]}"
 
     return sign

@@ -1,3 +1,5 @@
+import datetime
+
 import pytest
 
 from gfetch.sources import SOURCES, StacSource, get_source, planetary_computer_signer
@@ -37,9 +39,9 @@ def test_planetary_computer_signer_signs_blob_hrefs_once_per_container(
 ) -> None:
     requests: list[tuple[str, str]] = []
 
-    def fake_token(account: str, container: str) -> str:
+    def fake_token(account: str, container: str) -> tuple[str, datetime.datetime]:
         requests.append((account, container))
-        return f"sig={len(requests)}"
+        return f"sig={len(requests)}", datetime.datetime(2100, 1, 1, tzinfo=datetime.UTC)
 
     monkeypatch.setattr("gfetch.sources._pc_sas_token", fake_token)
     base = "https://acct.blob.core.windows.net"
@@ -64,9 +66,31 @@ def test_planetary_computer_signer_signs_blob_hrefs_once_per_container(
 def test_planetary_computer_signer_leaves_other_hrefs_unchanged(
     monkeypatch: pytest.MonkeyPatch, href: str
 ) -> None:
-    def fail(account: str, container: str) -> str:
+    def fail(account: str, container: str) -> tuple[str, datetime.datetime]:
         raise AssertionError("no token should be requested")
 
     monkeypatch.setattr("gfetch.sources._pc_sas_token", fail)
 
     assert planetary_computer_signer()(href) == href
+
+
+def test_planetary_computer_signer_renews_tokens_about_to_expire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.datetime.now(datetime.UTC)
+    expiries = [now + datetime.timedelta(minutes=2), now + datetime.timedelta(minutes=45)]
+    requests: list[int] = []
+
+    def fake_token(account: str, container: str) -> tuple[str, datetime.datetime]:
+        requests.append(len(requests))
+        return f"sig={len(requests)}", expiries[len(requests) - 1]
+
+    monkeypatch.setattr("gfetch.sources._pc_sas_token", fake_token)
+    sign = planetary_computer_signer()
+    href = "https://acct.blob.core.windows.net/c1/a.tif"
+
+    assert [sign(href), sign(href), sign(href)] == [
+        f"{href}?sig=1",
+        f"{href}?sig=2",
+        f"{href}?sig=2",
+    ]

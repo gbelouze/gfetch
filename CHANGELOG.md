@@ -49,6 +49,7 @@ Each release can have sections: "Added", "Changed", "Deprecated", "Removed", "Fi
 
 ### Fixed
 
+- `download` from Planetary Computer requests one SAS token per container for the whole batch instead of one per asset of every item, which got it rate-limited (HTTP 429) and items failed. Tokens are renewed before they expire, and token requests retry for about 5 minutes.
 - `gfetch <satellite> search` retries failed requests with backoff for about 5 minutes (5xx responses and proxy errors included), instead of 5 immediate retries: an HPC egress proxy failing for a few seconds no longer kills the job.
 - `gfetch utils rechunk` holds up to two copies of each unit in memory per thread instead of three (`gfetch.write.stack_bands` no longer copies float32 input).
 - `gfetch download` aborts a connection that delivers no data for 10 s and retries it. A stalled connection used to hold its item for `stac_asset`'s 300 s total request timeout, and that total timeout is now lifted, so a large asset on a slow link isn't cut off. Once the batch is done, it logs the overall throughput, percentiles of per-asset time and speed, the 5 slowest assets, and failed attempts by exception type. Retry warnings now name the item and the exception type.

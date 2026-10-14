@@ -1568,3 +1568,15 @@ that state was reached, and should be read chronologically, not as reference mat
   user's request after a PC-backed config needed `B04`-style band names, a hand-set
   `cloud_mask_out` (else no masking, silently) and no OCM. See `claude/tech-stack.md`'s
   "Resolved 2026-10-13" entry. `benchmark/common.py::SOURCE_BANDS` updated to match.
+
+- **2026-10-13** — **`download` signs Planetary Computer hrefs once per batch.** A PC-backed
+  S2 download on Jean Zay failed items with HTTP 429 from
+  `planetarycomputer.microsoft.com/api/sas/v1/token/...`: stac_asset builds a new
+  `PlanetaryComputerClient` per `download_item` call, so every item attempt asked for a
+  fresh token (12 requests per attempt, one per asset, since a failed request caches
+  nothing). Sharing one client isn't an option: `download_item` closes the clients it is
+  handed. `download_items` now signs the hrefs to download with one
+  `planetary_computer_signer` for the whole batch; stac_asset leaves signed hrefs alone.
+  The signer renews a token 5 minutes before its `msft:expiry` (~45 min), is
+  thread-safe, and `_pc_sas_token` retries for ~5 minutes (also covers `mosaic
+  --from-remote`). Checked live: real signed hrefs answer 200.
