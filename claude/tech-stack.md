@@ -396,6 +396,25 @@ reasoning and the `group_by_utm_zone` generalization this required.
   profile's band list vary by source - a nested dict? a per-source override in
   `sources.py`'s `StacSource`? something else?) that wasn't asked for yet.
 
+**Resolved 2026-10-13: asset keys renamed at `search`.** `gfetch.sources._ASSET_RENAMES`,
+keyed by (source, collection), maps PC `sentinel-2-l2a`'s band ids to Earth Search's keys
+(`B04` -> `red`, `B8A` -> `nir08`, `B05`-`B07` -> `rededge1`-`3`, `SCL` -> `scl`, ...).
+`search()` renames each item's assets with it, so `items.json` and everything downstream
+(`download`, `ocm`, `mosaic`, profile defaults, SCL mask classes, output band names) is
+source-independent, and a config switches source with `source:` alone.
+- Per source, not a `rename_bands` config option: it's a fact about the source, and a
+  config-level mapping would leave the OCM band check and `cloud_mask_band` reasoning
+  about names before or after renaming.
+- A static table, not derived from PC's `eo:bands`: PC gives B05-B07 *and* B8A the
+  common name `rededge`, and B09 none (live item, 2026-10-13). Earth Search's own
+  `eo:bands` names agree with every entry of the table.
+- Keyed by collection, so it also applies to a `custom` satellite searching PC's
+  `sentinel-2-l2a`. Unlisted assets (`visual`, metadata) keep their keys.
+- Still open: DN encoding. PC's 2020 items are baseline 02.12 (no +1000 offset), unlike
+  Earth Search C1; renaming doesn't make the two sources' values comparable. The dedup
+  `grid:code` gap above also remains, though a live 2-month PC search over Gorongosa
+  had no duplicate (tile, date).
+
 ## Chosen architecture
 
 ```

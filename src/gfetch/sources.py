@@ -21,6 +21,7 @@ from retry import retry
 __all__ = [
     "SOURCES",
     "StacSource",
+    "asset_renames",
     "get_source",
     "planetary_computer_signer",
     "resolve_collection",
@@ -96,6 +97,50 @@ _COLLECTIONS: dict[str, dict[str, str]] = {
     "sentinel-2": _SENTINEL2_COLLECTIONS,
     "sentinel-1": _SENTINEL1_COLLECTIONS,
 }
+
+# Keyed by (source name, collection id): asset key -> the key gfetch uses, so a config
+# names bands the same on every source. Planetary Computer keys Sentinel-2 assets by band
+# id, Earth Search by the names below, which match its own `eo:bands` metadata. They can't
+# be derived from Planetary Computer's `eo:bands`: it gives B05-B07 and B8A the same
+# `rededge` common name, and B09 none.
+_ASSET_RENAMES: dict[tuple[str, str], dict[str, str]] = {
+    ("planetary-computer", "sentinel-2-l2a"): {
+        "B01": "coastal",
+        "B02": "blue",
+        "B03": "green",
+        "B04": "red",
+        "B05": "rededge1",
+        "B06": "rededge2",
+        "B07": "rededge3",
+        "B08": "nir",
+        "B8A": "nir08",
+        "B09": "nir09",
+        "B11": "swir16",
+        "B12": "swir22",
+        "SCL": "scl",
+        "AOT": "aot",
+        "WVP": "wvp",
+    },
+}
+
+
+def asset_renames(source: "StacSource", collection: str) -> dict[str, str]:
+    """
+    Look up how a collection's asset keys are renamed into the keys gfetch uses.
+
+    Parameters
+    ----------
+    source : StacSource
+        STAC API source the collection is searched on.
+    collection : str
+        Collection id.
+
+    Returns
+    -------
+    dict[str, str]
+        Asset key -> gfetch key, empty if the collection's keys are used as they are.
+    """
+    return _ASSET_RENAMES.get((source.name, collection), {})
 
 
 @dataclass(frozen=True)

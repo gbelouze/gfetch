@@ -8,7 +8,7 @@ import pystac_client
 from pystac_client.stac_api_io import StacApiIO
 from urllib3.util.retry import Retry
 
-from gfetch.sources import StacSource, resolve_collection
+from gfetch.sources import StacSource, asset_renames, resolve_collection
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +24,28 @@ _RETRY = Retry(
     status_forcelist=(500, 502, 503, 504),
     allowed_methods=None,
 )
+
+
+def _rename_assets(item: pystac.Item, renames: dict[str, str]) -> None:
+    """
+    Rename an item's asset keys in place.
+
+    Parameters
+    ----------
+    item : pystac.Item
+        Item whose assets to rename.
+    renames : dict[str, str]
+        Asset key -> new key. Keys not listed are kept.
+
+    Raises
+    ------
+    ValueError
+        If two assets would end up with the same key.
+    """
+    assets = {renames.get(key, key): asset for key, asset in item.assets.items()}
+    if len(assets) != len(item.assets):
+        raise ValueError(f"{item.id}: renaming its assets with {renames} collides")
+    item.assets = assets
 
 
 def _dedupe_sentinel2_processing_baseline(items: list[pystac.Item]) -> list[pystac.Item]:
@@ -129,7 +151,8 @@ def search(
     Returns
     -------
     list[pystac.Item]
-        Matching STAC items.
+        Matching STAC items, their asset keys renamed to gfetch's (see
+        `gfetch.sources.asset_renames`).
     """
     collection = collection or source.collection(satellite)
     try:
@@ -159,6 +182,10 @@ def search(
         items.extend(page.items)
         total = f"/{matched}" if matched is not None else ""
         log.debug(f"Fetched page {page_num} ({len(items)}{total} items so far)")
+    renames = asset_renames(source, collection)
+    if renames:
+        for item in items:
+            _rename_assets(item, renames)
     if satellite == "sentinel-2":
         deduped = _dedupe_sentinel2_processing_baseline(items)
         if len(deduped) != len(items):

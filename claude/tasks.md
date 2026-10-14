@@ -1563,3 +1563,8 @@ that state was reached, and should be read chronologically, not as reference mat
     store is complete: the 2024 job had items from an interactive run and searched (and
     hit the proxy) again for nothing. Re-searching mid-download could also swap the item
     set under a partial cache. Delete `items.json` to rerun after a config change.
+
+- **2026-10-13** — **Planetary Computer S2 asset keys renamed at `search`**, at the
+  user's request after a PC-backed config needed `B04`-style band names, a hand-set
+  `cloud_mask_out` (else no masking, silently) and no OCM. See `claude/tech-stack.md`'s
+  "Resolved 2026-10-13" entry. `benchmark/common.py::SOURCE_BANDS` updated to match.
