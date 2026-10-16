@@ -11,7 +11,9 @@ from rasterio.crs import CRS
 from rasterio.transform import from_origin
 
 from gfetch import ocm as ocm_module
-from gfetch.ocm import ocm_grid, with_ocm_asset, write_mask, write_ocms
+from gfetch.dn import DN_OFFSET_PROPERTY
+from gfetch.ocm import ocm_grid, read_input, with_ocm_asset, write_mask, write_ocms
+from gfetch.profiles import OCM_INPUT_BANDS
 
 _TRANSFORM = from_origin(600000, 9500020, 10, 10)
 
@@ -147,3 +149,19 @@ def test_write_mask_leaves_no_partial_file_on_failure(tmp_path: Path, monkeypatc
         )
 
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(("offset", "expected"), [(0, 1300), (1000, 300)])
+def test_read_input_shifts_valid_dns_to_the_dn_offset(
+    tmp_path: Path, offset: int, expected: int
+) -> None:
+    data = np.full((4, 4), 300, dtype=np.uint16)
+    data[:2, :2] = 0
+    item = _item({band: _write_band(tmp_path / f"{band}.tif", data) for band in OCM_INPUT_BANDS})
+    item.properties[DN_OFFSET_PROPERTY] = offset
+
+    bands = read_input(item).bands
+
+    assert bands.dtype == np.uint16
+    np.testing.assert_array_equal(bands[:, 0, 0], 0)
+    np.testing.assert_array_equal(bands[:, 1, 1], expected)

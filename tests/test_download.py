@@ -227,6 +227,41 @@ def test_download_items_rewrites_s3_hrefs_before_downloading(
     assert seen_hrefs == ["https://sentinel-s1-l1c.s3.amazonaws.com/GRD/iw-vv.tiff"]
 
 
+def test_download_items_signs_planetary_computer_hrefs_once_per_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gfetch.download as download_mod
+
+    base = "https://acct.blob.core.windows.net/c1"
+    items = [
+        _make_item(f"item-{i}", {"red": f"{base}/{i}/red.tif", "nir": f"{base}/{i}/nir.tif"})
+        for i in range(3)
+    ]
+    token_requests: list[tuple[str, str]] = []
+
+    def fake_token(account: str, container: str) -> tuple[str, datetime]:
+        token_requests.append((account, container))
+        return "sig=token", datetime(2100, 1, 1, tzinfo=UTC)
+
+    seen_hrefs: list[str] = []
+
+    async def fake_download_item(item, directory, *, config, keep_non_downloaded, **kwargs):
+        for key in config.include:
+            seen_hrefs.append(item.assets[key].href)
+            (directory / f"{key}.tif").write_bytes(b"BYTES")
+            item.assets[key].href = f"{key}.tif"
+        item.set_self_href(str(directory / f"{item.id}.json"))
+        return item
+
+    monkeypatch.setattr("gfetch.sources._pc_sas_token", fake_token)
+    monkeypatch.setattr(download_mod, "download_item", fake_download_item)
+
+    asyncio.run(download_items(items, tmp_path / "cache", ["red"], max_concurrent_items=3))
+
+    assert token_requests == [("acct", "c1")]
+    assert sorted(seen_hrefs) == [f"{base}/{i}/red.tif?sig=token" for i in range(3)]
+
+
 def test_download_items_multiple_items(tmp_path: Path) -> None:
     source_dir = tmp_path / "source"
     source_dir.mkdir()

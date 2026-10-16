@@ -17,6 +17,7 @@ from gfetch.cli.config import (
     resolve_compute_workers,
     resolve_output_variables,
 )
+from gfetch.dn import DN_OFFSET_PROPERTY
 from gfetch.mosaic import (
     group_by_utm_zone,
     outside_aoi,
@@ -93,6 +94,14 @@ def mosaic(config_path: Path, satellite_key: str, *, task_id: int = 0, n_tasks: 
 
     items = list(pystac.ItemCollection.from_file(items_path))
     log.debug(f"Loaded {len(items)} item(s) from {items_path}")
+    undecided = [item.id for item in items if DN_OFFSET_PROPERTY not in item.properties]
+    if cfg.satellite == "sentinel-2" and undecided:
+        log.error(
+            f"{len(undecided)}/{len(items)} item(s) have no recorded DN encoding (e.g. "
+            f"{undecided[0]}), so their reflectances can't be harmonized: delete "
+            f"{cfg.items_path} and rerun `gfetch s2 search` (then `download`, if used)."
+        )
+        return
     if cfg.ocm:
         if from_remote:
             log.error(

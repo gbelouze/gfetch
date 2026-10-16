@@ -12,6 +12,7 @@ Each release can have sections: "Added", "Changed", "Deprecated", "Removed", "Fi
 
 ### Changed
 
+- `search` renames Planetary Computer `sentinel-2-l2a` asset keys to Earth Search's (`B04` -> `red`, `SCL` -> `scl`, ...; `gfetch.sources.asset_renames`), so S2 configs use the same band names on both sources, and OmniCloudMask and the SCL mask defaults work on Planetary Computer.
 - `gfetch <satellite> search` does nothing once its search results (`items.json`) exist, so a resubmitted job doesn't search again; delete `items.json` to rerun it. `download` does nothing once every Zarr store listed from the existing search results is complete, so rerunning a finished job after `clean` no longer downloads the whole cache again. That check is the one `clean` uses (`gfetch.cli.stores.stores_complete`) and ignores config changes: delete the stores to rerun.
 - `gfetch mosaic` writes each store's bands as one `(band, y, x)` float32 array, `bands`, chunked across every band, with a `band_names` attribute and a `band` coordinate naming them (`gfetch.write.stack_bands`). A training read of a window is one request per spatial chunk instead of one per band and spatial chunk (339 ms to 60 ms per sample on Jean Zay). Stores written in the one-array-per-band layout are refused (`gfetch.write.validate_bands`), and must be deleted or migrated. GDAL opens a store directly as a multi-band raster.
 - Default `chunks` is 256 px (was 64), `shard_factor` 32 (was 128, so shards are 8192 px), `compute_chunk_factor` 4 (was 16, still 1024 px bricks).
@@ -48,6 +49,7 @@ Each release can have sections: "Added", "Changed", "Deprecated", "Removed", "Fi
 
 ### Fixed
 
+- `download` from Planetary Computer requests one SAS token per container for the whole batch instead of one per asset of every item, which got it rate-limited (HTTP 429) and items failed. Tokens are renewed before they expire, and token requests retry for about 5 minutes.
 - `gfetch <satellite> search` retries failed requests with backoff for about 5 minutes (5xx responses and proxy errors included), instead of 5 immediate retries: an HPC egress proxy failing for a few seconds no longer kills the job.
 - `gfetch utils rechunk` holds up to two copies of each unit in memory per thread instead of three (`gfetch.write.stack_bands` no longer copies float32 input).
 - `gfetch download` aborts a connection that delivers no data for 10 s and retries it. A stalled connection used to hold its item for `stac_asset`'s 300 s total request timeout, and that total timeout is now lifted, so a large asset on a slow link isn't cut off. Once the batch is done, it logs the overall throughput, percentiles of per-asset time and speed, the 5 slowest assets, and failed attempts by exception type. Retry warnings now name the item and the exception type.

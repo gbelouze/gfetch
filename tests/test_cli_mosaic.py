@@ -17,6 +17,7 @@ from odc.geo.xr import xr_coords
 from gfetch import countries as countries_module
 from gfetch.cli.config import Config, load
 from gfetch.cli.mosaic import mosaic as mosaic_cmd
+from gfetch.dn import DN_OFFSET, DN_OFFSET_PROPERTY
 from gfetch.mosaic import group_by_utm_zone
 from gfetch.ocm import ocm_path
 from gfetch.write import (
@@ -63,7 +64,7 @@ def _write_fake_items(cfg: Config) -> None:
         geometry=geometry,
         bbox=list(cfg.resolved_aoi.bbox),
         datetime=datetime.datetime(2024, 3, 1, tzinfo=datetime.UTC),
-        properties={},
+        properties={DN_OFFSET_PROPERTY: DN_OFFSET},
     )
     pystac.ItemCollection([item]).save_object(str(cfg.cached_items_path))
 
@@ -111,6 +112,28 @@ def test_mosaic_computes_every_patch_on_a_fresh_store(tmp_path: Path, monkeypatc
     # 1 call to build the lazy template + 4 patches (2x2 native chunks per patch over
     # a 16x16 grid with 4x4 native chunks).
     assert len(calls) == 5
+
+
+def test_mosaic_refuses_sentinel2_items_without_a_dn_offset(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    cfg_path = _write_config(tmp_path / "config.yaml")
+    cfg = load(cfg_path, "s2")
+    _write_fake_items(cfg)
+    items = list(pystac.ItemCollection.from_file(cfg.cached_items_path))
+    for item in items:
+        del item.properties[DN_OFFSET_PROPERTY]
+    pystac.ItemCollection(items).save_object(str(cfg.cached_items_path))
+
+    calls: list[GeoBox] = []
+    monkeypatch.setattr("gfetch.cli.mosaic.zone_geobox", _fake_zone_geobox)
+    monkeypatch.setattr("gfetch.cli.mosaic.build_mosaic", _fake_build_mosaic(calls))
+
+    with caplog.at_level("ERROR"):
+        mosaic_cmd(cfg_path, "s2")
+
+    assert calls == []
+    assert "DN encoding" in caplog.text
 
 
 def test_mosaic_builds_the_template_at_shard_size(tmp_path: Path, monkeypatch) -> None:

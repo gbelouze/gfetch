@@ -1,15 +1,16 @@
 """STAC source registry: maps a source name to its API endpoint and per-satellite
 collection ids.
 
-`stac-asset` auto-selects the right download client (plain HTTP, S3, Planetary
-Computer SAS-signing, ...) per asset href, so a source here needs nothing beyond its
-search endpoint and collection-id mapping. Reading assets straight from their hrefs,
-without downloading them, needs `planetary_computer_signer` for Planetary Computer.
+`stac-asset` auto-selects the right download client (plain HTTP, S3, ...) per asset
+href, so a source here needs nothing beyond its search endpoint and collection-id
+mapping. Planetary Computer hrefs need signing, by `planetary_computer_signer`, both to
+download them and to read them straight from their hrefs.
 """
 
 import datetime
 import json
 import logging
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -20,7 +21,9 @@ from retry import retry
 
 __all__ = [
     "SOURCES",
+    "HeterogeneousFallbackError",
     "StacSource",
+    "asset_renames",
     "get_source",
     "planetary_computer_signer",
     "resolve_collection",
@@ -30,6 +33,7 @@ log = logging.getLogger(__name__)
 
 _PC_SAS_TOKEN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/token"
 _AZURE_BLOB_DOMAIN = ".blob.core.windows.net"
+_PC_TOKEN_REFRESH_MARGIN = datetime.timedelta(minutes=5)
 
 _SENTINEL2_COLLECTIONS = {
     "earthsearch": "sentinel-2-c1-l2a",
@@ -61,32 +65,57 @@ class _CollectionGap:
         entirely within the gap, or None to refuse such time ranges.
     fallback_caveat : str
         Appended to the warning logged when `fallback` is used. Defaults to ''.
+    confirm : bool
+        Whether using `fallback` must be explicitly accepted, see
+        `HeterogeneousFallbackError`. Defaults to False.
     """
 
     start: datetime.date
     end: datetime.date
     fallback: str | None = None
     fallback_caveat: str = ""
+    confirm: bool = False
+
+
+class HeterogeneousFallbackError(ValueError):
+    """
+    A time range lies within a gap whose fallback collection must be explicitly accepted.
+
+    Raised by `resolve_collection` unless called with `accept_heterogeneous=True`.
+    """
 
 
 # Keyed by (source name, collection id). Earth Search's Collection 1 only holds data
-# reprocessed by ESA to baseline 05.00+, and per Earth Search's own documentation (as of
-# April 2024) that reprocessing hasn't reached Nov 2016 - Nov 2019 or 2022. Confirmed
-# live 2026-09-23: 45 items for Jan-Sep 2022 over a 230 km box in France, against 1,372
-# in `sentinel-2-l2a`. That older collection has the same asset keys, `grid:code` and
-# `raster:bands` scale/offset as Collection 1, but its items before 25 Jan 2022 are
-# baseline 03.01, whose DNs lack the +1000 offset every later baseline carries.
+# reprocessed by ESA to baseline 05.00+. Measured live 2026-10-16 over France, Mozambique,
+# Japan and the US (`claude/tech-stack.md`): it holds nothing before Nov 2017, a fraction
+# of the scenes until 21 Mar 2019, and none between 1 Jan and 5 Dec 2022. The older
+# `sentinel-2-l2a` has the same asset keys and `grid:code` as Collection 1. Its DNs
+# lack Collection 1's +1000 offset, except most items acquired 25 Jan - 27 Feb 2022
+# (`claude/s2-2022/README.md`). Neither `earthsearch:boa_offset_applied` nor
+# `raster:bands` offset tells which, see `gfetch.dn`. All of this is specific to Earth
+# Search v1: revisit it once v2 leaves beta (`claude/s2-dn-harmonization.md`).
 _COLLECTION_GAPS: dict[tuple[str, str], list[_CollectionGap]] = {
     ("earthsearch", "sentinel-2-c1-l2a"): [
-        _CollectionGap(datetime.date(2016, 11, 1), datetime.date(2019, 11, 30)),
         _CollectionGap(
-            datetime.date(2022, 1, 1),
-            datetime.date(2022, 12, 31),
+            datetime.date(2015, 6, 23),
+            datetime.date(2019, 3, 21),
             fallback="sentinel-2-l2a",
             fallback_caveat=(
-                "Its items before 2022-01-25 are processing baseline 03.01, whose "
-                "reflectance DNs lack the +1000 offset of every later baseline and of "
-                "Collection 1; gfetch does not harmonize them."
+                "Its items mix processing baselines 00.01 to 03.01 (older Sen2Cor "
+                "versions, likely without geometric refinement before 03.00), in one "
+                "composite and against Collection 1's 05.00+; gfetch only harmonizes "
+                "their DN offset."
+            ),
+            confirm=True,
+        ),
+        _CollectionGap(
+            datetime.date(2022, 1, 1),
+            datetime.date(2022, 12, 5),
+            fallback="sentinel-2-l2a",
+            fallback_caveat=(
+                "Its reflectance DNs lack Collection 1's +1000 offset, except most "
+                "items acquired 2022-01-25 to 2022-02-27; gfetch harmonizes the offset "
+                "per item, see `gfetch.dn`."
             ),
         ),
     ],
@@ -96,6 +125,50 @@ _COLLECTIONS: dict[str, dict[str, str]] = {
     "sentinel-2": _SENTINEL2_COLLECTIONS,
     "sentinel-1": _SENTINEL1_COLLECTIONS,
 }
+
+# Keyed by (source name, collection id): asset key -> the key gfetch uses, so a config
+# names bands the same on every source. Planetary Computer keys Sentinel-2 assets by band
+# id, Earth Search by the names below, which match its own `eo:bands` metadata. They can't
+# be derived from Planetary Computer's `eo:bands`: it gives B05-B07 and B8A the same
+# `rededge` common name, and B09 none.
+_ASSET_RENAMES: dict[tuple[str, str], dict[str, str]] = {
+    ("planetary-computer", "sentinel-2-l2a"): {
+        "B01": "coastal",
+        "B02": "blue",
+        "B03": "green",
+        "B04": "red",
+        "B05": "rededge1",
+        "B06": "rededge2",
+        "B07": "rededge3",
+        "B08": "nir",
+        "B8A": "nir08",
+        "B09": "nir09",
+        "B11": "swir16",
+        "B12": "swir22",
+        "SCL": "scl",
+        "AOT": "aot",
+        "WVP": "wvp",
+    },
+}
+
+
+def asset_renames(source: "StacSource", collection: str) -> dict[str, str]:
+    """
+    Look up how a collection's asset keys are renamed into the keys gfetch uses.
+
+    Parameters
+    ----------
+    source : StacSource
+        STAC API source the collection is searched on.
+    collection : str
+        Collection id.
+
+    Returns
+    -------
+    dict[str, str]
+        Asset key -> gfetch key, empty if the collection's keys are used as they are.
+    """
+    return _ASSET_RENAMES.get((source.name, collection), {})
 
 
 @dataclass(frozen=True)
@@ -169,6 +242,8 @@ def resolve_collection(
     collection: str,
     start: datetime.date | None,
     end: datetime.date | None,
+    *,
+    accept_heterogeneous: bool = False,
 ) -> str:
     """
     Resolve the collection to search for a time range, given the periods a collection
@@ -184,6 +259,9 @@ def resolve_collection(
         First day of the time range, or None if open-ended.
     end : datetime.date | None
         Last day of the time range, or None if open-ended.
+    accept_heterogeneous : bool
+        Use the fallback of a gap that requires confirmation instead of raising.
+        Defaults to False.
 
     Returns
     -------
@@ -193,6 +271,9 @@ def resolve_collection(
 
     Raises
     ------
+    HeterogeneousFallbackError
+        If the time range falls entirely within a gap whose fallback requires
+        confirmation, and `accept_heterogeneous` is False.
     ValueError
         If the time range overlaps a known gap of `collection` on `source` that has no
         fallback, or that it doesn't fall entirely within.
@@ -202,13 +283,16 @@ def resolve_collection(
             continue
         within = start is not None and end is not None and gap.start <= start and end <= gap.end
         if gap.fallback is not None and within:
-            log.warning(
+            message = (
                 f"!!! {source.name} collection {collection!r} is missing data from "
                 f"{gap.start} to {gap.end}: searching {gap.fallback!r} instead for "
                 f"{start}/{end}. Its items are not Collection 1 reprocessed data, so "
                 f"this mosaic is not radiometrically equivalent to one outside that "
                 f"period. {gap.fallback_caveat}".rstrip()
             )
+            if gap.confirm and not accept_heterogeneous:
+                raise HeterogeneousFallbackError(message)
+            log.warning(message)
             return gap.fallback
         hint = (
             f"Split the time range so that each part lies either entirely outside or "
@@ -223,8 +307,10 @@ def resolve_collection(
     return collection
 
 
-@retry(urllib.error.URLError, tries=5, delay=1, backoff=2, logger=log)
-def _pc_sas_token(account: str, container: str) -> str:
+# Planetary Computer rate-limits anonymous token requests (HTTP 429). Waits 1, 2, 4, ...,
+# 32, then 60 s between attempts: about 5 minutes in total.
+@retry(urllib.error.URLError, tries=10, delay=1, backoff=2, max_delay=60, logger=log)
+def _pc_sas_token(account: str, container: str) -> tuple[str, datetime.datetime]:
     """
     Request a new, anonymous SAS token for a Planetary Computer blob container.
 
@@ -237,12 +323,13 @@ def _pc_sas_token(account: str, container: str) -> str:
 
     Returns
     -------
-    str
-        The token, as a URL query string.
+    tuple[str, datetime.datetime]
+        The token, as a URL query string, and when it expires.
     """
     url = f"{_PC_SAS_TOKEN_URL}/{account}/{container}"
     with urllib.request.urlopen(url, timeout=30) as response:
-        return json.load(response)["token"]
+        data = json.load(response)
+    return data["token"], datetime.datetime.fromisoformat(data["msft:expiry"])
 
 
 def planetary_computer_signer() -> Callable[[str], str]:
@@ -250,18 +337,20 @@ def planetary_computer_signer() -> Callable[[str], str]:
     Build a function appending a SAS token to Planetary Computer asset hrefs.
 
     Planetary Computer's STAC items hold unsigned Azure Blob Storage hrefs, which
-    Azure refuses (HTTP 409) without a token. Each signer requests its own tokens
-    the first time it meets a container, then reuses them; build a new signer for
-    each batch of reads, since a token expires 45 minutes after being issued.
-    Hrefs outside Azure Blob Storage, or already holding a query string, are
-    returned unchanged.
+    Azure refuses (HTTP 409) without a token. Each signer requests a token the first
+    time it meets a container, then reuses it until it is within
+    `_PC_TOKEN_REFRESH_MARGIN` of expiring (tokens last about 45 minutes), so one
+    signer serves a run of any length. It is thread-safe, and concurrent calls for
+    the same container share a single token request. Hrefs outside Azure Blob
+    Storage, or already holding a query string, are returned unchanged.
 
     Returns
     -------
     Callable[[str], str]
         Maps an href to its signed version, e.g. as `odc.stac.load`'s `patch_url`.
     """
-    tokens: dict[tuple[str, str], str] = {}
+    tokens: dict[tuple[str, str], tuple[str, datetime.datetime]] = {}
+    lock = threading.Lock()
 
     def sign(href: str) -> str:
         url = urlparse(href)
@@ -269,8 +358,11 @@ def planetary_computer_signer() -> Callable[[str], str]:
             return href
         account = url.netloc.removesuffix(_AZURE_BLOB_DOMAIN)
         container = url.path.lstrip("/").split("/", 1)[0]
-        if (account, container) not in tokens:
-            tokens[account, container] = _pc_sas_token(account, container)
-        return f"{href}?{tokens[account, container]}"
+        with lock:
+            cached = tokens.get((account, container))
+            now = datetime.datetime.now(datetime.UTC)
+            if cached is None or cached[1] - now < _PC_TOKEN_REFRESH_MARGIN:
+                cached = tokens[account, container] = _pc_sas_token(account, container)
+        return f"{href}?{cached[0]}"
 
     return sign

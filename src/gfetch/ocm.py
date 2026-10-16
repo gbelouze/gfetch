@@ -26,6 +26,7 @@ from affine import Affine
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
 
+from gfetch.dn import dn_shift
 from gfetch.profiles import OCM_BAND, OCM_INPUT_BANDS, OCM_NODATA
 
 log = logging.getLogger(__name__)
@@ -291,7 +292,8 @@ class OcmInput:
 
 def read_input(item: pystac.Item) -> OcmInput:
     """
-    Read a cached item's `OCM_INPUT_BANDS`, averaged down to `OCM_RESOLUTION`.
+    Read a cached item's `OCM_INPUT_BANDS`, averaged down to `OCM_RESOLUTION`, with
+    their valid DNs shifted to `gfetch.dn.DN_OFFSET` (see `gfetch.dn.dn_shift`).
 
     Parameters
     ----------
@@ -311,7 +313,12 @@ def read_input(item: pystac.Item) -> OcmInput:
     for href in hrefs:
         with rasterio.open(href) as src:
             bands.append(src.read(1, out_shape=shape, resampling=Resampling.average))
-    return OcmInput(np.stack(bands), transform, crs)
+    stacked = np.stack(bands)
+    shift = dn_shift(item)
+    if shift:
+        shifted = np.minimum(stacked.astype(np.int64) + shift, np.iinfo(stacked.dtype).max)
+        stacked = np.where(stacked > 0, shifted, 0).astype(stacked.dtype)
+    return OcmInput(stacked, transform, crs)
 
 
 def write_mask(path: Path, classes: np.ndarray, transform: Affine, crs: CRS) -> None:

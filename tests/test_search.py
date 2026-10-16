@@ -8,8 +8,9 @@ from pystac_client.stac_api_io import StacApiIO
 from requests.adapters import HTTPAdapter
 from urllib3.exceptions import MaxRetryError
 
-from gfetch.search import _dedupe_sentinel2_processing_baseline, search
-from gfetch.sources import get_source
+from gfetch.dn import DN_OFFSET, DN_OFFSET_PROPERTY
+from gfetch.search import _dedupe_sentinel2_processing_baseline, _rename_assets, search
+from gfetch.sources import HeterogeneousFallbackError, get_source
 
 
 def _s2_item(item_id: str, *, grid_code: str, date: str, baseline: str) -> pystac.Item:
@@ -29,6 +30,27 @@ def test_dedupe_sentinel2_processing_baseline_keeps_highest_baseline() -> None:
     deduped = _dedupe_sentinel2_processing_baseline([old, new])
 
     assert [item.id for item in deduped] == ["new"]
+
+
+def test_dedupe_sentinel2_processing_baseline_keys_planetary_computer_by_mgrs_tile() -> None:
+    # A real Planetary Computer pair: same scene, ids differing by processing time only.
+    def pc_item(item_id: str, baseline: str) -> pystac.Item:
+        return pystac.Item(
+            id=item_id,
+            geometry=None,
+            bbox=None,
+            datetime=datetime.datetime(2022, 7, 27, 16, 48, 51, 24000, tzinfo=datetime.UTC),
+            properties={"s2:mgrs_tile": "16SBJ", "s2:processing_baseline": baseline},
+        )
+
+    old = pc_item("S2A_MSIL2A_20220727T164851_R026_T16SBJ_20220729T051409", "04.00")
+    new = pc_item("S2A_MSIL2A_20220727T164851_R026_T16SBJ_20240716T165106", "05.10")
+    other_tile = pc_item("S2A_MSIL2A_20220727T164851_R026_T16SBH_20220729T051409", "04.00")
+    other_tile.properties["s2:mgrs_tile"] = "16SBH"
+
+    deduped = _dedupe_sentinel2_processing_baseline([old, new, other_tile])
+
+    assert {item.id for item in deduped} == {new.id, other_tile.id}
 
 
 def test_dedupe_sentinel2_processing_baseline_keeps_distinct_tiles_and_dates() -> None:
@@ -59,16 +81,20 @@ class _FakeResult:
 
 class _FakeCatalog:
     def __init__(
-        self, requested_collections: list[list[str]], requested_kwargs: list[dict] | None = None
+        self,
+        requested_collections: list[list[str]],
+        requested_kwargs: list[dict] | None = None,
+        items: list[pystac.Item] | None = None,
     ) -> None:
         self._requested = requested_collections
         self._requested_kwargs = requested_kwargs
+        self._items = items if items is not None else []
 
     def search(self, *, collections, bbox, intersects, datetime, query, max_items):
         self._requested.append(collections)
         if self._requested_kwargs is not None:
             self._requested_kwargs.append({"bbox": bbox, "intersects": intersects})
-        return _FakeResult([])
+        return _FakeResult(self._items)
 
 
 def test_search_uses_explicit_collection_bypassing_source_registry(
@@ -205,7 +231,7 @@ def test_search_earthsearch_sentinel1_orbit_state_filter() -> None:
         "2021-12-15/2022-01-10",
         "2022-12-01/2023-02-01",
         "2021-01-01/2023-12-31",
-        "2019-06-01/2020-06-01",
+        "2019-01-01/2019-12-31",
         "2021-01-01/..",
         "../2022-03-01",
     ],
@@ -226,7 +252,8 @@ def test_search_refuses_known_earthsearch_c1_gaps(
     ("source", "datetime_range"),
     [
         ("earthsearch", "2021-01-01/2021-12-31"),
-        ("earthsearch", "2019-12-01/2021-12-31"),
+        ("earthsearch", "2019-03-22/2021-12-31"),
+        ("earthsearch", "2022-12-06/2023-02-01"),
         ("earthsearch", "2023-01-01T00:00:00Z/2023-06-01T00:00:00Z"),
         ("planetary-computer", "2022-01-01/2022-09-30"),
     ],
@@ -248,7 +275,7 @@ def test_search_allows_time_ranges_outside_known_gaps(
 
 @pytest.mark.parametrize(
     "datetime_range",
-    ["2022-01-01/2022-12-31", "2022-02-01T00:00:00Z/2022-05-01T00:00:00Z"],
+    ["2022-01-01/2022-12-05", "2022-02-01T00:00:00Z/2022-05-01T00:00:00Z"],
 )
 def test_search_falls_back_within_earthsearch_c1_2022_gap(
     datetime_range: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -267,3 +294,81 @@ def test_search_falls_back_within_earthsearch_c1_2022_gap(
     assert any(
         r.levelname == "WARNING" and "sentinel-2-l2a" in r.getMessage() for r in caplog.records
     )
+
+
+def test_search_refuses_the_early_earthsearch_c1_gap_unless_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_collections: list[list[str]] = []
+    monkeypatch.setattr(
+        pystac_client.Client,
+        "open",
+        staticmethod(lambda url, **kwargs: _FakeCatalog(requested_collections)),
+    )
+    args = (
+        get_source("earthsearch"),
+        "sentinel-2",
+        (-1.0, 45.6, 2.0, 47.7),
+        "2018-01-01/2018-12-31",
+    )
+
+    with pytest.raises(HeterogeneousFallbackError, match="sentinel-2-l2a"):
+        search(*args)
+    assert requested_collections == []
+
+    search(*args, accept_heterogeneous=True)
+    assert requested_collections == [["sentinel-2-l2a"]]
+
+
+def test_search_records_each_items_dn_offset(monkeypatch: pytest.MonkeyPatch) -> None:
+    item = _s2_item("item", grid_code="MGRS-31TCN", date="2024-07-19", baseline="05.11")
+    monkeypatch.setattr(
+        pystac_client.Client,
+        "open",
+        staticmethod(lambda url, **kwargs: _FakeCatalog([], items=[item])),
+    )
+
+    [found] = search(
+        get_source("earthsearch"), "sentinel-2", (-1.0, 45.6, 2.0, 47.7), "2024-07-01/2024-07-31"
+    )
+
+    assert found.properties[DN_OFFSET_PROPERTY] == DN_OFFSET
+
+
+def _item_with_assets(*keys: str) -> pystac.Item:
+    item = _s2_item("item", grid_code="MGRS-36KXE", date="2020-01-29", baseline="02.12")
+    for key in keys:
+        item.add_asset(key, pystac.Asset(href=f"https://example.com/{key}.tif"))
+    return item
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("planetary-computer", ["red", "nir08", "scl", "visual"]),
+        ("earthsearch", ["B04", "B8A", "SCL", "visual"]),
+    ],
+)
+def test_search_renames_assets_per_source(
+    source: str, expected: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _item_with_assets("B04", "B8A", "SCL", "visual")
+    monkeypatch.setattr(
+        pystac_client.Client,
+        "open",
+        staticmethod(lambda url, **kwargs: _FakeCatalog([], items=[item])),
+    )
+
+    (found,) = search(
+        get_source(source), "sentinel-2", (34.2, -19.1, 34.3, -19.0), "2020-01-01/2020-02-01"
+    )
+
+    assert list(found.assets) == expected
+    assert found.assets[expected[0]].href == "https://example.com/B04.tif"
+
+
+def test_rename_assets_refuses_collisions() -> None:
+    item = _item_with_assets("B04", "red")
+
+    with pytest.raises(ValueError, match="collides"):
+        _rename_assets(item, {"B04": "red"})

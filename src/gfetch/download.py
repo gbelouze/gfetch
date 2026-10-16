@@ -38,6 +38,7 @@ from stac_asset.messages import (
     WriteChunk,
 )
 
+from gfetch.sources import planetary_computer_signer
 from gfetch.utils.progress import Progress, TaskID, temporary_task
 
 log = logging.getLogger(__name__)
@@ -416,6 +417,7 @@ async def _download_item(
     config: Config,
     semaphore: asyncio.Semaphore,
     stats: _DownloadStats,
+    sign: Callable[[str], str],
     progress: Progress | None = None,
 ) -> pystac.Item | None:
     """
@@ -437,6 +439,9 @@ async def _download_item(
         Bounds the number of items downloading concurrently across the whole batch.
     stats : _DownloadStats
         Batch-wide asset timings and errors to record into.
+    sign : Callable[[str], str]
+        Signs the hrefs of the assets being downloaded, see
+        `gfetch.sources.planetary_computer_signer`.
     progress : Progress | None
         Rich progress tracker. When given, this item gets its own byte-progress bar
         for the duration of its download (added/removed here, self-contained, with no
@@ -477,9 +482,12 @@ async def _download_item(
             consumer = asyncio.create_task(
                 _consume_messages(messages, item.id, stats, progress, task)
             )
+            remote = _rewrite_s3_hrefs(item)
+            for key in keys:
+                remote.assets[key].href = await asyncio.to_thread(sign, remote.assets[key].href)
             try:
                 downloaded = await download_item(
-                    _rewrite_s3_hrefs(item),
+                    remote,
                     Path(tmp),
                     config=download_config,
                     keep_non_downloaded=True,
@@ -599,6 +607,10 @@ async def download_items(
     stats = _DownloadStats()
     start = time.monotonic()
     semaphore = asyncio.Semaphore(max_concurrent_items)
+    # stac_asset requests a SAS token for every Planetary Computer asset it downloads,
+    # enough to get rate-limited (HTTP 429); it leaves hrefs that are already signed
+    # alone, so signing them here takes one token per container for the whole batch.
+    sign = planetary_computer_signer()
     log.info(
         f"Downloading {len(items)} item(s) x {len(asset_keys)} asset(s) into {cache_dir} "
         f"(max_concurrent_items={max_concurrent_items})"
@@ -609,7 +621,7 @@ async def download_items(
     async def _download_one(item: pystac.Item, task: TaskID | None) -> pystac.Item | None:
         nonlocal n_done
         result = await _download_item(
-            item, cache_dir, asset_keys, config, semaphore, stats, progress
+            item, cache_dir, asset_keys, config, semaphore, stats, sign, progress
         )
         n_done += 1
         status = "cached" if result is not None else "dropped"

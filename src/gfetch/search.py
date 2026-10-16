@@ -8,7 +8,13 @@ import pystac_client
 from pystac_client.stac_api_io import StacApiIO
 from urllib3.util.retry import Retry
 
-from gfetch.sources import StacSource, resolve_collection
+from gfetch.dn import assign_dn_offsets
+from gfetch.sources import (
+    HeterogeneousFallbackError,
+    StacSource,
+    asset_renames,
+    resolve_collection,
+)
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +30,50 @@ _RETRY = Retry(
     status_forcelist=(500, 502, 503, 504),
     allowed_methods=None,
 )
+
+
+def _rename_assets(item: pystac.Item, renames: dict[str, str]) -> None:
+    """
+    Rename an item's asset keys in place.
+
+    Parameters
+    ----------
+    item : pystac.Item
+        Item whose assets to rename.
+    renames : dict[str, str]
+        Asset key -> new key. Keys not listed are kept.
+
+    Raises
+    ------
+    ValueError
+        If two assets would end up with the same key.
+    """
+    assets = {renames.get(key, key): asset for key, asset in item.assets.items()}
+    if len(assets) != len(item.assets):
+        raise ValueError(f"{item.id}: renaming its assets with {renames} collides")
+    item.assets = assets
+
+
+def _sentinel2_tile(item: pystac.Item) -> str:
+    """
+    Name a Sentinel-2 item's MGRS tile, the same way on every source.
+
+    Parameters
+    ----------
+    item : pystac.Item
+        Sentinel-2 item.
+
+    Returns
+    -------
+    str
+        Its `grid:code` (Earth Search, e.g. 'MGRS-16SBJ'), else its `s2:mgrs_tile` in
+        that format (Planetary Computer, e.g. '16SBJ'), else its id.
+    """
+    if "grid:code" in item.properties:
+        return item.properties["grid:code"]
+    if "s2:mgrs_tile" in item.properties:
+        return f"MGRS-{item.properties['s2:mgrs_tile']}"
+    return item.id
 
 
 def _dedupe_sentinel2_processing_baseline(items: list[pystac.Item]) -> list[pystac.Item]:
@@ -52,7 +102,7 @@ def _dedupe_sentinel2_processing_baseline(items: list[pystac.Item]) -> list[pyst
     best: dict[tuple[str, object], pystac.Item] = {}
     for item in items:
         assert item.datetime is not None
-        key = (item.properties.get("grid:code", item.id), item.datetime.date())
+        key = (_sentinel2_tile(item), item.datetime.date())
         baseline = item.properties.get("s2:processing_baseline", "0")
         if key not in best or baseline > best[key].properties.get("s2:processing_baseline", "0"):
             best[key] = item
@@ -93,6 +143,7 @@ def search(
     query: dict | None = None,
     collection: str | None = None,
     intersects: dict | None = None,
+    accept_heterogeneous: bool = False,
 ) -> list[pystac.Item]:
     """
     Search a STAC source for items matching an AOI and time range.
@@ -125,15 +176,27 @@ def search(
         request when this is given (a `gfetch.countries`-derived AOI passes its
         exact country polygon here rather than just its bounding box). Defaults to
         None (search by `bbox`).
+    accept_heterogeneous : bool
+        Search a fallback collection that requires confirmation, see
+        `gfetch.sources.resolve_collection`. Defaults to False.
 
     Returns
     -------
     list[pystac.Item]
-        Matching STAC items.
+        Matching STAC items, their asset keys renamed to gfetch's (see
+        `gfetch.sources.asset_renames`), and their DN encoding recorded (see
+        `gfetch.dn.assign_dn_offsets`).
     """
     collection = collection or source.collection(satellite)
     try:
-        collection = resolve_collection(source, collection, *_parse_date_range(datetime))
+        collection = resolve_collection(
+            source,
+            collection,
+            *_parse_date_range(datetime),
+            accept_heterogeneous=accept_heterogeneous,
+        )
+    except HeterogeneousFallbackError:
+        raise
     except ValueError as e:
         log.error(e)
         raise
@@ -159,6 +222,10 @@ def search(
         items.extend(page.items)
         total = f"/{matched}" if matched is not None else ""
         log.debug(f"Fetched page {page_num} ({len(items)}{total} items so far)")
+    renames = asset_renames(source, collection)
+    if renames:
+        for item in items:
+            _rename_assets(item, renames)
     if satellite == "sentinel-2":
         deduped = _dedupe_sentinel2_processing_baseline(items)
         if len(deduped) != len(items):
@@ -166,5 +233,6 @@ def search(
                 f"Dropped {len(items) - len(deduped)} superseded-processing-baseline duplicate(s)"
             )
         items = deduped
+    assign_dn_offsets(items, source.name, collection)
     log.info(f"Found {len(items)} items")
     return items

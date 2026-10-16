@@ -37,7 +37,38 @@ different it will be from the other years (Collection 1, `sentinel-2-c1-l2a`).
 - `pairs.py`: using the -0.1 offset, the 04.00 items average *negative* blue/red
   over clear land (≈ -0.035), consistent with the offset already having been removed.
 
-To do next:
+### Resolved 2026-10-16: per-item DN encoding (`enc.py`, `enc2.py`)
+
+Method: per item, the fraction of blue DNs below 1000 over SCL-clear vegetation/water
+(SCL 4/6). Their blue reflectance is ~0.01-0.05, so it's ~1 without the offset and ~0
+with it. Clouds must be masked first: unmasked, cloudy items read as +1000 whatever
+their encoding. Four boxes (France 1.5..4.5°E 46.5..48.5°N, Gorongosa 34..35°E
+19.5..18.5°S, Kanto 138.5..140.5°E 35..36.5°N, Missouri 91..89°W 38..39.5°N).
+The fraction is bimodal: of ~1,000 classified items, 738 are ≤ 0.01 and ~800 are ≥ 0.5.
+
+- `enc.py`: 8 items (cloud cover < 30%) per (collection, baseline,
+  `boa_offset_applied`, `raster:bands` offset) group, 2017-2026.
+  - C1, every baseline 05.00-05.12 (no `boa_offset_applied`, offset -0.1): +1000.
+  - `sentinel-2-l2a`, baselines 00.01, 02.08-02.14, 03.01 (offset 0): no offset.
+  - `sentinel-2-l2a`, 04.00-05.12 with `applied: true` (offset -0.1): no offset.
+    `raster:bands` is wrong for these: a client applying it subtracts 0.1 again.
+- `enc2.py`: *every* `sentinel-2-l2a` item with `applied: false` acquired from
+  2022-01-25 on, in the four boxes: 1,537 items, 576 too cloudy to classify.
+  - Acquired 2022-01-25 to 2022-02-27, baseline 04.00, created 2022-11-03/06: 168 +1000,
+    8 none (25-30 Jan).
+  - Every other one: no offset. That's 285 items from Mar-Nov 2022 (04.00, 05.10) and
+    500 from Nov 2024-Jul 2026 (05.11, 05.12).
+- So `applied: false` is wrong for most items, and `raster:bands` offset is wrong for
+  every no-offset item from 04.00 on. Neither metadata field determines the encoding.
+  The only +1000 items in `sentinel-2-l2a` are acquired 2022-01-25 to 2022-02-27, and
+  not all items acquired then.
+- Consequences:
+  - A gfetch fallback to `sentinel-2-l2a` is uniformly no-offset, except that window.
+  - It is 1000 DN below C1 everywhere.
+  - A ≤ 2019 fallback is internally consistent too (00.01, 02.xx, and the 05.00
+    `applied: true` duplicates are all no-offset).
+
+Old to-do list (items 1-3 answered above):
 1. Let `dn.py` finish. Compare raw DNs on the same tile across `sentinel-2-l2a`
    2022 (04.00 True/False, 05.10) and C1 2021/2023, same season. Does each group sit
    near C1 (+1000) or near 03.01 (no offset)?

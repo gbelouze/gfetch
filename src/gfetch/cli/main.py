@@ -54,7 +54,9 @@ def _register_raster_commands(sub_app: cyclopts.App, satellite_key: str) -> None
     """
 
     @sub_app.command(name="search")
-    def _search(config: Path, verbose: bool = False) -> None:
+    def _search(
+        config: Path, verbose: bool = False, accept_heterogeneous_baselines: bool = False
+    ) -> None:
         """
         Search a STAC source for items matching a configuration's AOI/time range.
 
@@ -67,11 +69,17 @@ def _register_raster_commands(sub_app: cyclopts.App, satellite_key: str) -> None
             Path to the configuration YAML file.
         verbose : bool
             Enable verbose (DEBUG) logging. Defaults to False.
+        accept_heterogeneous_baselines : bool
+            Search a fallback collection with heterogeneous processing baselines (e.g.
+            Earth Search Sentinel-2 before 22 Mar 2019) without asking for
+            confirmation, as a non-interactive job must. Defaults to False.
         """
         _setup_logging(level=logging.DEBUG if verbose else logging.INFO)
         from gfetch.cli.search import search as search_cmd
 
-        search_cmd(config, satellite_key)
+        search_cmd(
+            config, satellite_key, accept_heterogeneous_baselines=accept_heterogeneous_baselines
+        )
 
     @sub_app.command(name="download")
     def _download(config: Path, verbose: bool = False) -> None:
@@ -276,7 +284,9 @@ custom_app = cyclopts.App(
 
 
 @custom_app.command(name="search")
-def _custom_search(name: str, config: Path, verbose: bool = False) -> None:
+def _custom_search(
+    name: str, config: Path, verbose: bool = False, accept_heterogeneous_baselines: bool = False
+) -> None:
     """
     Search a STAC source for items matching a `custom` satellite's AOI/time range.
 
@@ -291,11 +301,14 @@ def _custom_search(name: str, config: Path, verbose: bool = False) -> None:
         Path to the configuration YAML file.
     verbose : bool
         Enable verbose (DEBUG) logging. Defaults to False.
+    accept_heterogeneous_baselines : bool
+        Search a fallback collection with heterogeneous processing baselines without
+        asking for confirmation, as a non-interactive job must. Defaults to False.
     """
     _setup_logging(level=logging.DEBUG if verbose else logging.INFO)
     from gfetch.cli.search import search as search_cmd
 
-    search_cmd(config, name)
+    search_cmd(config, name, accept_heterogeneous_baselines=accept_heterogeneous_baselines)
 
 
 @custom_app.command(name="download")
