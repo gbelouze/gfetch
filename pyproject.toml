@@ -29,6 +29,13 @@ project-includes = [
     "**/*.py*",
     "**/*.ipynb",
 ]
+project-excludes = [
+    "claude/**",
+    "**/node_modules",
+    "**/__pycache__",
+    "**/venv/**",
+    "**/.[!/.]*/**",
+]
 disable-search-path-heuristics = true
 search-path = [".", "benchmark", "tests"]
 
