@@ -410,10 +410,13 @@ source-independent, and a config switches source with `source:` alone.
   `eo:bands` names agree with every entry of the table.
 - Keyed by collection, so it also applies to a `custom` satellite searching PC's
   `sentinel-2-l2a`. Unlisted assets (`visual`, metadata) keep their keys.
-- Still open: DN encoding. PC's 2020 items are baseline 02.12 (no +1000 offset), unlike
-  Earth Search C1; renaming doesn't make the two sources' values comparable. The dedup
-  `grid:code` gap above also remains, though a live 2-month PC search over Gorongosa
-  had no duplicate (tile, date).
+- DN encoding: PC's 2020 items are baseline 02.12 (no +1000 offset), unlike Earth Search
+  C1. Resolved 2026-10-16 by per-item harmonization, see `claude/s2-dn-harmonization.md`.
+- Dedup `grid:code` gap: resolved 2026-10-16. PC does list reprocessed duplicates: 8 of
+  20 items over a small Missouri box, 20-28 Jul 2022, were 04.00/05.10 pairs. Their ids
+  differ only by processing time, while `datetime`, `platform`, `sat:relative_orbit` and
+  `s2:mgrs_tile` match exactly. `_dedupe_sentinel2_processing_baseline` now falls back
+  to `MGRS-<s2:mgrs_tile>` when `grid:code` is absent.
 
 **CDSE assessed 2026-10-14: poor fit for gfetch.** Checked live against
 `https://stac.dataspace.copernicus.eu/v1` (STAC 1.1, CQL2 filter), plus CDSE's quota page.
@@ -719,9 +722,9 @@ throughout. 2022 over the same box, keeping the highest baseline per (tile, date
 (Earth Search's C1 does: scale 1e-4, offset -0.1), so the +1000 DN offset introduced
 by baseline 04.00 (25 Jan 2022) would have to be harmonized by gfetch itself before
 compositing across it. Band names differ too (`B04` vs `red`, see the per-source
-band-naming open question). `_dedupe_sentinel2_processing_baseline` keys on
-`grid:code`, which PC items lack (`s2:mgrs_tile` there), so on PC it falls back to the
-item id and removes no duplicates.
+band-naming open question). `_dedupe_sentinel2_processing_baseline` keyed on
+`grid:code`, which PC items lack, so on PC it removed no duplicates; it now falls back to
+`s2:mgrs_tile` (resolved 2026-10-16, see above).
 
 ## Inode usage (added 2026-09-22)
 

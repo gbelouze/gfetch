@@ -89,8 +89,8 @@ alone)".
 
 ## Out of scope, noted
 
-- PC dedup: PC lists reprocessed duplicates (e.g. 2022-07-24 at both 04.00 and 05.10),
-  and `_dedupe_sentinel2_processing_baseline` can't collapse them without `grid:code`.
-  It could use `s2:mgrs_tile` instead. Both carry +1000, so encoding isn't affected.
+- PC dedup: PC lists reprocessed duplicates (e.g. 2022-07-24 at both 04.00 and 05.10).
+  Both carry +1000, so encoding isn't affected. Since 2026-10-16,
+  `_dedupe_sentinel2_processing_baseline` collapses them via `s2:mgrs_tile`.
 - Non-encoding differences between baselines (algorithm, SCL, geolocation) aren't
   corrected. 04.00 vs 05.10 measured ≤ 0.005 mean |diff|; 00.01 hasn't been measured.

@@ -54,6 +54,28 @@ def _rename_assets(item: pystac.Item, renames: dict[str, str]) -> None:
     item.assets = assets
 
 
+def _sentinel2_tile(item: pystac.Item) -> str:
+    """
+    Name a Sentinel-2 item's MGRS tile, the same way on every source.
+
+    Parameters
+    ----------
+    item : pystac.Item
+        Sentinel-2 item.
+
+    Returns
+    -------
+    str
+        Its `grid:code` (Earth Search, e.g. 'MGRS-16SBJ'), else its `s2:mgrs_tile` in
+        that format (Planetary Computer, e.g. '16SBJ'), else its id.
+    """
+    if "grid:code" in item.properties:
+        return item.properties["grid:code"]
+    if "s2:mgrs_tile" in item.properties:
+        return f"MGRS-{item.properties['s2:mgrs_tile']}"
+    return item.id
+
+
 def _dedupe_sentinel2_processing_baseline(items: list[pystac.Item]) -> list[pystac.Item]:
     """
     Keep one item per (grid tile, date), preferring the highest `s2:processing_baseline`.
@@ -80,7 +102,7 @@ def _dedupe_sentinel2_processing_baseline(items: list[pystac.Item]) -> list[pyst
     best: dict[tuple[str, object], pystac.Item] = {}
     for item in items:
         assert item.datetime is not None
-        key = (item.properties.get("grid:code", item.id), item.datetime.date())
+        key = (_sentinel2_tile(item), item.datetime.date())
         baseline = item.properties.get("s2:processing_baseline", "0")
         if key not in best or baseline > best[key].properties.get("s2:processing_baseline", "0"):
             best[key] = item

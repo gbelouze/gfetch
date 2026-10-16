@@ -32,6 +32,27 @@ def test_dedupe_sentinel2_processing_baseline_keeps_highest_baseline() -> None:
     assert [item.id for item in deduped] == ["new"]
 
 
+def test_dedupe_sentinel2_processing_baseline_keys_planetary_computer_by_mgrs_tile() -> None:
+    # A real Planetary Computer pair: same scene, ids differing by processing time only.
+    def pc_item(item_id: str, baseline: str) -> pystac.Item:
+        return pystac.Item(
+            id=item_id,
+            geometry=None,
+            bbox=None,
+            datetime=datetime.datetime(2022, 7, 27, 16, 48, 51, 24000, tzinfo=datetime.UTC),
+            properties={"s2:mgrs_tile": "16SBJ", "s2:processing_baseline": baseline},
+        )
+
+    old = pc_item("S2A_MSIL2A_20220727T164851_R026_T16SBJ_20220729T051409", "04.00")
+    new = pc_item("S2A_MSIL2A_20220727T164851_R026_T16SBJ_20240716T165106", "05.10")
+    other_tile = pc_item("S2A_MSIL2A_20220727T164851_R026_T16SBH_20220729T051409", "04.00")
+    other_tile.properties["s2:mgrs_tile"] = "16SBH"
+
+    deduped = _dedupe_sentinel2_processing_baseline([old, new, other_tile])
+
+    assert {item.id for item in deduped} == {new.id, other_tile.id}
+
+
 def test_dedupe_sentinel2_processing_baseline_keeps_distinct_tiles_and_dates() -> None:
     tile_a = _s2_item("a", grid_code="MGRS-35MNM", date="2020-06-06", baseline="02.14")
     tile_b = _s2_item("b", grid_code="MGRS-35MNN", date="2020-06-06", baseline="02.14")
