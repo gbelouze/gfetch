@@ -10,8 +10,10 @@ def test_builtin_satellite_commands_dispatch_with_correct_satellite_key(
 ) -> None:
     calls: list[tuple] = []
 
-    def fake_search(config_path: Path, satellite_key: str) -> None:
-        calls.append(("search", config_path, satellite_key))
+    def fake_search(
+        config_path: Path, satellite_key: str, *, accept_heterogeneous_baselines: bool = False
+    ) -> None:
+        calls.append(("search", config_path, satellite_key, accept_heterogeneous_baselines))
 
     def fake_download(config_path: Path, satellite_key: str) -> None:
         calls.append(("download", config_path, satellite_key))
@@ -26,6 +28,10 @@ def test_builtin_satellite_commands_dispatch_with_correct_satellite_key(
     monkeypatch.setattr("gfetch.cli.mosaic.mosaic", fake_mosaic)
 
     app(["s1", "search", "config.yaml"], result_action="return_value")
+    app(
+        ["s2", "search", "config.yaml", "--accept-heterogeneous-baselines"],
+        result_action="return_value",
+    )
     app(["s2", "download", "config.yaml"], result_action="return_value")
     app(
         ["s2", "mosaic", "config.yaml", "--task-id", "1", "--n-tasks", "2"],
@@ -33,7 +39,8 @@ def test_builtin_satellite_commands_dispatch_with_correct_satellite_key(
     )
 
     assert calls == [
-        ("search", Path("config.yaml"), "s1"),
+        ("search", Path("config.yaml"), "s1", False),
+        ("search", Path("config.yaml"), "s2", True),
         ("download", Path("config.yaml"), "s2"),
         ("mosaic", Path("config.yaml"), "s2", 1, 2),
     ]
@@ -42,8 +49,10 @@ def test_builtin_satellite_commands_dispatch_with_correct_satellite_key(
 def test_custom_satellite_commands_pass_through_name(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple] = []
 
-    def fake_search(config_path: Path, satellite_key: str) -> None:
-        calls.append(("search", config_path, satellite_key))
+    def fake_search(
+        config_path: Path, satellite_key: str, *, accept_heterogeneous_baselines: bool = False
+    ) -> None:
+        calls.append(("search", config_path, satellite_key, accept_heterogeneous_baselines))
 
     def fake_download(config_path: Path, satellite_key: str) -> None:
         calls.append(("download", config_path, satellite_key))
@@ -62,7 +71,7 @@ def test_custom_satellite_commands_pass_through_name(monkeypatch: pytest.MonkeyP
     app(["custom", "mosaic", "landsat8", "config.yaml"], result_action="return_value")
 
     assert calls == [
-        ("search", Path("config.yaml"), "landsat8"),
+        ("search", Path("config.yaml"), "landsat8", False),
         ("download", Path("config.yaml"), "landsat8"),
         ("mosaic", Path("config.yaml"), "landsat8", 0, 1),
     ]

@@ -21,6 +21,7 @@ from retry import retry
 
 __all__ = [
     "SOURCES",
+    "HeterogeneousFallbackError",
     "StacSource",
     "asset_renames",
     "get_source",
@@ -64,32 +65,57 @@ class _CollectionGap:
         entirely within the gap, or None to refuse such time ranges.
     fallback_caveat : str
         Appended to the warning logged when `fallback` is used. Defaults to ''.
+    confirm : bool
+        Whether using `fallback` must be explicitly accepted, see
+        `HeterogeneousFallbackError`. Defaults to False.
     """
 
     start: datetime.date
     end: datetime.date
     fallback: str | None = None
     fallback_caveat: str = ""
+    confirm: bool = False
+
+
+class HeterogeneousFallbackError(ValueError):
+    """
+    A time range lies within a gap whose fallback collection must be explicitly accepted.
+
+    Raised by `resolve_collection` unless called with `accept_heterogeneous=True`.
+    """
 
 
 # Keyed by (source name, collection id). Earth Search's Collection 1 only holds data
-# reprocessed by ESA to baseline 05.00+, and per Earth Search's own documentation (as of
-# April 2024) that reprocessing hasn't reached Nov 2016 - Nov 2019 or 2022. Confirmed
-# live 2026-09-23: 45 items for Jan-Sep 2022 over a 230 km box in France, against 1,372
-# in `sentinel-2-l2a`. That older collection has the same asset keys, `grid:code` and
-# `raster:bands` scale/offset as Collection 1, but its items before 25 Jan 2022 are
-# baseline 03.01, whose DNs lack the +1000 offset every later baseline carries.
+# reprocessed by ESA to baseline 05.00+. Measured live 2026-10-16 over France, Mozambique,
+# Japan and the US (`claude/tech-stack.md`): it holds nothing before Nov 2017, a fraction
+# of the scenes until 21 Mar 2019, and none between 1 Jan and 5 Dec 2022. The older
+# `sentinel-2-l2a` has the same asset keys and `grid:code` as Collection 1. Its DNs
+# lack Collection 1's +1000 offset, except most items acquired 25 Jan - 27 Feb 2022
+# (`claude/s2-2022/README.md`). Neither `earthsearch:boa_offset_applied` nor
+# `raster:bands` offset tells which, see `gfetch.dn`. All of this is specific to Earth
+# Search v1: revisit it once v2 leaves beta (`claude/s2-dn-harmonization.md`).
 _COLLECTION_GAPS: dict[tuple[str, str], list[_CollectionGap]] = {
     ("earthsearch", "sentinel-2-c1-l2a"): [
-        _CollectionGap(datetime.date(2016, 11, 1), datetime.date(2019, 11, 30)),
         _CollectionGap(
-            datetime.date(2022, 1, 1),
-            datetime.date(2022, 12, 31),
+            datetime.date(2015, 6, 23),
+            datetime.date(2019, 3, 21),
             fallback="sentinel-2-l2a",
             fallback_caveat=(
-                "Its items before 2022-01-25 are processing baseline 03.01, whose "
-                "reflectance DNs lack the +1000 offset of every later baseline and of "
-                "Collection 1; gfetch does not harmonize them."
+                "Its items mix processing baselines 00.01 to 03.01 (older Sen2Cor "
+                "versions, likely without geometric refinement before 03.00), in one "
+                "composite and against Collection 1's 05.00+; gfetch only harmonizes "
+                "their DN offset."
+            ),
+            confirm=True,
+        ),
+        _CollectionGap(
+            datetime.date(2022, 1, 1),
+            datetime.date(2022, 12, 5),
+            fallback="sentinel-2-l2a",
+            fallback_caveat=(
+                "Its reflectance DNs lack Collection 1's +1000 offset, except most "
+                "items acquired 2022-01-25 to 2022-02-27; gfetch harmonizes the offset "
+                "per item, see `gfetch.dn`."
             ),
         ),
     ],
@@ -216,6 +242,8 @@ def resolve_collection(
     collection: str,
     start: datetime.date | None,
     end: datetime.date | None,
+    *,
+    accept_heterogeneous: bool = False,
 ) -> str:
     """
     Resolve the collection to search for a time range, given the periods a collection
@@ -231,6 +259,9 @@ def resolve_collection(
         First day of the time range, or None if open-ended.
     end : datetime.date | None
         Last day of the time range, or None if open-ended.
+    accept_heterogeneous : bool
+        Use the fallback of a gap that requires confirmation instead of raising.
+        Defaults to False.
 
     Returns
     -------
@@ -240,6 +271,9 @@ def resolve_collection(
 
     Raises
     ------
+    HeterogeneousFallbackError
+        If the time range falls entirely within a gap whose fallback requires
+        confirmation, and `accept_heterogeneous` is False.
     ValueError
         If the time range overlaps a known gap of `collection` on `source` that has no
         fallback, or that it doesn't fall entirely within.
@@ -249,13 +283,16 @@ def resolve_collection(
             continue
         within = start is not None and end is not None and gap.start <= start and end <= gap.end
         if gap.fallback is not None and within:
-            log.warning(
+            message = (
                 f"!!! {source.name} collection {collection!r} is missing data from "
                 f"{gap.start} to {gap.end}: searching {gap.fallback!r} instead for "
                 f"{start}/{end}. Its items are not Collection 1 reprocessed data, so "
                 f"this mosaic is not radiometrically equivalent to one outside that "
                 f"period. {gap.fallback_caveat}".rstrip()
             )
+            if gap.confirm and not accept_heterogeneous:
+                raise HeterogeneousFallbackError(message)
+            log.warning(message)
             return gap.fallback
         hint = (
             f"Split the time range so that each part lies either entirely outside or "

@@ -8,6 +8,7 @@ import yaml
 from gfetch.cli.config import AOIConfig, Config, TimeRangeConfig, load
 from gfetch.cli.search import _build_query
 from gfetch.cli.search import search as search_cmd
+from gfetch.sources import HeterogeneousFallbackError
 
 
 def _config(**overrides: Any) -> Config:
@@ -85,3 +86,55 @@ def test_search_skips_when_items_exist(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("gfetch.cli.search.search_items", no_search)
 
     search_cmd(cfg_path, "s2")
+
+
+def _fake_heterogeneous_search(accepts: list[bool]):
+    def fake(*args: object, accept_heterogeneous: bool = False, **kwargs: object) -> list:
+        accepts.append(accept_heterogeneous)
+        if not accept_heterogeneous:
+            raise HeterogeneousFallbackError("heterogeneous")
+        return []
+
+    return fake
+
+
+def test_search_refuses_a_heterogeneous_fallback_without_a_terminal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cfg_path = _write_config(tmp_path)
+    accepts: list[bool] = []
+    monkeypatch.setattr("gfetch.cli.search.search_items", _fake_heterogeneous_search(accepts))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    with pytest.raises(HeterogeneousFallbackError):
+        search_cmd(cfg_path, "s2")
+
+    assert accepts == [False]
+    assert not load(cfg_path, "s2").items_path.exists()
+
+
+def test_search_accepts_a_heterogeneous_fallback_with_the_flag(tmp_path: Path, monkeypatch) -> None:
+    cfg_path = _write_config(tmp_path)
+    accepts: list[bool] = []
+    monkeypatch.setattr("gfetch.cli.search.search_items", _fake_heterogeneous_search(accepts))
+
+    search_cmd(cfg_path, "s2", accept_heterogeneous_baselines=True)
+
+    assert accepts == [True]
+    assert load(cfg_path, "s2").items_path.exists()
+
+
+@pytest.mark.parametrize("confirmed", [True, False])
+def test_search_asks_before_a_heterogeneous_fallback_on_a_terminal(
+    tmp_path: Path, monkeypatch, confirmed: bool
+) -> None:
+    cfg_path = _write_config(tmp_path)
+    accepts: list[bool] = []
+    monkeypatch.setattr("gfetch.cli.search.search_items", _fake_heterogeneous_search(accepts))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("gfetch.cli.search.Confirm.ask", lambda *args, **kwargs: confirmed)
+
+    search_cmd(cfg_path, "s2")
+
+    assert accepts == ([False, True] if confirmed else [False])
+    assert load(cfg_path, "s2").items_path.exists() == confirmed

@@ -8,7 +8,13 @@ import pystac_client
 from pystac_client.stac_api_io import StacApiIO
 from urllib3.util.retry import Retry
 
-from gfetch.sources import StacSource, asset_renames, resolve_collection
+from gfetch.dn import assign_dn_offsets
+from gfetch.sources import (
+    HeterogeneousFallbackError,
+    StacSource,
+    asset_renames,
+    resolve_collection,
+)
 
 log = logging.getLogger(__name__)
 
@@ -115,6 +121,7 @@ def search(
     query: dict | None = None,
     collection: str | None = None,
     intersects: dict | None = None,
+    accept_heterogeneous: bool = False,
 ) -> list[pystac.Item]:
     """
     Search a STAC source for items matching an AOI and time range.
@@ -147,16 +154,27 @@ def search(
         request when this is given (a `gfetch.countries`-derived AOI passes its
         exact country polygon here rather than just its bounding box). Defaults to
         None (search by `bbox`).
+    accept_heterogeneous : bool
+        Search a fallback collection that requires confirmation, see
+        `gfetch.sources.resolve_collection`. Defaults to False.
 
     Returns
     -------
     list[pystac.Item]
         Matching STAC items, their asset keys renamed to gfetch's (see
-        `gfetch.sources.asset_renames`).
+        `gfetch.sources.asset_renames`), and their DN encoding recorded (see
+        `gfetch.dn.assign_dn_offsets`).
     """
     collection = collection or source.collection(satellite)
     try:
-        collection = resolve_collection(source, collection, *_parse_date_range(datetime))
+        collection = resolve_collection(
+            source,
+            collection,
+            *_parse_date_range(datetime),
+            accept_heterogeneous=accept_heterogeneous,
+        )
+    except HeterogeneousFallbackError:
+        raise
     except ValueError as e:
         log.error(e)
         raise
@@ -193,5 +211,6 @@ def search(
                 f"Dropped {len(items) - len(deduped)} superseded-processing-baseline duplicate(s)"
             )
         items = deduped
+    assign_dn_offsets(items, source.name, collection)
     log.info(f"Found {len(items)} items")
     return items

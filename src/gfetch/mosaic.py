@@ -20,6 +20,7 @@ from odc.geo.geom import BoundingBox, Geometry, bbox_intersection
 from pyproj.database import query_utm_crs_info
 from shapely.geometry.base import BaseGeometry
 
+from gfetch.dn import REFLECTANCE_BANDS, dn_shift
 from gfetch.utils.memory import log_chunk_footprint
 
 log = logging.getLogger(__name__)
@@ -457,6 +458,8 @@ def mosaic(
     Convenience wrapper chaining `load`, `mask_nodata`, `mask_clouds`, and
     `composite`. A pixel with no valid observation is NaN. Items whose footprint
     doesn't intersect `geobox` are dropped before loading, see `_items_intersecting`.
+    Items with a `gfetch.dn.DN_OFFSET_PROPERTY` have their reflectance bands shifted to
+    `gfetch.dn.DN_OFFSET` first, see `_load_harmonized`.
 
     Parameters
     ----------
@@ -490,9 +493,10 @@ def mosaic(
     log_footprint : bool
         Passed to `load`. Defaults to True.
     on_load : Callable[[xr.Dataset], object] | None
-        Called with the lazily loaded dataset, before masking and compositing (e.g.
-        to measure how many bytes the mosaic processes). Called once per orbit
-        state with `split_orbit_states`. Defaults to None.
+        Called with each lazily loaded dataset, before masking and compositing (e.g.
+        to measure how many bytes the mosaic processes): once per orbit state with
+        `split_orbit_states`, and once per DN shift (see `_load_harmonized`).
+        Defaults to None.
     split_orbit_states : bool
         Composite each `sat:orbit_state` (see `ORBIT_STATES`) separately, into
         variables named as `orbit_state_variables` does. An orbit state with no
@@ -524,7 +528,7 @@ def mosaic(
         )
         resolved_chunks["time"] = _DEFAULT_TIME_CHUNK
 
-    def build(group: Sequence[pystac.Item]) -> xr.Dataset:
+    def load_group(group: Sequence[pystac.Item]) -> xr.Dataset:
         ds = load(
             group,
             geobox,
@@ -537,7 +541,10 @@ def mosaic(
         )
         if on_load is not None:
             on_load(ds)
-        ds = mask_nodata(ds, exclude=mask_band)
+        return mask_nodata(ds, exclude=mask_band)
+
+    def build(group: Sequence[pystac.Item]) -> xr.Dataset:
+        ds = _load_harmonized(group, load_group)
         if mask_band is not None:
             ds = mask_clouds(ds, mask_band, mask_out)
         return composite(ds, method=method)
@@ -550,6 +557,76 @@ def mosaic(
     # needing extra resampling to reach the common geobox). write_region()'s Zarr
     # requires exact alignment for every variable, so we pin it explicitly.
     return result.chunk({"y": resolved_chunks["y"], "x": resolved_chunks["x"]})
+
+
+def _load_harmonized(
+    items: Sequence[pystac.Item], load_group: Callable[[Sequence[pystac.Item]], xr.Dataset]
+) -> xr.Dataset:
+    """
+    Load items with `gfetch.dn.DN_OFFSET` encoding throughout.
+
+    odc-stac fuses same-day items into one time step, so a per-item shift can't happen
+    after loading. Items are loaded in groups of equal `gfetch.dn.dn_shift` instead,
+    each group's `gfetch.dn.REFLECTANCE_BANDS` shifted, and the groups concatenated
+    along `time`. A day with items in two groups becomes two time steps, which only
+    affects pixels both groups cover.
+
+    Parameters
+    ----------
+    items : Sequence[pystac.Item]
+        Items to load.
+    load_group : Callable[[Sequence[pystac.Item]], xr.Dataset]
+        Loads a list of items and masks their nodata to NaN, so that a shift leaves it
+        NaN.
+
+    Returns
+    -------
+    xr.Dataset
+        The items' dataset, with a single `time` chunk.
+    """
+    groups: dict[int, list[pystac.Item]] = {}
+    for item in items:
+        groups.setdefault(dn_shift(item), []).append(item)
+    if len(groups) <= 1:
+        shift = next(iter(groups), 0)
+        return _shift_reflectance(load_group(items), shift)
+    log.info(f"Items per DN shift: { {shift: len(g) for shift, g in groups.items()} }")
+    parts = [_shift_reflectance(load_group(group), shift) for shift, group in groups.items()]
+    merged = xr.concat(
+        parts,
+        dim="time",
+        join="exact",
+        coords="minimal",
+        compat="override",
+        combine_attrs="override",
+    )
+    return merged.sortby("time").chunk({"time": _DEFAULT_TIME_CHUNK})
+
+
+def _shift_reflectance(ds: xr.Dataset, shift: int) -> xr.Dataset:
+    """
+    Add `shift` to a dataset's `gfetch.dn.REFLECTANCE_BANDS`, keeping their attributes.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Dataset with nodata already masked to NaN.
+    shift : int
+        DN shift, see `gfetch.dn.dn_shift`.
+
+    Returns
+    -------
+    xr.Dataset
+        `ds` with its reflectance bands shifted, or `ds` itself if `shift` is 0.
+    """
+    if not shift:
+        return ds
+    shifted = {
+        name: (ds[name] + shift).assign_attrs(ds[name].attrs)
+        for name in ds.data_vars
+        if name in REFLECTANCE_BANDS
+    }
+    return ds.assign(shifted)
 
 
 def orbit_state_variables(bands: Sequence[str]) -> list[str]:

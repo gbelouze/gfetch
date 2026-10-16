@@ -8,8 +8,9 @@ from pystac_client.stac_api_io import StacApiIO
 from requests.adapters import HTTPAdapter
 from urllib3.exceptions import MaxRetryError
 
+from gfetch.dn import DN_OFFSET, DN_OFFSET_PROPERTY
 from gfetch.search import _dedupe_sentinel2_processing_baseline, _rename_assets, search
-from gfetch.sources import get_source
+from gfetch.sources import HeterogeneousFallbackError, get_source
 
 
 def _s2_item(item_id: str, *, grid_code: str, date: str, baseline: str) -> pystac.Item:
@@ -209,7 +210,7 @@ def test_search_earthsearch_sentinel1_orbit_state_filter() -> None:
         "2021-12-15/2022-01-10",
         "2022-12-01/2023-02-01",
         "2021-01-01/2023-12-31",
-        "2019-06-01/2020-06-01",
+        "2019-01-01/2019-12-31",
         "2021-01-01/..",
         "../2022-03-01",
     ],
@@ -230,7 +231,8 @@ def test_search_refuses_known_earthsearch_c1_gaps(
     ("source", "datetime_range"),
     [
         ("earthsearch", "2021-01-01/2021-12-31"),
-        ("earthsearch", "2019-12-01/2021-12-31"),
+        ("earthsearch", "2019-03-22/2021-12-31"),
+        ("earthsearch", "2022-12-06/2023-02-01"),
         ("earthsearch", "2023-01-01T00:00:00Z/2023-06-01T00:00:00Z"),
         ("planetary-computer", "2022-01-01/2022-09-30"),
     ],
@@ -252,7 +254,7 @@ def test_search_allows_time_ranges_outside_known_gaps(
 
 @pytest.mark.parametrize(
     "datetime_range",
-    ["2022-01-01/2022-12-31", "2022-02-01T00:00:00Z/2022-05-01T00:00:00Z"],
+    ["2022-01-01/2022-12-05", "2022-02-01T00:00:00Z/2022-05-01T00:00:00Z"],
 )
 def test_search_falls_back_within_earthsearch_c1_2022_gap(
     datetime_range: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -271,6 +273,45 @@ def test_search_falls_back_within_earthsearch_c1_2022_gap(
     assert any(
         r.levelname == "WARNING" and "sentinel-2-l2a" in r.getMessage() for r in caplog.records
     )
+
+
+def test_search_refuses_the_early_earthsearch_c1_gap_unless_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_collections: list[list[str]] = []
+    monkeypatch.setattr(
+        pystac_client.Client,
+        "open",
+        staticmethod(lambda url, **kwargs: _FakeCatalog(requested_collections)),
+    )
+    args = (
+        get_source("earthsearch"),
+        "sentinel-2",
+        (-1.0, 45.6, 2.0, 47.7),
+        "2018-01-01/2018-12-31",
+    )
+
+    with pytest.raises(HeterogeneousFallbackError, match="sentinel-2-l2a"):
+        search(*args)
+    assert requested_collections == []
+
+    search(*args, accept_heterogeneous=True)
+    assert requested_collections == [["sentinel-2-l2a"]]
+
+
+def test_search_records_each_items_dn_offset(monkeypatch: pytest.MonkeyPatch) -> None:
+    item = _s2_item("item", grid_code="MGRS-31TCN", date="2024-07-19", baseline="05.11")
+    monkeypatch.setattr(
+        pystac_client.Client,
+        "open",
+        staticmethod(lambda url, **kwargs: _FakeCatalog([], items=[item])),
+    )
+
+    [found] = search(
+        get_source("earthsearch"), "sentinel-2", (-1.0, 45.6, 2.0, 47.7), "2024-07-01/2024-07-31"
+    )
+
+    assert found.properties[DN_OFFSET_PROPERTY] == DN_OFFSET
 
 
 def _item_with_assets(*keys: str) -> pystac.Item:

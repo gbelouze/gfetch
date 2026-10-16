@@ -64,6 +64,17 @@ For Sentinel-2, `ocm: true` under `s2:` masks clouds with
 `uv sync --extra ocm`, `nir` in `bands`, and a `gfetch s2 ocm config.yaml` run between
 `download` and `mosaic` (on a GPU node, ideally).
 
+Sentinel-2 mosaics use Collection 1's encoding, `DN = reflectance × 10000 + 1000`, whatever
+the source: `search` records each item's DN offset, and `ocm`/`mosaic` shift the items
+without it. On Earth Search, `search` falls back to the older `sentinel-2-l2a` collection
+where Collection 1 has no data:
+- 1 Jan to 5 Dec 2022.
+- Before 22 Mar 2019. Its processing baselines are heterogeneous, so `search` asks for
+  confirmation, or takes `--accept-heterogeneous-baselines` in a non-interactive job.
+
+A time range straddling either period's boundaries is refused; split it instead. See
+`claude/s2-dn-harmonization.md`.
+
 `mosaic` writes one Zarr store per UTM zone the AOI spans
 (`<output_dir>/mosaic_epsg<code>.zarr`) — a country-scale AOI crossing several zones
 produces several stores, each in its own zone's native CRS, rather than one store

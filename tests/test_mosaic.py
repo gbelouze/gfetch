@@ -12,6 +12,7 @@ from odc.geo.geobox import GeoBox
 from odc.geo.geom import box
 from rasterio.transform import from_origin
 
+from gfetch.dn import DN_OFFSET, DN_OFFSET_PROPERTY
 from gfetch.mosaic import (
     _items_intersecting,
     _pin_mask_band_resampling,
@@ -411,6 +412,77 @@ def test_mosaic_split_orbit_states_fills_missing_state_with_nan(monkeypatch) -> 
     assert list(ds.data_vars) == ["vv_ascending", "vv_descending"]
     assert np.isnan(ds["vv_ascending"].values).all()
     assert (ds["vv_descending"].values == 1).all()
+
+
+def _dn_item(item_id: str, offset: int | None, day: int) -> pystac.Item:
+    item = _item(item_id, (0, 0, 1, 1))
+    item.datetime = datetime.datetime(2022, 2, day, tzinfo=datetime.UTC)
+    if offset is not None:
+        item.properties[DN_OFFSET_PROPERTY] = offset
+    return item
+
+
+def _fake_load_by_item_day(monkeypatch) -> list[list[str]]:
+    """Patch `load` to give each item a time step, its `red` set to 300 + its offset."""
+    calls: list[list[str]] = []
+
+    def fake_load(items, geobox, bands, *, groupby, chunks, resampling, log_footprint, patch_url):
+        calls.append([item.id for item in items])
+        red = [300.0 + item.properties.get(DN_OFFSET_PROPERTY, DN_OFFSET) for item in items]
+        values = {
+            "red": np.array(red)[:, None, None] * np.ones((1, 2, 2)),
+            "scl": np.full((len(items), 2, 2), 4.0),
+        }
+        return xr.Dataset(
+            {band: (("time", "y", "x"), values[band]) for band in bands},
+            coords={"time": [item.datetime for item in items]},
+        ).chunk({"time": 1})
+
+    monkeypatch.setattr("gfetch.mosaic.load", fake_load)
+    return calls
+
+
+def test_mosaic_shifts_items_without_the_offset_before_compositing(monkeypatch) -> None:
+    calls = _fake_load_by_item_day(monkeypatch)
+    items = [_dn_item("c1", DN_OFFSET, 1), _dn_item("old", 0, 2), _dn_item("c1b", DN_OFFSET, 3)]
+
+    ds = mosaic(
+        items,
+        GeoBox.from_bbox((0, 0, 1, 1), crs="EPSG:4326", shape=(2, 2)),
+        ["red"],
+        mask_band="scl",
+        mask_out=frozenset({9}),
+        method="min",
+    )
+
+    assert sorted(calls) == [["c1", "c1b"], ["old"]]
+    assert (ds["red"].values == 1300).all()
+
+
+def test_mosaic_loads_once_when_items_share_an_encoding(monkeypatch) -> None:
+    calls = _fake_load_by_item_day(monkeypatch)
+
+    ds = mosaic(
+        [_dn_item("a", 0, 1), _dn_item("b", 0, 2)],
+        GeoBox.from_bbox((0, 0, 1, 1), crs="EPSG:4326", shape=(2, 2)),
+        ["red"],
+    )
+
+    assert calls == [["a", "b"]]
+    assert (ds["red"].values == 1300).all()
+
+
+def test_mosaic_leaves_items_without_a_recorded_offset_unshifted(monkeypatch) -> None:
+    calls = _fake_load_by_item_day(monkeypatch)
+
+    ds = mosaic(
+        [_dn_item("a", None, 1)],
+        GeoBox.from_bbox((0, 0, 1, 1), crs="EPSG:4326", shape=(2, 2)),
+        ["red"],
+    )
+
+    assert calls == [["a"]]
+    assert (ds["red"].values == 1300).all()
 
 
 @pytest.mark.parametrize("orbit_state", [None, "sideways"])

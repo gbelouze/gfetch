@@ -64,6 +64,10 @@ dev = [
 [tool.ruff]
 target-version = "py312"
 line-length = 100
+# Design notes and one-off investigation scripts, not package code.
+extend-exclude = ["claude"]
+# pre-commit passes filenames explicitly, which ruff otherwise checks despite excludes.
+force-exclude = true
 
 [tool.ruff.lint]
 select = [

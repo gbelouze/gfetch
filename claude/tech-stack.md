@@ -321,7 +321,7 @@ API and a static file tree:
 | Planetary Computer | anonymous search; SAS-signed assets | `sentinel-2-l2a` | **v1** — broadest coverage (S1/S2/Landsat), Hub retired 2024 but STAC/Data API confirmed to remain; single-vendor free-tier risk (same class as GEE, not yet triggered) |
 | Element84 Earth Search (AWS) | none — public S3 | `sentinel-2-l2a` / `sentinel-2-c1-l2a` | **v1** — no token dance, architecturally simplest, most robust long-term free option; chosen specifically to keep the source abstraction honest (forces `signer` to be optional) |
 | USGS Landsat (LandsatLook) | requester-pays S3 for direct access | `landsat-c2-l2` | Future — in practice, free via PC/Earth Search mirrors |
-| CDSE | OAuth2 client-credentials | official Sentinel archive | Future — more friction, had a multi-day STAC outage in Mar 2026; authoritative fallback, not default |
+| CDSE | S3 keys or OIDC bearer token | official Sentinel archive | **Poor fit (assessed 2026-10-14)** — JP2 S2 assets, credentials on every asset, 12 TB/30-day quota; see below |
 | Generic static S3 catalog | none / bucket policy dependent | n/a | Future — needs `StaticSource`, see above |
 
 **Sentinel-1 (added 2026-09-22)**: both Planetary Computer and Earth Search expose a
@@ -414,6 +414,31 @@ source-independent, and a config switches source with `source:` alone.
   Earth Search C1; renaming doesn't make the two sources' values comparable. The dedup
   `grid:code` gap above also remains, though a live 2-month PC search over Gorongosa
   had no duplicate (tile, date).
+
+**CDSE assessed 2026-10-14: poor fit for gfetch.** Checked live against
+`https://stac.dataspace.copernicus.eu/v1` (STAC 1.1, CQL2 filter), plus CDSE's quota page.
+- Search is anonymous. Every asset needs credentials: the primary href is
+  `s3://eodata/...` (static CDSE S3 keys), and the `alternate.https` href is an OData
+  `Products(<id>)/Nodes(...)/$value` URL (OIDC token, valid 10 min, refreshable for 60).
+- `sentinel-2-l2a` assets are the `.SAFE`'s JP2 files, one per band per resolution
+  (`B04_10m`, `B04_20m`, `SCL_20m`, ...). Windowed remote reads are much slower than COG,
+  and the keys need yet another `_ASSET_RENAMES` table.
+- `sentinel-1-grd` assets are COGs (`_COG` products, one asset per polarisation), in
+  radar geometry with no terrain correction. Forum reports: per-satellite `product:type`
+  values (S1A/S1B/S1C differ), and some items pointing to missing S3 objects.
+- The STAC catalogue indexes a subset of collections. The complete catalogue is OData
+  (`catalogue.dataspace.copernicus.eu/odata/v1/Products?$filter=...`, product-level,
+  inherited from SciHub/DHuS). The OpenSearch API is slated for deprecation.
+- Quotas for Copernicus General users (S3, OData and STAC alike): 4 concurrent connections
+  at 20 MB/s each, 12 TB over a rolling 30 days (checked hourly), 2000 S3 requests/min.
+  Past 12 TB, access throttles to 1 connection at 1 MB/s until the 30-day sum drops.
+  Offline products can only be ordered via the web Data Workspace.
+- CDSE's intended route for bulk work is compute next to the data: CloudFerro/CREODIAS
+  VMs reading `eodata`, or CDSE's openEO/Sentinel Hub/JupyterLab. Other options are
+  higher-quota user types (on application) and national mirrors (e.g. PEPS/GEODES,
+  CODE-DE). The mirrors' current status is unverified.
+- Revisit only if gfetch runs inside the Copernicus cloud, or if a national mirror with
+  COGs and no quota becomes available.
 
 ## Chosen architecture
 
@@ -656,13 +681,34 @@ Jan-Sep, distinct (tile, date) pairs:
 | 2022 | 45 items | 1,372 items |
 | 2023-2025 | matches | matches |
 
+**Re-measured 2026-10-16** over four boxes: France (1.5..4.5°E, 46.5..48.5°N),
+Gorongosa (34..35°E, 19.5..18.5°S), Kanto (138.5..140.5°E, 35..36.5°N), Missouri
+(91..89°W, 38..39.5°N). Same boundaries in all four:
+- C1 holds nothing before Nov 2017. From Nov 2017 to 21 Mar 2019 it holds a varying
+  fraction (0-50%) of the scenes. From 22 Mar 2019 to 31 Dec 2021 it is complete:
+  `sentinel-2-l2a` lists each C1 scene a second time, at its original baseline.
+- None from 1 Jan to 5 Dec 2022, except a few 05.10 scenes (Mar-Apr, one in Jul/Oct).
+  Complete again from 6 Dec 2022 (baseline 05.09).
+- `sentinel-2-l2a` starts Nov 2016 (France) or Jan 2017 (the other three). Its items
+  before 25 Jan 2022 are baselines 00.01 (2017-2018), 02.xx and 03.0x, with
+  `raster:bands` offset 0.
+- Earth Search v2 `sentinel-2-l2a` (beta) matches v1 C1, except that it excludes baseline
+  05.09. So it has an extra gap from Dec 2022 to Nov 2023, measured over France.
+- Element84's docs: the "Nov 2016 to Nov 2019 and 2022 are missing" sentence was in the
+  README until the 2026-10-06 split into `docs/collections/` (commit 184b253), which
+  dropped it. The new page no longer gives C1's temporal coverage.
+
 `search()` refuses a time range overlapping either gap (`gfetch.sources.
-_COLLECTION_GAPS`), except one lying entirely within 2022: that is searched against
+_COLLECTION_GAPS`: 2015-06-23 to 2019-03-21, and 2022-01-01 to 2022-12-05), except one
+lying entirely within the 2022 gap: that is searched against
 Earth Search's `sentinel-2-l2a` instead, with a warning. Checked live 2026-09-23 over
-Mozambique (tile 36LYJ): same asset keys, `grid:code` and `raster:bands` scale 1e-4 /
-offset -0.1 as C1, `earthsearch:boa_offset_applied: true` from baseline 04.00 on. Its
-items before 25 Jan 2022 are baseline 03.01 (offset 0, `boa_offset_applied: false`), and
-`mosaic` stores raw DNs, so a composite reaching into 1-24 Jan 2022 mixes DN encodings.
+Mozambique (tile 36LYJ): same asset keys and `grid:code` as C1. Its DN encoding
+(measured from pixels 2026-10-16, `claude/s2-2022/README.md`): no +1000 offset,
+whatever the baseline and despite `raster:bands` offset -0.1 from 04.00 on. The
+exception is most items acquired 25 Jan - 27 Feb 2022, which carry it.
+`earthsearch:boa_offset_applied` doesn't tell them apart. `mosaic` stores raw DNs, so
+a fallback composite sits 1000 DN below C1, and one reaching into that window also
+mixes encodings.
 A time range straddling 2022 and another year still raises, since it would composite C0
 and C1 items together.
 
