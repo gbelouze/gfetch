@@ -21,10 +21,11 @@ import geopandas as gpd
 import pandas as pd
 import shapely
 from pyproj import Geod
+from retry.api import retry_call
 from rich.progress import Progress
 from shapely.geometry.base import BaseGeometry
 from sliderule import gedi, sliderule
-from sliderule.session import Session
+from sliderule.session import FatalError, Session
 
 from gfetch.utils.geoparquet import write_geoparquet
 from gfetch.utils.progress import temporary_task
@@ -50,6 +51,12 @@ def _patched_session_init(self: Session, *args: object, **kwargs: object) -> Non
 
 
 Session.__init__ = _patched_session_init
+
+# SlideRule itself retries a failed request twice, seconds apart. On top of that, a tile
+# is retried after 30, 60, 120 and 240 s, about 7.5 minutes in total, to ride out a
+# flaky HPC egress or a busy public cluster before giving up on the job.
+_TILE_TRIES = 5
+_TILE_RETRY_DELAY_S = 30.0
 
 __all__ = [
     "GEDI_L2A_DEFAULT_FIELDS",
@@ -259,16 +266,9 @@ def _select_columns(
         if not gdf.empty:
             raise KeyError(f"field(s) {missing} not in response columns {list(gdf.columns)}")
         # SlideRule returns a bare-geometry frame with no data columns at all
-        # (`sliderule.emptyframe()`) both when the AOI/time range genuinely matches
-        # zero footprints and when the request itself failed server-side (SlideRule
-        # logs that failure loudly on its own, e.g. "Unexpected termination of
-        # response") - either way, this column selection would otherwise raise a
-        # confusing KeyError instead of a well-formed empty result.
-        log.warning(
-            f"Empty response over tile={tile} with no data columns (missing {missing}) - "
-            "the request may have failed server-side rather than genuinely matching zero "
-            "footprints"
-        )
+        # (`sliderule.emptyframe()`) when the AOI/time range matches zero footprints.
+        # A failed request raises instead, see `_fetch_tile_with_retries`.
+        log.debug(f"No footprints over tile={tile}")
         for f in missing:
             gdf[f] = []
     return gdf[[*keep, gdf.geometry.name]]
@@ -461,9 +461,9 @@ def _fetch_tiles(
                 )
             else:
                 if not sliderule_ready:
-                    sliderule.init(verbose=False)
+                    sliderule.init(verbose=False, rethrow=True)
                     sliderule_ready = True
-                tile_gdf = fetch_tile(tile)
+                tile_gdf = _fetch_tile_with_retries(product, fetch_tile, tile)
                 if path is not None:
                     write_geoparquet(tile_gdf, path)
                 log.info(
@@ -506,9 +506,9 @@ def fetch_gedi_l2a(
     intersecting it are requested - whole tiles are kept or skipped, so footprints
     outside `polygon` but inside a kept tile are still returned. With `tile_dir` set,
     each tile's result is saved there as soon as it's fetched and reused by a later
-    call, so an interrupted run resumes where it stopped. A tile whose request failed
-    server-side comes back empty (see `_select_columns`) and is saved like a genuinely
-    empty one, so a resumed run doesn't retry it.
+    call, so an interrupted run resumes where it stopped. A failed request is retried
+    (see `_fetch_tile_with_retries`), then raises without saving its tile, so a rerun
+    fetches it again.
 
     With `quality_filter` set, footprints are filtered like geefetch's GEDI L2A
     collection: `quality_flag == 1`, `degrade_flag == 0`, `solar_elevation <= 0`
@@ -671,6 +671,52 @@ def fetch_gedi_l4a(
         params,
         progress,
     )
+
+
+def _fetch_tile_with_retries(
+    product: str,
+    fetch_tile: Callable[[tuple[float, float, float, float]], gpd.GeoDataFrame],
+    tile: tuple[float, float, float, float],
+) -> gpd.GeoDataFrame:
+    """
+    Fetch one tile, retrying failed SlideRule requests with a backoff.
+
+    Parameters
+    ----------
+    product : str
+        Product name for logging, e.g. `'L2A'`.
+    fetch_tile : Callable[[tuple[float, float, float, float]], gpd.GeoDataFrame]
+        Fetches one tile's footprints, raising `FatalError` when its request fails
+        (`sliderule.init(rethrow=True)`).
+    tile : tuple[float, float, float, float]
+        Tile (min_lon, min_lat, max_lon, max_lat), as returned by `split_bbox`.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        The tile's footprints.
+
+    Raises
+    ------
+    FatalError
+        If the request still fails after `_TILE_TRIES` attempts.
+    """
+    try:
+        return retry_call(
+            fetch_tile,
+            fargs=[tile],
+            exceptions=FatalError,
+            tries=_TILE_TRIES,
+            delay=_TILE_RETRY_DELAY_S,
+            backoff=2,
+            logger=log,
+        )
+    except FatalError as e:
+        log.error(
+            f"GEDI {product} request over tile={tile} failed {_TILE_TRIES} times, giving "
+            f"up: {e}. Tiles fetched so far are saved, rerun to resume."
+        )
+        raise
 
 
 def _tile_path(tile_dir: Path, tile: tuple[float, float, float, float]) -> Path:
