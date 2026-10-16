@@ -1,3 +1,4 @@
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -187,7 +188,7 @@ def test_fetch_gedi_l2a_resumes_from_saved_tiles(
 
     monkeypatch.setattr(gedi_module.gedi, "gedi02ap", interrupted)
     with pytest.raises(KeyboardInterrupt):
-        fetch_gedi_l2a(bbox, max_size_m=10_000, tile_dir=tile_dir)
+        fetch_gedi_l2a(bbox, max_size_m=10_000, tile_dir=tile_dir, concurrent_requests=1)
     assert len(list(tile_dir.glob("[!.]*.parquet"))) == 2
 
     calls.clear()
@@ -589,3 +590,56 @@ def test_fetch_gedi_l2a_never_saves_a_tile_whose_request_failed(
     monkeypatch.setattr(gedi_module.gedi, "gedi02ap", _fake_gedi02ap_over([(2.01, 48.01)], calls))
     assert len(fetch_gedi_l2a(bbox, tile_dir=tile_dir)) == 1
     assert len(calls) == 1
+
+
+def test_fetch_gedi_l2a_requests_tiles_concurrently(monkeypatch: pytest.MonkeyPatch) -> None:
+    bbox = (2.0, 48.0, 2.2, 48.2)
+    points = [(2.01, 48.01), (2.19, 48.19)]
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
+    calls: list[dict] = []
+    fake = _fake_gedi02ap_over(points, calls)
+    # Two requests must be in flight together to pass it; a sequential fetch times out.
+    both_in_flight = threading.Barrier(2, timeout=10)
+
+    def meeting(parms: dict) -> gpd.GeoDataFrame:
+        if len(calls) < 2:
+            both_in_flight.wait()
+        return fake(parms)
+
+    monkeypatch.setattr(gedi_module.gedi, "gedi02ap", meeting)
+
+    gdf = fetch_gedi_l2a(bbox, max_size_m=10_000, concurrent_requests=2)
+
+    assert len(calls) == len(split_bbox(bbox, 10_000))
+    assert sorted(zip(gdf.geometry.x, gdf.geometry.y, strict=True)) == sorted(points)
+
+
+def test_fetch_gedi_l2a_stops_requesting_tiles_after_one_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bbox = (2.0, 48.0, 2.2, 48.2)
+    tile_dir = tmp_path / "tiles"
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gedi_module, "_TILE_RETRY_DELAY_S", 0)
+    calls: list[dict] = []
+    fake = _fake_gedi02ap_over([], calls)
+
+    def second_tile_fails(parms: dict) -> gpd.GeoDataFrame:
+        if len(calls) >= 1:
+            calls.append(parms)
+            raise FatalError("error in request: Connection error")
+        return fake(parms)
+
+    monkeypatch.setattr(gedi_module.gedi, "gedi02ap", second_tile_fails)
+
+    with pytest.raises(FatalError):
+        fetch_gedi_l2a(bbox, max_size_m=10_000, tile_dir=tile_dir, concurrent_requests=1)
+
+    assert len(split_bbox(bbox, 10_000)) > 2
+    assert len(calls) == 1 + gedi_module._TILE_TRIES
+    assert len(list(tile_dir.glob("[!.]*.parquet"))) == 1
+
+
+def test_fetch_gedi_l2a_refuses_no_concurrent_requests() -> None:
+    with pytest.raises(ValueError, match="concurrent_requests"):
+        fetch_gedi_l2a((2.0, 48.0, 2.05, 48.05), concurrent_requests=0)

@@ -62,6 +62,11 @@ class GediConfig:
     quality_filter : bool
         Drop low-quality footprints like geefetch does, via
         `gfetch.gedi.fetch_gedi_l4a`'s `quality_filter`. Defaults to True.
+    concurrent_requests : int | None
+        Maximum number of tiles requested from SlideRule at once. Deliberately not
+        the generic `n_workers`: past a few requests in flight, SlideRule's public
+        cluster only queues them. Defaults to None, which uses
+        `gfetch.gedi.GEDI_CONCURRENT_REQUESTS`.
     """
 
     output: Path
@@ -72,6 +77,7 @@ class GediConfig:
     fields: list[str] | None = None
     anc_fields: list[str] | None = None
     quality_filter: bool = True
+    concurrent_requests: int | None = None
 
     def __post_init__(self) -> None:
         self.output = Path(self.output).expanduser().absolute()
