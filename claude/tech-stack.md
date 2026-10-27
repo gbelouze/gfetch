@@ -1214,6 +1214,46 @@ non-network tests for `anc_fields` pass-through/keep-regardless-of-`fields` and
 `expand_rh`'s pure array-splitting, plus one `@pytest.mark.slow` live test
 requesting all fourteen working `anc_fields` at once.
 
+### Failures, rate limits and concurrency (added 2026-10-16)
+
+- **Failed requests.** SlideRule's client retries a request twice, seconds apart. It
+  then logs "Error in request" and returns an empty frame, unless `sliderule.init(...,
+  rethrow=True)`, in which case it raises `FatalError`. gfetch used to save that empty
+  frame as a genuinely empty tile, so a resumed run never refetched it. Seen on Jean
+  Zay, where the archive partition's proxy answers every HTTPS tunnel with 403. gfetch
+  now uses `rethrow=True`, retries a tile after 30/60/120/240 s, and then stops without
+  saving it.
+- **Rate limit.** Read from the source, not the docs (`apps/ilb/analyzer.lua` on main):
+  - Public cluster only. Counts HTTP requests per ISO week, per source IP for anonymous
+    clients and per user for GitHub-authenticated ones.
+  - Budget: 50,000 per IP, 100,000 per user. Past it, 10 minutes blocked (HTTP 429),
+    then 10 more requests before the next block.
+  - No concurrency limit.
+  - Every Jean Zay job leaves through `prodprox.idris.fr`, so IDRIS users likely share
+    one IP budget. A Mozambique+Tanzania job is ~1,700 requests (855 tiles × 2
+    products).
+  - Private clusters (by request to the SlideRule team) have no rate limits.
+- **Concurrency.** Measured from a laptop: 16 L2A tiles (50 km) over northern
+  Mozambique, Jan-Jun 2022, identical 84,388 footprints and no failures at every
+  setting.
+
+  | requests in flight | 1 (cold) | 2 | 4 | 8 | 1 (warm, rerun last) |
+  |---|---|---|---|---|---|
+  | wall time | 572 s | 221 s | 150 s | 127 s | 340 s |
+  | median per tile | 40 s | 24 s | 18 s | 45 s | 23 s |
+
+  - Repeating the 1-worker run last shows server-side warm-up: 572 s → 340 s.
+  - Past 4 requests in flight, each request slows down: the shared cluster queues
+    them.
+  - So `concurrent_requests` defaults to 4 (`GEDI_CONCURRENT_REQUESTS`). It's a
+    GEDI-section key, deliberately not the generic `n_workers`, which raster jobs set
+    to 16.
+  - Live check at 4 over the 2°×2° box: 25 tiles, 135,614 footprints, 314 s. A
+    resumed run reused every tile without a request.
+- **Writing our own reader with h5coro instead** (assessed, not pursued): a few days.
+  The work is HTTPS range reads from Europe, Earthdata Login redirects and
+  orchestration, plus matching SlideRule's field semantics.
+
 ### Open questions / risks (vector pipeline)
 
 - No time-range default: an AOI with no `time_range` pulls the *entire* GEDI mission

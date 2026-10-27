@@ -87,6 +87,16 @@ def test_raster_only_generic_fields_are_ignored_not_an_error(tmp_path: Path) -> 
 
     assert cfg.fields == ["beam"]
     assert cfg.output == (tmp_path / "gedi" / "l2a.parquet").expanduser().absolute()
+    assert cfg.concurrent_requests is None
+
+
+def test_concurrent_requests_reads_from_the_gedi_section(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path / "config.yaml", n_workers=16)
+    config = yaml.safe_load(config_path.read_text())
+    config["gedi_l2a"] = {"concurrent_requests": 2}
+    config_path.write_text(yaml.dump(config))
+
+    assert load(config_path, "l2a").concurrent_requests == 2
 
 
 def test_output_explicit_in_gedi_section_wins_over_output_dir_default(tmp_path: Path) -> None:

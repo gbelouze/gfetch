@@ -4,6 +4,7 @@ from pathlib import Path
 
 from gfetch.cli.gedi_config import GediL2AConfig, load
 from gfetch.gedi import (
+    GEDI_CONCURRENT_REQUESTS,
     GEDI_L2A_DEFAULT_FIELDS,
     GEDI_L4A_DEFAULT_FIELDS,
     fetch_gedi_l2a,
@@ -75,6 +76,9 @@ def gedi(config_path: Path, product: str) -> None:
         "quality_filter": cfg.quality_filter,
         "tile_dir": tile_dir,
     }
+    concurrent_requests = (
+        cfg.concurrent_requests if cfg.concurrent_requests is not None else GEDI_CONCURRENT_REQUESTS
+    )
     with count_bar() as progress:
         if isinstance(cfg, GediL2AConfig):
             gdf = fetch_gedi_l2a(
@@ -82,6 +86,7 @@ def gedi(config_path: Path, product: str) -> None:
                 fields=cfg.fields if cfg.fields is not None else GEDI_L2A_DEFAULT_FIELDS,
                 rh_percentiles=cfg.rh_percentiles,
                 progress=progress,
+                concurrent_requests=concurrent_requests,
                 **common,
             )
         else:
@@ -89,6 +94,7 @@ def gedi(config_path: Path, product: str) -> None:
                 cfg.resolved_aoi.bbox,
                 fields=cfg.fields if cfg.fields is not None else GEDI_L4A_DEFAULT_FIELDS,
                 progress=progress,
+                concurrent_requests=concurrent_requests,
                 **common,
             )
     write_geoparquet(gdf, cfg.output)

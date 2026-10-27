@@ -13,7 +13,9 @@ import logging
 import math
 import os
 import tempfile
+import threading
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -21,10 +23,11 @@ import geopandas as gpd
 import pandas as pd
 import shapely
 from pyproj import Geod
+from retry.api import retry_call
 from rich.progress import Progress
 from shapely.geometry.base import BaseGeometry
 from sliderule import gedi, sliderule
-from sliderule.session import Session
+from sliderule.session import FatalError, Session
 
 from gfetch.utils.geoparquet import write_geoparquet
 from gfetch.utils.progress import temporary_task
@@ -51,7 +54,19 @@ def _patched_session_init(self: Session, *args: object, **kwargs: object) -> Non
 
 Session.__init__ = _patched_session_init
 
+# SlideRule itself retries a failed request twice, seconds apart. On top of that, a tile
+# is retried after 30, 60, 120 and 240 s, about 7.5 minutes in total, to ride out a
+# flaky HPC egress or a busy public cluster before giving up on the job.
+_TILE_TRIES = 5
+_TILE_RETRY_DELAY_S = 30.0
+
+# Measured 2026-10-16 on the public cluster, 16 L2A tiles over Jan-Jun 2022 (see
+# `claude/tech-stack.md`): 1.5x faster with 2 requests in flight, 2.3x with 4, 2.7x with
+# 8, where each request takes twice as long as at 4 as the cluster saturates.
+GEDI_CONCURRENT_REQUESTS = 4
+
 __all__ = [
+    "GEDI_CONCURRENT_REQUESTS",
     "GEDI_L2A_DEFAULT_FIELDS",
     "GEDI_L2A_RH_PERCENTILES",
     "GEDI_L4A_DEFAULT_FIELDS",
@@ -259,16 +274,9 @@ def _select_columns(
         if not gdf.empty:
             raise KeyError(f"field(s) {missing} not in response columns {list(gdf.columns)}")
         # SlideRule returns a bare-geometry frame with no data columns at all
-        # (`sliderule.emptyframe()`) both when the AOI/time range genuinely matches
-        # zero footprints and when the request itself failed server-side (SlideRule
-        # logs that failure loudly on its own, e.g. "Unexpected termination of
-        # response") - either way, this column selection would otherwise raise a
-        # confusing KeyError instead of a well-formed empty result.
-        log.warning(
-            f"Empty response over tile={tile} with no data columns (missing {missing}) - "
-            "the request may have failed server-side rather than genuinely matching zero "
-            "footprints"
-        )
+        # (`sliderule.emptyframe()`) when the AOI/time range matches zero footprints.
+        # A failed request raises instead, see `_fetch_tile_with_retries`.
+        log.debug(f"No footprints over tile={tile}")
         for f in missing:
             gdf[f] = []
     return gdf[[*keep, gdf.geometry.name]]
@@ -393,9 +401,14 @@ def _fetch_tiles(
     tile_dir: Path | None,
     params: dict,
     progress: Progress | None,
+    concurrent_requests: int,
 ) -> gpd.GeoDataFrame:
     """
     Fetch one GEDI product tile by tile over an AOI, resuming from saved tiles.
+
+    Up to `concurrent_requests` tiles are requested at once. If a tile still fails
+    after its retries, the tiles not yet requested are cancelled, those in flight
+    finish (and are saved), and the error is raised.
 
     Parameters
     ----------
@@ -415,6 +428,8 @@ def _fetch_tiles(
         JSON-serializable request parameters recorded in `tile_dir`.
     progress : Progress | None
         See `fetch_gedi_l2a`.
+    concurrent_requests : int
+        See `fetch_gedi_l2a`.
 
     Returns
     -------
@@ -424,8 +439,12 @@ def _fetch_tiles(
     Raises
     ------
     ValueError
-        If `polygon` doesn't intersect `bbox`.
+        If `polygon` doesn't intersect `bbox`, or `concurrent_requests` is below 1.
     """
+    if concurrent_requests < 1:
+        msg = f"concurrent_requests must be at least 1, got {concurrent_requests}"
+        log.error(msg)
+        raise ValueError(msg)
     tiles = split_bbox(bbox, max_size_m)
     if polygon is not None:
         n_bbox_tiles = len(tiles)
@@ -443,43 +462,66 @@ def _fetch_tiles(
         f"time_range={params['time_range']} in {len(tiles)} tile(s)"
     )
 
-    gdfs = []
+    paths = [_tile_path(tile_dir, tile) if tile_dir is not None else None for tile in tiles]
+    gdfs: list[gpd.GeoDataFrame | None] = [
+        gpd.read_parquet(path) if path is not None and path.exists() else None for path in paths
+    ]
+    todo = [i for i, gdf in enumerate(gdfs) if gdf is None]
+    if len(todo) < len(tiles):
+        log.info(
+            f"Reused {len(tiles) - len(todo)}/{len(tiles)} tile(s) already saved in {tile_dir}"
+        )
+
+    # Set as soon as a tile gives up, so that a worker freed by it doesn't start (and
+    # retry for minutes) another tile before the main thread cancels the queue.
+    given_up = threading.Event()
+
+    def fetch_and_save(i: int) -> gpd.GeoDataFrame | None:
+        if given_up.is_set():
+            return None
+        try:
+            tile_gdf = _fetch_tile_with_retries(product, fetch_tile, tiles[i])
+        except BaseException:
+            given_up.set()
+            raise
+        path = paths[i]
+        if path is not None:
+            write_geoparquet(tile_gdf, path)
+        return tile_gdf
+
     with (
         temporary_task(progress, f"Fetching GEDI {product} tiles", total=len(tiles))
         if progress is not None
         else nullcontext(None)
     ) as task:
-        n_reused = 0
-        sliderule_ready = False
-        for i, tile in enumerate(tiles, start=1):
-            path = _tile_path(tile_dir, tile) if tile_dir is not None else None
-            if path is not None and path.exists():
-                tile_gdf = gpd.read_parquet(path)
-                n_reused += 1
-                log.debug(
-                    f"GEDI {product} tile reused, {len(tile_gdf)} footprint(s) [{i}/{len(tiles)}]"
-                )
-            else:
-                if not sliderule_ready:
-                    sliderule.init(verbose=False)
-                    sliderule_ready = True
-                tile_gdf = fetch_tile(tile)
-                if path is not None:
-                    write_geoparquet(tile_gdf, path)
-                log.info(
-                    f"GEDI {product} tile fetched, {len(tile_gdf)} footprint(s) [{i}/{len(tiles)}]"
-                )
-            gdfs.append(tile_gdf)
-            if progress is not None and task is not None:
-                progress.advance(task)
-    if n_reused:
-        log.info(f"Reused {n_reused}/{len(tiles)} tile(s) already saved in {tile_dir}")
+        if progress is not None and task is not None:
+            progress.advance(task, len(tiles) - len(todo))
+        if todo:
+            sliderule.init(verbose=False, rethrow=True)
+            pool = ThreadPoolExecutor(min(concurrent_requests, len(todo)))
+            try:
+                futures = {pool.submit(fetch_and_save, i): i for i in todo}
+                for done, future in enumerate(as_completed(futures), start=1):
+                    i = futures[future]
+                    tile_gdf = future.result()
+                    if tile_gdf is None:
+                        continue
+                    gdfs[i] = tile_gdf
+                    log.info(
+                        f"GEDI {product} tile fetched, {len(tile_gdf)} footprint(s) "
+                        f"[{done}/{len(todo)}]"
+                    )
+                    if progress is not None and task is not None:
+                        progress.advance(task)
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
 
     # Concatenating an empty, possibly column-less tile frame would otherwise
     # degrade the other tiles' column dtypes to object.
-    non_empty = [gdf for gdf in gdfs if not gdf.empty]
+    fetched = [gdf for gdf in gdfs if gdf is not None]
+    non_empty = [gdf for gdf in fetched if not gdf.empty]
     if not non_empty:
-        gdf = gdfs[0]
+        gdf = fetched[0]
     else:
         gdf = gpd.GeoDataFrame(pd.concat(non_empty), crs=non_empty[0].crs).sort_index()
     log.info(f"Received {len(gdf)} footprint(s)")
@@ -497,18 +539,19 @@ def fetch_gedi_l2a(
     quality_filter: bool = True,
     tile_dir: Path | None = None,
     progress: Progress | None = None,
+    concurrent_requests: int = GEDI_CONCURRENT_REQUESTS,
 ) -> gpd.GeoDataFrame:
     """
     Fetch GEDI L2A footprints over an AOI via SlideRule's on-demand subsetting.
 
     The AOI is split into tiles of at most `max_size_m` on each side (see
-    `split_bbox`), fetched one request at a time. With `polygon` set, only the tiles
+    `split_bbox`), up to `concurrent_requests` at a time. With `polygon` set, only the tiles
     intersecting it are requested - whole tiles are kept or skipped, so footprints
     outside `polygon` but inside a kept tile are still returned. With `tile_dir` set,
     each tile's result is saved there as soon as it's fetched and reused by a later
-    call, so an interrupted run resumes where it stopped. A tile whose request failed
-    server-side comes back empty (see `_select_columns`) and is saved like a genuinely
-    empty one, so a resumed run doesn't retry it.
+    call, so an interrupted run resumes where it stopped. A failed request is retried
+    (see `_fetch_tile_with_retries`), then raises without saving its tile, so a rerun
+    fetches it again.
 
     With `quality_filter` set, footprints are filtered like geefetch's GEDI L2A
     collection: `quality_flag == 1`, `degrade_flag == 0`, `solar_elevation <= 0`
@@ -565,6 +608,9 @@ def fetch_gedi_l2a(
     progress : Progress | None
         Rich progress tracker, advanced once per fetched tile. Defaults to None (no
         progress bar).
+    concurrent_requests : int
+        Maximum number of tiles requested from SlideRule at once. Defaults to
+        `GEDI_CONCURRENT_REQUESTS`.
 
     Returns
     -------
@@ -592,6 +638,7 @@ def fetch_gedi_l2a(
         tile_dir,
         params,
         progress,
+        concurrent_requests,
     )
 
 
@@ -605,6 +652,7 @@ def fetch_gedi_l4a(
     quality_filter: bool = True,
     tile_dir: Path | None = None,
     progress: Progress | None = None,
+    concurrent_requests: int = GEDI_CONCURRENT_REQUESTS,
 ) -> gpd.GeoDataFrame:
     """
     Fetch GEDI L4A (aboveground biomass density) footprints over an AOI via
@@ -646,6 +694,9 @@ def fetch_gedi_l4a(
     progress : Progress | None
         Rich progress tracker, advanced once per fetched tile. Defaults to None (no
         progress bar).
+    concurrent_requests : int
+        Maximum number of tiles requested from SlideRule at once. Defaults to
+        `GEDI_CONCURRENT_REQUESTS`.
 
     Returns
     -------
@@ -670,7 +721,54 @@ def fetch_gedi_l4a(
         tile_dir,
         params,
         progress,
+        concurrent_requests,
     )
+
+
+def _fetch_tile_with_retries(
+    product: str,
+    fetch_tile: Callable[[tuple[float, float, float, float]], gpd.GeoDataFrame],
+    tile: tuple[float, float, float, float],
+) -> gpd.GeoDataFrame:
+    """
+    Fetch one tile, retrying failed SlideRule requests with a backoff.
+
+    Parameters
+    ----------
+    product : str
+        Product name for logging, e.g. `'L2A'`.
+    fetch_tile : Callable[[tuple[float, float, float, float]], gpd.GeoDataFrame]
+        Fetches one tile's footprints, raising `FatalError` when its request fails
+        (`sliderule.init(rethrow=True)`).
+    tile : tuple[float, float, float, float]
+        Tile (min_lon, min_lat, max_lon, max_lat), as returned by `split_bbox`.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        The tile's footprints.
+
+    Raises
+    ------
+    FatalError
+        If the request still fails after `_TILE_TRIES` attempts.
+    """
+    try:
+        return retry_call(
+            fetch_tile,
+            fargs=[tile],
+            exceptions=FatalError,
+            tries=_TILE_TRIES,
+            delay=_TILE_RETRY_DELAY_S,
+            backoff=2,
+            logger=log,
+        )
+    except FatalError as e:
+        log.error(
+            f"GEDI {product} request over tile={tile} failed {_TILE_TRIES} times, giving "
+            f"up: {e}. Tiles fetched so far are saved, rerun to resume."
+        )
+        raise
 
 
 def _tile_path(tile_dir: Path, tile: tuple[float, float, float, float]) -> Path:

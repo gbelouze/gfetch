@@ -1,3 +1,4 @@
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -6,6 +7,7 @@ import numpy as np
 import pytest
 import shapely
 import sliderule.sliderule as sliderule_core
+from sliderule.session import FatalError
 
 from gfetch import gedi as gedi_module
 from gfetch.gedi import (
@@ -186,7 +188,7 @@ def test_fetch_gedi_l2a_resumes_from_saved_tiles(
 
     monkeypatch.setattr(gedi_module.gedi, "gedi02ap", interrupted)
     with pytest.raises(KeyboardInterrupt):
-        fetch_gedi_l2a(bbox, max_size_m=10_000, tile_dir=tile_dir)
+        fetch_gedi_l2a(bbox, max_size_m=10_000, tile_dir=tile_dir, concurrent_requests=1)
     assert len(list(tile_dir.glob("[!.]*.parquet"))) == 2
 
     calls.clear()
@@ -217,11 +219,9 @@ def test_fetch_gedi_l2a_refuses_tiles_from_other_parameters(
         )
 
 
-def test_fetch_gedi_l2a_handles_empty_or_failed_response(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_gedi_l2a_handles_empty_response(monkeypatch: pytest.MonkeyPatch) -> None:
     """`sliderule.gedi.gedi02ap()` returns a bare-geometry frame with no data
-    columns both on a genuine zero-footprint match and on a server-side request
-    failure (e.g. "Unexpected termination of response", confirmed live) - the
-    column selection below must not crash on either.
+    columns on a zero-footprint match - the column selection must not crash on it.
     """
     monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -532,3 +532,114 @@ def test_fetch_gedi_l4a_returns_filtered_footprints_over_france() -> None:
     assert maxx <= bbox[2]
     assert bbox[1] <= miny
     assert maxy <= bbox[3]
+
+
+def test_fetch_gedi_l2a_inits_sliderule_to_raise_on_failed_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_kwargs: list[dict] = []
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda **kwargs: init_kwargs.append(kwargs))
+    monkeypatch.setattr(gedi_module.gedi, "gedi02ap", _fake_gedi02ap_over([], []))
+
+    fetch_gedi_l2a((2.0, 48.0, 2.05, 48.05))
+
+    assert init_kwargs == [{"verbose": False, "rethrow": True}]
+
+
+def test_fetch_gedi_l2a_retries_a_failed_tile_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gedi_module, "_TILE_RETRY_DELAY_S", 0)
+    calls: list[dict] = []
+    fake = _fake_gedi02ap_over([(2.01, 48.01)], calls)
+
+    def flaky(parms: dict) -> gpd.GeoDataFrame:
+        if not calls:
+            calls.append(parms)
+            raise FatalError("error in request: Connection error")
+        return fake(parms)
+
+    monkeypatch.setattr(gedi_module.gedi, "gedi02ap", flaky)
+
+    gdf = fetch_gedi_l2a((2.0, 48.0, 2.05, 48.05))
+
+    assert len(calls) == 2
+    assert len(gdf) == 1
+
+
+def test_fetch_gedi_l2a_never_saves_a_tile_whose_request_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bbox = (2.0, 48.0, 2.05, 48.05)
+    tile_dir = tmp_path / "tiles"
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gedi_module, "_TILE_RETRY_DELAY_S", 0)
+    attempts: list[dict] = []
+
+    def failing(parms: dict) -> gpd.GeoDataFrame:
+        attempts.append(parms)
+        raise FatalError("error in request: Connection error")
+
+    monkeypatch.setattr(gedi_module.gedi, "gedi02ap", failing)
+    with pytest.raises(FatalError):
+        fetch_gedi_l2a(bbox, tile_dir=tile_dir)
+
+    assert len(attempts) == gedi_module._TILE_TRIES
+    assert list(tile_dir.glob("[!.]*.parquet")) == []
+
+    calls: list[dict] = []
+    monkeypatch.setattr(gedi_module.gedi, "gedi02ap", _fake_gedi02ap_over([(2.01, 48.01)], calls))
+    assert len(fetch_gedi_l2a(bbox, tile_dir=tile_dir)) == 1
+    assert len(calls) == 1
+
+
+def test_fetch_gedi_l2a_requests_tiles_concurrently(monkeypatch: pytest.MonkeyPatch) -> None:
+    bbox = (2.0, 48.0, 2.2, 48.2)
+    points = [(2.01, 48.01), (2.19, 48.19)]
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
+    calls: list[dict] = []
+    fake = _fake_gedi02ap_over(points, calls)
+    # Two requests must be in flight together to pass it; a sequential fetch times out.
+    both_in_flight = threading.Barrier(2, timeout=10)
+
+    def meeting(parms: dict) -> gpd.GeoDataFrame:
+        if len(calls) < 2:
+            both_in_flight.wait()
+        return fake(parms)
+
+    monkeypatch.setattr(gedi_module.gedi, "gedi02ap", meeting)
+
+    gdf = fetch_gedi_l2a(bbox, max_size_m=10_000, concurrent_requests=2)
+
+    assert len(calls) == len(split_bbox(bbox, 10_000))
+    assert sorted(zip(gdf.geometry.x, gdf.geometry.y, strict=True)) == sorted(points)
+
+
+def test_fetch_gedi_l2a_stops_requesting_tiles_after_one_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bbox = (2.0, 48.0, 2.2, 48.2)
+    tile_dir = tmp_path / "tiles"
+    monkeypatch.setattr(gedi_module.sliderule, "init", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gedi_module, "_TILE_RETRY_DELAY_S", 0)
+    calls: list[dict] = []
+    fake = _fake_gedi02ap_over([], calls)
+
+    def second_tile_fails(parms: dict) -> gpd.GeoDataFrame:
+        if len(calls) >= 1:
+            calls.append(parms)
+            raise FatalError("error in request: Connection error")
+        return fake(parms)
+
+    monkeypatch.setattr(gedi_module.gedi, "gedi02ap", second_tile_fails)
+
+    with pytest.raises(FatalError):
+        fetch_gedi_l2a(bbox, max_size_m=10_000, tile_dir=tile_dir, concurrent_requests=1)
+
+    assert len(split_bbox(bbox, 10_000)) > 2
+    assert len(calls) == 1 + gedi_module._TILE_TRIES
+    assert len(list(tile_dir.glob("[!.]*.parquet"))) == 1
+
+
+def test_fetch_gedi_l2a_refuses_no_concurrent_requests() -> None:
+    with pytest.raises(ValueError, match="concurrent_requests"):
+        fetch_gedi_l2a((2.0, 48.0, 2.05, 48.05), concurrent_requests=0)
